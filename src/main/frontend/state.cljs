@@ -126,6 +126,7 @@
       :editor/args                           nil
       :editor/on-paste?                      (atom false)
       :editor/last-key-code                  (atom nil)
+     :editor/block-op-type                  nil             ;; :cut, :copy
 
       ;; Stores deleted refed blocks, indexed by repo
       :editor/last-replace-ref-content-tx    nil
@@ -1902,7 +1903,15 @@ Similar to re-frame subscriptions"
 
 (defn get-last-key-code
   []
-  @(:editor/last-key-code @state))
+  (:editor/last-key-code @state))
+
+(defn set-block-op-type!
+  [op-type]
+  (set-state! :editor/block-op-type op-type))
+
+(defn get-block-op-type
+  []
+  (:editor/block-op-type @state))
 
 (defn feature-http-server-enabled?
   []

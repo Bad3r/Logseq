@@ -35,7 +35,7 @@
       [:span.flex.items-center
        (if local?
          (let [local-dir (config/get-local-dir url)
-               graph-name (text-util/get-graph-name-from-path local-dir)]
+               graph-name (text-util/get-graph-name-from-path url)]
            [:a.flex.items-center {:title    local-dir
                                   :on-click #(on-click graph)}
             [:span graph-name (when GraphName [:strong.px-1 "(" GraphName ")"])]
@@ -160,7 +160,7 @@
                                           (when remote? [:span.pl-1.flex.items-center
                                                          {:title (str "<" GraphName "> #" GraphUUID)}
                                                          (ui/icon "cloud" {:size 18})])]
-                           :hover-detail repo-path ;; show full path on hover
+                           :hover-detail repo-url ;; show full path on hover
                            :options      {:on-click (fn [e]
                                                       (if (gobj/get e "shiftKey")
                                                         (state/pub-event! [:graph/open-new-window url])
