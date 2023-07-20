@@ -4,15 +4,16 @@
             [frontend.util :as util]
             [frontend.components.block :as block]
             [frontend.components.svg :as svg]
+            [frontend.components.search.highlight :as highlight]
             [frontend.handler.route :as route-handler]
             [frontend.handler.editor :as editor-handler]
             [frontend.handler.page :as page-handler]
-            [frontend.handler.block :as block-handler]
             [frontend.handler.notification :as notification]
             [frontend.db :as db]
             [frontend.db.model :as model]
             [frontend.handler.search :as search-handler]
             [frontend.handler.whiteboard :as whiteboard-handler]
+            [frontend.handler.recent :as recent-handler]
             [frontend.extensions.pdf.utils :as pdf-utils]
             [frontend.ui :as ui]
             [frontend.state :as state]
@@ -24,44 +25,6 @@
             [reitit.frontend.easy :as rfe]
             [frontend.modules.shortcut.core :as shortcut]
             [frontend.util.text :as text-util]))
-
-(defn highlight-exact-query
-  [content q]
-  (if (or (string/blank? content) (string/blank? q))
-    content
-    (when (and content q)
-      (let [q-words (string/split q #" ")
-            lc-content (util/search-normalize content (state/enable-search-remove-accents?))
-            lc-q (util/search-normalize q (state/enable-search-remove-accents?))]
-        (if (and (string/includes? lc-content lc-q)
-                 (not (util/safe-re-find #" " q)))
-          (let [i (string/index-of lc-content lc-q)
-                [before after] [(subs content 0 i) (subs content (+ i (count q)))]]
-            [:div
-             (when-not (string/blank? before)
-               [:span before])
-             [:mark.p-0.rounded-none (subs content i (+ i (count q)))]
-             (when-not (string/blank? after)
-               [:span after])])
-          (let [elements (loop [words q-words
-                                content content
-                                result []]
-                           (if (and (seq words) content)
-                             (let [word (first words)
-                                   lc-word (util/search-normalize word (state/enable-search-remove-accents?))
-                                   lc-content (util/search-normalize content (state/enable-search-remove-accents?))]
-                               (if-let [i (string/index-of lc-content lc-word)]
-                                 (recur (rest words)
-                                        (subs content (+ i (count word)))
-                                        (vec
-                                         (concat result
-                                                 [[:span (subs content 0 i)]
-                                                  [:mark.p-0.rounded-none (subs content i (+ i (count word)))]])))
-                                 (recur nil
-                                        content
-                                        result)))
-                             (conj result [:span content])))]
-            [:p {:class "m-0"} elements]))))))
 
 (defn highlight-page-content-query
   "Return hiccup of highlighted page content FTS result"
@@ -113,7 +76,7 @@
                           (clojure.core/uuid uuid)
                           {:indent? false})])
      [:div {:class "font-medium" :key "content"}
-      (highlight-exact-query content q)]]))
+      (highlight/highlight-exact-query content q)]]))
 
 (defonce search-timeout (atom nil))
 
@@ -173,14 +136,13 @@
     (let [block-uuid (uuid (:block/uuid data))
           collapsed? (db/parents-collapsed? repo block-uuid)
           page (:block/page (db/entity [:block/uuid block-uuid]))
-          page-name (:block/name page)
-          long-page? (block-handler/long-page? repo (:db/id page))]
+          page-name (:block/name page)]
       (if page
         (cond
           (model/whiteboard-page? page-name)
           (route-handler/redirect-to-whiteboard! page-name {:block-id block-uuid})
 
-          (or collapsed? long-page?)
+          collapsed?
           (route-handler/redirect-to-page! block-uuid)
 
           :else
@@ -283,12 +245,12 @@
         (search-result-item {:name (if (model/whiteboard-page? data) "whiteboard" "page")
                              :extension? true
                              :title (t (if (model/whiteboard-page? data) :search-item/whiteboard :search-item/page))}
-                            (highlight-exact-query data search-q))]
+                            (highlight/highlight-exact-query data search-q))]
 
        :file
        (search-result-item {:name "file"
                             :title (t :search-item/file)}
-                           (highlight-exact-query data search-q))
+                           (highlight/highlight-exact-query data search-q))
 
        :block
        (let [{:block/keys [page uuid content]} data  ;; content here is normalized
@@ -417,10 +379,7 @@
                     :on-click #(state/pub-event! [:modal/command-palette])}
                    (ui/icon "command" {:style {:font-size 20}})])])]]
    (let [recent-search (mapv (fn [q] {:type :search :data q}) (db/get-key-value :recent/search))
-         pages (->> (db/get-key-value :recent/pages)
-                    (remove nil?)
-                    (filter string?)
-                    (remove #(= (string/lower-case %) "contents"))
+         pages (->> (recent-handler/get-recent-pages)
                     (mapv (fn [page] {:type :page :data page})))
          result (concat (take 5 recent-search) pages)]
      (ui/auto-complete

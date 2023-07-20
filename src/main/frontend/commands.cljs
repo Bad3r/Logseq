@@ -5,24 +5,25 @@
             [frontend.date :as date]
             [frontend.db :as db]
             [frontend.db.utils :as db-utils]
+            [frontend.extensions.video.youtube :as youtube]
             [frontend.handler.draw :as draw]
             [frontend.handler.notification :as notification]
             [frontend.handler.plugin :as plugin-handler]
-            [frontend.extensions.video.youtube :as youtube]
+            [frontend.handler.property :as property-handler]
             [frontend.search :as search]
             [frontend.state :as state]
             [frontend.util :as util]
             [frontend.util.cursor :as cursor]
             [frontend.util.marker :as marker]
             [frontend.util.priority :as priority]
-            [frontend.util.property :as property]
-            [logseq.graph-parser.util :as gp-util]
-            [logseq.graph-parser.config :as gp-config]
-            [logseq.graph-parser.property :as gp-property]
-            [logseq.graph-parser.util.page-ref :as page-ref]
-            [logseq.graph-parser.util.block-ref :as block-ref]
+            [frontend.util.property-edit :as property-edit]
             [goog.dom :as gdom]
             [goog.object :as gobj]
+            [logseq.graph-parser.config :as gp-config]
+            [logseq.graph-parser.property :as gp-property]
+            [logseq.graph-parser.util :as gp-util]
+            [logseq.graph-parser.util.block-ref :as block-ref]
+            [logseq.graph-parser.util.page-ref :as page-ref]
             [promesa.core :as p]))
 
 ;; TODO: move to frontend.handler.editor.commands
@@ -235,12 +236,11 @@
      ["Template" [[:editor/input command-trigger nil]
                   [:editor/search-template]] "Insert a created template here"]
      (cond
-       (and (util/electron?) (config/local-db? (state/get-current-repo)))
+       (and (util/electron?) (config/local-file-based-graph? (state/get-current-repo)))
 
        ["Upload an asset" [[:editor/click-hidden-file-input :id]] "Upload file types like image, pdf, docx, etc.)"])]
 
        ;; ["Upload an image" [[:editor/click-hidden-file-input :id]]]
-
 
     (headings)
 
@@ -298,6 +298,8 @@
 
      ["Embed Twitter tweet" [[:editor/input "{{tweet }}" {:last-pattern command-trigger
                                                           :backward-pos 2}]]]
+     ["Add new property" [[:editor/clear-current-slash]
+                          [:editor/new-property]]]
 
      ["Code block" [[:editor/input "```\n```\n" {:type            "block"
                                                  :backward-pos    5
@@ -610,14 +612,15 @@
     (when-let [current-input (gdom/getElement input-id)]
       (let [format (or (db/get-page-format (state/get-current-page)) (state/get-preferred-format))
             edit-content (gobj/get current-input "value")
-            new-value (property/insert-property format edit-content "" "")]
+            repo (state/get-current-repo)
+            new-value (property-edit/insert-property-when-file-based repo format edit-content "" "")]
         (state/set-edit-content! input-id new-value)))))
 
 (defmethod handle-step :editor/move-cursor-to-properties [[_]]
   (when-let [input-id (state/get-edit-input-id)]
     (when-let [current-input (gdom/getElement input-id)]
       (let [format (or (db/get-page-format (state/get-current-page)) (state/get-preferred-format))]
-        (property/goto-properties-end format current-input)
+        (property-edit/goto-properties-end-when-file-based format current-input)
         (cursor/move-cursor-backward current-input 3)))))
 
 (defonce markdown-heading-pattern #"^#+\s+")
@@ -717,6 +720,9 @@
 
 (defmethod handle-step :editor/exit [[_]]
   (state/clear-edit!))
+
+(defmethod handle-step :editor/new-property [[_]]
+  (property-handler/editing-new-property!))
 
 (defmethod handle-step :default [[type & _args]]
   (prn "No handler for step: " type))

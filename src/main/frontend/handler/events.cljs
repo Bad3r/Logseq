@@ -24,6 +24,8 @@
             [frontend.components.whiteboard :as whiteboard]
             [frontend.components.user.login :as login]
             [frontend.components.shortcut :as shortcut]
+            [frontend.components.repo :as repo]
+            [frontend.components.page :as page]
             [frontend.config :as config]
             [frontend.context.i18n :refer [t]]
             [frontend.db :as db]
@@ -70,7 +72,8 @@
             [logseq.db.schema :as db-schema]
             [logseq.graph-parser.config :as gp-config]
             [promesa.core :as p]
-            [rum.core :as rum]))
+            [rum.core :as rum]
+            [frontend.db.listener :as db-listener]))
 
 ;; TODO: should we move all events here?
 
@@ -130,7 +133,7 @@
 (defmethod handle :graph/added [[_ repo {:keys [empty-graph?]}]]
   (db/set-key-value repo :ast/version db-schema/ast-version)
   (search-handler/rebuild-indices!)
-  (db/persist! repo)
+  (db-listener/persist! repo)
   (plugin-handler/hook-plugin-app :graph-after-indexed {:repo repo :empty-graph? empty-graph?})
   (when (state/setups-picker?)
     (if empty-graph?
@@ -179,8 +182,9 @@
      (when persist?
        (when (util/electron?)
          (p/do!
-          (repo-handler/persist-db! current-repo persist-db-noti-m)
-          (repo-handler/broadcast-persist-db! graph))))
+          (when (config/local-file-based-graph? current-repo)
+            (repo-handler/persist-db! current-repo persist-db-noti-m)
+            (repo-handler/broadcast-persist-db! graph)))))
      (repo-handler/restore-and-setup-repo! graph)
      (graph-switch graph)
      state/set-state! :sync-graph/init? false)))
@@ -236,9 +240,11 @@
 (defmethod handle :graph/open-new-window [[_ev repo]]
   (p/let [current-repo (state/get-current-repo)
           target-repo (or repo current-repo)
-          _ (repo-handler/persist-db! current-repo persist-db-noti-m) ;; FIXME: redundant when opening non-current-graph window
+          _ (when (config/local-file-based-graph? current-repo)
+              (repo-handler/persist-db! current-repo persist-db-noti-m)) ;; FIXME: redundant when opening non-current-graph window
           _ (when-not (= current-repo target-repo)
-              (repo-handler/broadcast-persist-db! repo))]
+              (when (config/local-file-based-graph? current-repo)
+                (repo-handler/broadcast-persist-db! repo)))]
     (ui-handler/open-new-window! repo)))
 
 (defmethod handle :graph/migrated [[_ _repo]]
@@ -261,7 +267,7 @@
 (defn get-local-repo
   []
   (when-let [repo (state/get-current-repo)]
-    (when (config/local-db? repo)
+    (when (config/local-file-based-graph? repo)
       repo)))
 
 (defn ask-permission
@@ -375,7 +381,7 @@
 ;; FIXME: config may not be loaded when the graph is ready.
 (defmethod handle :graph/ready
   [[_ repo]]
-  (when (config/local-db? repo)
+  (when (config/local-file-based-graph? repo)
     (p/let [dir               (config/get-repo-dir repo)
             dir-exists?       (fs/dir-exists? dir)]
       (when (and (not dir-exists?)
@@ -384,7 +390,8 @@
   ;; FIXME: an ugly implementation for redirecting to page on new window is restored
   (repo-handler/graph-ready! repo)
   ;; Replace initial fs watcher
-  (fs-watcher/load-graph-files! repo)
+  (when-not (config/db-based-graph? repo)
+    (fs-watcher/load-graph-files! repo))
   ;; TODO(junyi): Notify user to update filename format when the UX is smooth enough
   ;; (when-not config/test?
   ;;   (js/setTimeout
@@ -558,8 +565,8 @@
                 (catch :default e
                   (js/console.error e)))
               (state/set-current-repo! current-repo)
-              (db/listen-and-persist! current-repo)
-              (db/persist-if-idle! current-repo)
+              (db-listener/listen-and-persist! current-repo)
+              (db-listener/persist-if-idle! current-repo)
               (repo-config-handler/restore-repo-config! current-repo)
               (.watch mobile-util/fs-watcher #js {:path current-repo-dir})
               (when graph-switch-f (graph-switch-f current-repo true))
@@ -865,9 +872,18 @@
        {:label "graph-setup"})
       (page-handler/ls-dir-files! st/refresh! opts'))))
 
+(defmethod handle :graph/new-db-graph [[_ _opts]]
+  (state/set-modal!
+   repo/new-db-graph
+   {:id :new-db-graph
+    :label "graph-setup"}))
+
 (defmethod handle :file/alter [[_ repo path content]]
   (p/let [_ (file-handler/alter-file repo path content {:from-disk? true})]
     (ui-handler/re-render-root!)))
+
+(defmethod handle :ui/re-render-root [[_]]
+  (ui-handler/re-render-root!))
 
 (rum/defcs file-id-conflict-item <
   (rum/local false ::resolved?)
@@ -962,6 +978,10 @@
 (defmethod handle :editor/toggle-children-number-list [[_ block]]
   (when-let [blocks (and block (db-model/get-block-immediate-children (state/get-current-repo) (:block/uuid block)))]
     (editor-handler/toggle-blocks-as-own-order-list! blocks)))
+
+(defmethod handle :page/configure [[_ page]]
+  (when-let [repo (state/get-current-repo)]
+    (state/set-modal! #(page/configure repo page))))
 
 (defn run!
   []

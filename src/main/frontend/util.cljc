@@ -45,6 +45,12 @@
      js/Symbol
      (-pr-writer [sym writer _]
        (-write writer (str "\"" (.toString sym) "\"")))))
+#?(:cljs
+   (extend-protocol INamed
+     UUID
+     (-name [this] (str this))
+     (-namespace [_] nil)))
+
 
 #?(:cljs (defonce ^js node-path utils/nodePath))
 #?(:cljs (defonce ^js full-path-extname pathCompleteExtname))
@@ -619,7 +625,7 @@
          (str prefix new-value)))
      s)))
 
-(defonce escape-chars "[]{}().+*?|")
+(def escape-chars "[]{}().+*?|$")
 
 (defn escape-regex-chars
   "Escapes characters in string `old-value"

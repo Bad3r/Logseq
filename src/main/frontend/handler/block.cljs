@@ -5,7 +5,6 @@
    [clojure.walk :as walk]
    [frontend.db :as db]
    [frontend.db.model :as db-model]
-   [frontend.db.react :as react]
    [frontend.mobile.haptics :as haptics]
    [frontend.modules.outliner.core :as outliner-core]
    [frontend.modules.outliner.transaction :as outliner-tx]
@@ -15,10 +14,6 @@
    [logseq.graph-parser.block :as gp-block]))
 
 ;;  Fns
-
-(defn long-page?
-  [repo page-id]
-  (>= (db/get-page-blocks-count repo page-id) db-model/initial-blocks-length))
 
 ;; TODO: reduced version
 (defn- walk-block
@@ -48,26 +43,6 @@
   [block]
   (get-timestamp block "Deadline"))
 
-(defn load-more!
-  [db-id start-id]
-  (let [repo (state/get-current-repo)
-        db (db/get-db repo)
-        block (db/entity repo db-id)
-        block? (not (:block/name block))
-        k (if block?
-            :frontend.db.react/block-and-children
-            :frontend.db.react/page-blocks)
-        query-k [repo k db-id]
-        option (cond-> {:limit db-model/step-loading-blocks}
-                 block?
-                 (assoc :scoped-block-id db-id))
-        more-data (->> (db-model/get-paginated-blocks-no-cache db start-id option)
-                       (map #(db/pull (:db/id %))))]
-    (react/swap-new-result! query-k
-                            (fn [result]
-                              (->> (concat result more-data)
-                                   (util/distinct-by :db/id))))))
-
 (defn indentable?
   [{:block/keys [parent left]}]
   (when parent
@@ -79,9 +54,9 @@
 
 (defn indent-outdent-block!
   [block direction]
-  (outliner-tx/transact!
-    {:outliner-op :move-blocks}
-    (outliner-core/indent-outdent-blocks! [block] (= direction :right))))
+  (let [opts {:outliner-op :move-blocks}]
+    (outliner-tx/transact! opts
+      (outliner-core/indent-outdent-blocks! [block] (= direction :right)))))
 
 (defn select-block!
   [block-uuid]

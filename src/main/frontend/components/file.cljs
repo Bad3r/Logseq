@@ -78,7 +78,8 @@
   {:will-mount (fn [state]
                  (let [*content (atom nil)
                        [path format] (:rum/args state)
-                       repo-dir (config/get-repo-dir (state/get-current-repo))
+                       repo (state/get-current-repo)
+                       repo-dir (config/get-repo-dir repo)
                        [dir path] (cond
                                     ;; assume local file, relative path
                                     (not (string/starts-with? path "/"))
@@ -87,7 +88,11 @@
                                     :else ;; global file on native platform
                                     [nil path])]
                    (when (and format (contains? (gp-config/text-formats) format))
-                     (p/let [content (fs/read-file dir path)]
+                     (p/let [content (if (and (config/db-based-graph? repo)
+                                              ;; not global
+                                              (not (string/starts-with? path "/")))
+                                       (db/get-file path)
+                                       (fs/read-file dir path))]
                        (reset! *content (or content ""))))
                    (assoc state ::file-content *content)))
    :did-mount (fn [state]
@@ -103,9 +108,15 @@
         original-name (db/get-file-page (or path rel-path))
         in-db? (when-not (path/absolute? path)
                  (boolean (db/get-file (or path rel-path))))
-        file-fpath (if in-db?
-                     (path/path-join repo-dir path)
-                     path)
+        file-path (cond
+                    (config/db-based-graph? (state/get-current-repo))
+                    path
+
+                    in-db?
+                    (path/path-join repo-dir path)
+
+                    :else
+                    path)
         random-id (str (d/squuid))
         content (rum/react (::file-content state))]
     [:div.file {:id (str "file-edit-wrapper-" random-id)
@@ -143,7 +154,7 @@
        (let [content' (string/trim content)
              mode (util/get-file-ext path)]
          (lazy-editor/editor {:file?     true
-                              :file-path file-fpath}
+                              :file-path file-path}
                              (str "file-edit-" random-id)
                              {:data-lang mode}
                              content'

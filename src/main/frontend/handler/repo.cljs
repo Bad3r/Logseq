@@ -6,6 +6,7 @@
             [frontend.context.i18n :refer [t]]
             [frontend.date :as date]
             [frontend.db :as db]
+            [frontend.db.restore :as db-restore]
             [frontend.fs :as fs]
             [frontend.fs.nfs :as nfs]
             [frontend.handler.file :as file-handler]
@@ -31,7 +32,9 @@
             [frontend.mobile.util :as mobile-util]
             [medley.core :as medley]
             [logseq.common.path :as path]
-            [logseq.common.config :as common-config]))
+            [logseq.common.config :as common-config]
+            [frontend.db.react :as react]
+            [frontend.db.listener :as db-listener]))
 
 ;; Project settings should be checked in two situations:
 ;; 1. User changes the config.edn directly in logseq.com (fn: alter-file)
@@ -339,7 +342,8 @@
 
 (defn remove-repo!
   [{:keys [url] :as repo}]
-  (let [delete-db-f (fn []
+  (let [db-based? (config/db-based-graph? url)
+        delete-db-f (fn []
                       (let [graph-exists? (db/get-db url)
                             current-repo (state/get-current-repo)]
                         (db/remove-conn! url)
@@ -348,16 +352,18 @@
                         (state/delete-repo! repo)
                         (when graph-exists? (ipc/ipc "graphUnlinked" repo))
                         (when (= current-repo url)
-                          (state/set-current-repo! (:url (first (state/get-repos)))))))]
-    (when (or (config/local-db? url) (config/demo-graph? url))
-      (-> (p/let [_ (idb/clear-local-db! url)] ; clear file handles
-            )
+                          (when-let [graph (:url (first (state/get-repos)))]
+                            (state/pub-event! [:graph/switch graph {}])))))]
+    (when (or (config/local-file-based-graph? url)
+              db-based?
+              (config/demo-graph? url))
+      (-> (idb/clear-local-db! url)     ; clear file handles
           (p/finally delete-db-f)))))
 
 (defn start-repo-db-if-not-exists!
   [repo]
   (state/set-current-repo! repo)
-  (db/start-db-conn! repo))
+  (db/start-db-conn! repo {:listen-handler db-listener/listen-and-persist!}))
 
 (defn- setup-local-repo-if-not-exists-impl!
   []
@@ -367,7 +373,7 @@
           repo-dir (config/get-repo-dir repo)]
       (p/do! (fs/mkdir-if-not-exists repo-dir) ;; create memory://local
              (state/set-current-repo! repo)
-             (db/start-db-conn! repo)
+             (db/start-db-conn! repo {:listen-handler db-listener/listen-and-persist!})
              (when-not config/publishing?
                (let [dummy-notes (t :tutorial/dummy-notes)]
                  (create-dummy-notes-page repo dummy-notes)))
@@ -400,12 +406,12 @@
   [repo]
   (p/do!
    (state/set-db-restoring! true)
-   (db/restore-graph! repo)
+   (db-restore/restore-graph! repo)
    (repo-config-handler/restore-repo-config! repo)
    (when (config/global-config-enabled?)
      (global-config-handler/restore-global-config!))
     ;; Don't have to unlisten the old listener, as it will be destroyed with the conn
-   (db/listen-and-persist! repo)
+   (db-listener/listen-and-persist! repo)
    (ui-handler/add-style-if-exists!)
    (state/set-db-restoring! false)))
 
@@ -427,7 +433,7 @@
     (let [dir (config/get-repo-dir repo)]
       (when-not (state/unlinked-dir? dir)
        (route-handler/redirect-to-home!)
-       (let [local? (config/local-db? repo)]
+       (let [local? (config/local-file-based-graph? repo)]
          (if local?
            (nfs-rebuild-index! repo ok-handler)
            (rebuild-index! repo))
@@ -445,7 +451,7 @@
     (p/do!
      (when before
        (before))
-     (db/persist! repo)
+     (db-listener/persist! repo)
      (when on-success
        (on-success)))
     (p/catch (fn [error]
@@ -531,3 +537,38 @@
   ;; FIXME: Call electron that the graph is loaded, an ugly implementation for redirect to page when graph is restored
   [graph]
   (ipc/ipc "graphReady" graph))
+
+(defn- create-db [full-graph-name]
+  (p/let [_ (ipc/ipc :db-new full-graph-name)
+          _ (start-repo-db-if-not-exists! full-graph-name)
+          _ (state/add-repo! {:url full-graph-name})
+          _ (route-handler/redirect-to-home!)
+          _ (db/transact! full-graph-name [(react/kv :db/type "db")]
+                          {:skip-persist? true})
+          initial-data [{:block/uuid (db/new-block-id)
+                         :file/path (str "logseq/" "config.edn")
+                         :file/content config/config-default-content}
+                        {:block/uuid (db/new-block-id)
+                         :file/path (str "logseq/" "custom.css")
+                         :file/content ""}
+                        {:block/uuid (db/new-block-id)
+                         :file/path (str "logseq/" "custom.js")
+                         :file/content ""}]
+          _ (db/transact! full-graph-name initial-data)
+          _ (repo-config-handler/set-repo-config-state! full-graph-name config/config-default-content)
+          ;; TODO: handle global graph
+
+          _ (state/pub-event! [:page/create (date/today) {:redirect? false}])]
+    (js/setTimeout ui-handler/re-render-root! 100)
+    (prn "New db created: " full-graph-name)))
+
+(defn new-db!
+  "Handler for creating a new database graph"
+  [graph]
+  (let [full-graph-name (str config/db-version-prefix graph)
+        graph-already-exists? (some #(= (:url %) full-graph-name) (state/get-repos))]
+    (if graph-already-exists?
+      (state/pub-event! [:notification/show
+                         {:content (str "The graph '" graph "' already exists. Please try again with another name.")
+                          :status :error}])
+      (create-db full-graph-name))))

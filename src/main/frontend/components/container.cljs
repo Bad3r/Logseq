@@ -25,6 +25,7 @@
             [frontend.handler.route :as route-handler]
             [frontend.handler.user :as user-handler]
             [frontend.handler.whiteboard :as whiteboard-handler]
+            [frontend.handler.recent :as recent-handler]
             [frontend.mixins :as mixins]
             [frontend.mobile.action-bar :as action-bar]
             [frontend.mobile.footer :as footer]
@@ -166,13 +167,7 @@
 
    {:class "recent"}
 
-   (let [pages (->> (db/sub-key-value :recent/pages)
-                    (remove string/blank?)
-                    (filter string?)
-                    (map (fn [page] {:lowercase (util/safe-page-name-sanity-lc page)
-                                     :page page}))
-                    (util/distinct-by :lowercase)
-                    (map :page))]
+   (let [pages (recent-handler/get-recent-pages)]
      [:ul.text-sm
       (for [name pages]
         (when-let [entity (db/entity [:block/name (util/safe-page-name-sanity-lc name)])]
@@ -471,7 +466,7 @@
                (when-let [pos (some-> (state/get-input) cursor/pos)]
                  (state/set-editor-last-pos! pos)))
     :onStop (fn [_event]
-              (when-let [block (get-in @state/state [:editor/block :block/uuid])]
+              (when-let [block (get @(get @state/state :editor/block) :block/uuid)]
                 (editor-handler/edit-block! block :max (:block/uuid block))
                 (when-let [input (state/get-input)]
                   (when-let [saved-cursor (state/get-editor-last-pos)]
@@ -656,7 +651,8 @@
      [:div.menu-backdrop {:on-mouse-down (fn [e] (hide-context-menu-and-clear-selection e))}]
      [:div#custom-context-menu
       {:ref ref
-       :style {:left (str (first position) "px")
+       :style {:z-index 999
+               :left (str (first position) "px")
                :top (str (second position) "px")}} links]]))
 
 (rum/defc custom-context-menu < rum/reactive

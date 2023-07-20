@@ -9,7 +9,7 @@
             [clojure.set :as set]
             [medley.core :as medley]
             [frontend.util.drawer :as drawer]
-            [frontend.util.property :as property]))
+            [frontend.util.property-edit :as property-edit]))
 
 ;;;; APIs
 
@@ -160,22 +160,23 @@
   []
   (when-let [block (state/get-edit-block)]
     (when-let [content (:block/content (db/entity (:db/id block)))]
-      (let [content' (-> (property/remove-built-in-properties (:block/format block) content)
+      (let [repo (state/get-current-repo)
+            content' (-> (property-edit/remove-built-in-properties-when-file-based repo (:block/format block) content)
                          (drawer/remove-logbook))]
         (state/set-edit-content! (state/get-edit-input-id) content')))))
 
 (defn- get-next-tx-editor-cursor
   [tx-id]
-  (let [result (->> (sort (keys (:history/tx->editor-cursor @state/state)))
+  (let [result (->> (sort (keys @(:history/tx->editor-cursor @state/state)))
                     (split-with #(not= % tx-id))
                     second)]
     (when (> (count result) 1)
       (when-let [next-tx-id (nth result 1)]
-        (get-in @state/state [:history/tx->editor-cursor next-tx-id])))))
+        (get @(get @state/state :history/tx->editor-cursor) next-tx-id)))))
 
 (defn- get-previous-tx-id
   [tx-id]
-  (let [result (->> (sort (keys (:history/tx->editor-cursor @state/state)))
+  (let [result (->> (sort (keys @(:history/tx->editor-cursor @state/state)))
                     (split-with #(not= % tx-id))
                     first)]
     (when (>= (count result) 1)
@@ -184,14 +185,14 @@
 (defn- get-previous-tx-editor-cursor
   [tx-id]
   (when-let [prev-tx-id (get-previous-tx-id tx-id)]
-    (get-in @state/state [:history/tx->editor-cursor prev-tx-id])))
+    (get @(get @state/state :history/tx->editor-cursor) prev-tx-id)))
 
 (defn undo
   []
   (when-let [e (smart-pop-undo)]
     (let [{:keys [txs tx-meta tx-id]} e
           new-txs (get-txs false txs)
-          current-editor-cursor (get-in @state/state [:history/tx->editor-cursor tx-id])
+          current-editor-cursor (get @(get @state/state :history/tx->editor-cursor) tx-id)
           save-block? (= (:outliner-op tx-meta) :save-block)
           prev-editor-cursor (get-previous-tx-editor-cursor tx-id)
           editor-cursor (if (and save-block?
@@ -201,8 +202,7 @@
                           current-editor-cursor)]
       (push-redo e)
       (transact! new-txs (merge {:undo? true}
-                                tx-meta
-                                (select-keys e [:pagination-blocks-range])))
+                                tx-meta))
       (set-editor-content!)
       (when (:whiteboard/transact? tx-meta)
         (state/pub-event! [:whiteboard/undo e]))
@@ -214,14 +214,13 @@
   []
   (when-let [{:keys [txs tx-meta tx-id] :as e} (smart-pop-redo)]
     (let [new-txs (get-txs true txs)
-          current-editor-cursor (get-in @state/state [:history/tx->editor-cursor tx-id])
+          current-editor-cursor (get @(get @state/state :history/tx->editor-cursor) tx-id)
           editor-cursor (if (= (:outliner-op tx-meta) :save-block)
                           current-editor-cursor
                           (get-next-tx-editor-cursor tx-id))]
       (push-undo e)
       (transact! new-txs (merge {:redo? true}
-                                tx-meta
-                                (select-keys e [:pagination-blocks-range])))
+                                tx-meta))
       (set-editor-content!)
       (when (:whiteboard/transact? tx-meta)
         (state/pub-event! [:whiteboard/redo e]))
@@ -263,7 +262,6 @@
                     :blocks updated-blocks
                     :txs tx-data
                     :tx-meta tx-meta
-                    :pagination-blocks-range (get-in [:ui/pagination-blocks-range (get-in tx-report [:db-after :max-tx])] @state/state)
                     :app-state (select-keys @state/state
                                             [:route-match
                                              :ui/sidebar-open?

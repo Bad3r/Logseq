@@ -1,22 +1,14 @@
 (ns frontend.db
   "Main entry ns for db related fns"
-  (:require [clojure.core.async :as async]
-            [datascript.core :as d]
-            [logseq.db.schema :as db-schema]
+  (:require [datascript.core :as d]
             [frontend.db.conn :as conn]
-            [logseq.db.default :as default-db]
             [frontend.db.model]
             [frontend.db.query-custom]
             [frontend.db.query-react]
             [frontend.db.react :as react]
             [frontend.db.utils]
-            [frontend.db.persist :as db-persist]
-            [frontend.db.migrate :as db-migrate]
             [frontend.namespaces :refer [import-vars]]
-            [frontend.state :as state]
-            [frontend.util :as util]
-            [promesa.core :as p]
-            [electron.ipc :as ipc]))
+            [logseq.db.default :as default-db]))
 
 (import-vars
  [frontend.db.conn
@@ -45,7 +37,7 @@
   get-custom-css get-date-scheduled-or-deadlines
   get-file-last-modified-at get-file get-file-page get-file-page-id file-exists?
   get-files get-files-blocks get-files-full get-journals-length get-pages-with-file
-  get-latest-journals get-page get-page-alias get-page-alias-names get-paginated-blocks
+  get-latest-journals get-page get-page-alias get-page-alias-names
   get-page-blocks-count get-page-blocks-no-cache get-page-file get-page-format get-page-properties
   get-page-referenced-blocks get-page-referenced-blocks-full get-page-referenced-pages get-page-unlinked-references
   get-all-pages get-pages get-pages-relation get-pages-that-mentioned-page get-tag-pages
@@ -68,132 +60,11 @@
 
  [logseq.db.default built-in-pages-names built-in-pages])
 
-(defn- old-schema?
-  "Requires migration if the schema version is older than db-schema/version"
-  [db]
-  (let [v (db-migrate/get-schema-version db)
-        ;; backward compatibility
-        v (if (integer? v) v 0)]
-    (cond
-      (= db-schema/version v)
-      false
-
-      (< db-schema/version v)
-      (do
-        (js/console.error "DB schema version is newer than the app, please update the app. " ":db-version" v)
-        false)
-
-      :else
-      true)))
-
-;; persisting DBs between page reloads
-(defn persist! [repo]
-  (let [key (datascript-db repo)
-        db (get-db repo)]
-    (when db
-      (let [db-str (if db (db->string db) "")]
-        (p/let [_ (db-persist/save-graph! key db-str)])))))
-
-(defonce persistent-jobs (atom {}))
-
-(defn clear-repo-persistent-job!
-  [repo]
-  (when-let [old-job (get @persistent-jobs repo)]
-    (js/clearTimeout old-job)))
-
-(defn persist-if-idle!
-  [repo]
-  (clear-repo-persistent-job! repo)
-  (let [job (js/setTimeout
-             (fn []
-               (if (and (state/input-idle? repo)
-                        (state/db-idle? repo)
-                        ;; It's ok to not persist here since new changes
-                        ;; will be notified when restarting the app.
-                        (not (state/whiteboard-route?)))
-                 (persist! repo)
-                 ;; (state/set-db-persisted! repo true)
-
-                 (persist-if-idle! repo)))
-             3000)]
-    (swap! persistent-jobs assoc repo job)))
-
-;; only save when user's idle
-
-(defonce *db-listener (atom nil))
-
-(defn- repo-listen-to-tx!
-  [repo conn]
-  (d/listen! conn :persistence
-             (fn [tx-report]
-               (when (not (:new-graph? (:tx-meta tx-report))) ; skip initial txs
-                 (if (util/electron?)
-                   (when-not (:dbsync? (:tx-meta tx-report))
-                     ;; sync with other windows if needed
-                     (p/let [graph-has-other-window? (ipc/ipc "graphHasOtherWindow" repo)]
-                       (when graph-has-other-window?
-                         (ipc/ipc "dbsync" repo {:data (db->string (:tx-data tx-report))}))))
-                   (do
-                     (state/set-last-transact-time! repo (util/time-ms))
-                     (persist-if-idle! repo)))
-
-                 (when-let [db-listener @*db-listener]
-                   (db-listener repo tx-report))))))
-
-(defn listen-and-persist!
-  [repo]
-  (when-let [conn (get-db repo false)]
-    (d/unlisten! conn :persistence)
-    (repo-listen-to-tx! repo conn)))
-
 (defn start-db-conn!
   ([repo]
    (start-db-conn! repo {}))
   ([repo option]
-   (conn/start! repo
-                (assoc option
-                       :listen-handler listen-and-persist!))))
-
-(defn restore-graph-from-text!
-  "Swap db string into the current db status
-   stored: the text to restore from"
-  [repo stored]
-  (p/let [db-name (datascript-db repo)
-          db-conn (d/create-conn db-schema/schema)
-          _ (swap! conns assoc db-name db-conn)
-          _ (when stored
-              (let [stored-db (try (string->db stored)
-                                   (catch :default _e
-                                     (js/console.warn "Invalid graph cache")
-                                     (d/empty-db db-schema/schema)))
-                    attached-db (d/db-with stored-db
-                                           default-db/built-in-pages) ;; TODO bug overriding uuids?
-                    db (if (old-schema? attached-db)
-                         (db-migrate/migrate attached-db)
-                         attached-db)]
-                (conn/reset-conn! db-conn db)))]
-    (d/transact! db-conn [{:schema/version db-schema/version}])))
-
-(defn restore-graph!
-  "Restore db from serialized db cache"
-  [repo]
-  (p/let [db-name (datascript-db repo)
-          stored (db-persist/get-serialized-graph db-name)]
-    (restore-graph-from-text! repo stored)))
-
-(defn restore!
-  [repo]
-  (p/let [_ (restore-graph! repo)]
-    (listen-and-persist! repo)))
-
-(defn run-batch-txs!
-  []
-  (let [chan (state/get-db-batch-txs-chan)]
-    (async/go-loop []
-      (let [f (async/<! chan)]
-        (f))
-      (recur))
-    chan))
+   (conn/start! repo option)))
 
 (defn new-block-id
   []

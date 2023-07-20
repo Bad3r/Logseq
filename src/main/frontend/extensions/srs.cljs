@@ -5,7 +5,7 @@
             [frontend.util :as util]
             [logseq.graph-parser.property :as gp-property]
             [logseq.graph-parser.util.page-ref :as page-ref]
-            [frontend.util.property :as property]
+            [frontend.util.property-edit :as property-edit]
             [frontend.util.drawer :as drawer]
             [frontend.util.persist-var :as persist-var]
             [frontend.db :as db]
@@ -29,7 +29,8 @@
             [rum.core :as rum]
             [frontend.modules.shortcut.core :as shortcut]
             [medley.core :as medley]
-            [frontend.context.i18n :refer [t]]))
+            [frontend.context.i18n :refer [t]]
+            [frontend.config :as config]))
 
 ;;; ================================================================
 ;;; Commentary
@@ -108,7 +109,8 @@
   [block props]
   (editor-handler/save-block-if-changed!
    block
-   (property/insert-properties (:block/format block) (:block/content block) props)
+   (property-edit/insert-properties-when-file-based
+    (state/get-current-repo) (:block/format block) (:block/content block) props)
    {:force? true}))
 
 (defn- reset-block-card-properties!
@@ -224,14 +226,13 @@
   ICardShow
   (show-cycle [_this phase]
     (let [block-id (:db/id block)
-          blocks (-> (db/get-paginated-blocks (state/get-current-repo) block-id
-                                              {:scoped-block-id block-id})
+          blocks (-> [(db/entity block-id)]
                      clear-collapsed-property)
           cloze? (has-cloze? blocks)]
       (case phase
         1
         (let [blocks-count (count blocks)]
-          {:value [(first blocks)] :next-phase (if (or (> blocks-count 1) (nil? cloze?)) 2 3)})
+          {:value [(first blocks)] :next-phase (if (or (> blocks-count 1) cloze?) 2 3)})
         2
         {:value blocks :next-phase (if cloze? 3 1)}
         3
@@ -240,7 +241,7 @@
   (show-cycle-config [_this phase]
     (case phase
       1
-      {}
+      {:hide-children? true}
       2
       {}
       3
@@ -269,7 +270,7 @@
                                                    (string/starts-with? query-string "["))
                                          (page-ref/->page-ref (string/trim query-string))
                                          query-string)
-                          {:keys [query sort-by rules]} (query-dsl/parse query-string)
+                          {:keys [query sort-by rules]} (query-dsl/parse query-string (config/db-based-graph? repo))
                           query* (util/concat-without-nil
                                   [['?b :block/refs '?br] ['?br :block/name card-hash-tag]]
                                   (if (coll? (first query)) query [query]))]
@@ -523,8 +524,7 @@
 
 (rum/defc preview-cp < rum/reactive db-mixins/query
   [block-id]
-  (let [blocks (db/get-paginated-blocks (state/get-current-repo) block-id
-                                        {:scoped-block-id block-id})]
+  (let [blocks [(db/entity block-id)]]
     (view-modal blocks {:preview? true} (atom 0))))
 
 (defn preview
@@ -774,7 +774,8 @@
   [block-id]
   (when-let [block (db/entity [:block/uuid block-id])]
     (when-let [content (:block/content block)]
-      (let [content (-> (property/remove-built-in-properties (:block/format block) content)
+      (let [content (-> (property-edit/remove-built-in-properties-when-file-based
+                         (state/get-current-repo) (:block/format block) content)
                         (drawer/remove-logbook))]
         (editor-handler/save-block!
          (state/get-current-repo)
@@ -785,7 +786,8 @@
   ([] (batch-make-cards! (state/get-selection-block-ids)))
   ([block-ids]
    (let [block-content-fn (fn [block]
-                            [block (-> (property/remove-built-in-properties (:block/format block) (:block/content block))
+                            [block (-> (property-edit/remove-built-in-properties-when-file-based
+                                        (state/get-current-repo) (:block/format block) (:block/content block))
                                        (drawer/remove-logbook)
                                        string/trim
                                        (str " #" card-hash-tag))])

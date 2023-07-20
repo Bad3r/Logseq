@@ -21,14 +21,9 @@
             [logseq.graph-parser.util.db :as db-util]
             [logseq.graph-parser.util :as gp-util]
             [cljs-time.core :as t]
-            [cljs-time.format :as tf]))
-
-;; lazy loading
-
-(def initial-blocks-length 50)
-
-(def step-loading-blocks 25)
-
+            [cljs-time.format :as tf]
+            ;; add map ops to datascript Entity
+            [frontend.db.datascript.entity-plus :as entity-plus]))
 
 ;; TODO: extract to specific models and move data transform logic to the
 ;; corresponding handlers.
@@ -45,6 +40,7 @@
     :block/_refs
     :block/path-refs
     :block/tags
+    :block/instance
     :block/content
     :block/marker
     :block/priority
@@ -62,16 +58,6 @@
     :block/file
     {:block/page [:db/id :block/name :block/original-name :block/journal-day]}
     {:block/_parent ...}])
-
-(defn sub-block
-  [id]
-  (when-let [repo (state/get-current-repo)]
-    (->
-     (react/q repo [:frontend.db.react/block id]
-              {:query-fn (fn [_]
-                           (db-utils/pull (butlast block-attrs) id))}
-              nil)
-     react)))
 
 (def get-original-name util/get-page-original-name)
 
@@ -426,6 +412,28 @@ independent of format as format specific heading characters are stripped"
       result'
       blocks)))
 
+(defn sub-block
+  [id]
+  (when-let [repo (state/get-current-repo)]
+    (->
+     (react/q repo [:frontend.db.react/block id]
+       {:query-fn (fn [_]
+                    (let [e (db-utils/entity id)
+                          children (map :db/id (sort-by-left (:block/_parent e) e))]
+                      [e {:original-name (:block/original-name e)
+                          :type (:block/type e)
+                          :schema (:block/schema e)
+                          :content (:block/content e)
+                          :marker (:block/marker e)
+                          :priority (:block/priority e)
+                          :properties (:block/properties e)
+                          :properties-values (:block/properties-text-values e)
+                          :children children
+                          :collapsed? (:block/collapsed? e)}]))}
+       nil)
+     react
+     first)))
+
 (defn sort-by-left-recursive
   [form]
   (walk/postwalk (fn [f]
@@ -507,24 +515,6 @@ independent of format as format specific heading characters are stripped"
                                   (not= parent-id (:db/id node)))
                          node)) lefts))))
 
-(defn- get-next-outdented-block
-  "Get the next outdented block of the block that has the `id`.
-  e.g.
-  - a
-    - b
-      - c
-  - d
-
-  The next outdented block of `c` is `d`."
-  [db id]
-  (when-let [block (db-utils/entity db id)]
-    (let [parent (:block/parent block)]
-      (if-let [parent-sibling (get-by-parent-&-left db
-                                                    (:db/id (:block/parent parent))
-                                                    (:db/id parent))]
-        parent-sibling
-        (get-next-outdented-block db (:db/id parent))))))
-
 (defn top-block?
   [block]
   (= (:db/id (:block/parent block))
@@ -559,63 +549,6 @@ independent of format as format specific heading characters are stripped"
           '[:db/id :block/collapsed? :block/properties {:block/parent ...}]
           [:block/uuid block-id]))
 
-(defn get-next-open-block
-  ([db block]
-   (get-next-open-block db block nil))
-  ([db block scoped-block-id]
-   (let [block-id (:db/id block)
-         block-parent-id (:db/id (:block/parent block))
-         next-block (or
-                     (if (and (collapsed-and-has-children? db block)
-                              (not= block-id scoped-block-id)) ; skips children
-                       ;; Sibling
-                       (get-by-parent-&-left db block-parent-id block-id)
-                       (or
-                        ;; Child
-                        (get-by-parent-&-left db block-id block-id)
-                        ;; Sibling
-                        (get-by-parent-&-left db block-parent-id block-id)))
-
-                     ;; Next outdented block
-                     (get-next-outdented-block db block-id))]
-     (if (and scoped-block-id next-block)
-       (let [parents (->> (get-block-parents (state/get-current-repo) (:block/uuid next-block))
-                          (map :db/id)
-                          (set))]
-         (when (contains? parents scoped-block-id)
-           next-block))
-       next-block))))
-
-(defn get-paginated-blocks-no-cache
-  "Result should be sorted."
-  [db start-id {:keys [limit include-start? scoped-block-id end-id]}]
-  (when-let [start (db-utils/entity db start-id)]
-    (let [scoped-block-parents (when scoped-block-id
-                                 (let [block (db-utils/entity db scoped-block-id)]
-                                   (->> (get-block-parents (state/get-current-repo) (:block/uuid block))
-                                        (map :db/id)
-                                        (set))))
-          result (loop [block start
-                        result []]
-                   (if (and limit (>= (count result) limit))
-                     result
-                     (let [next-block (get-next-open-block db block scoped-block-id)]
-                       (if next-block
-                         (cond
-                           (and (seq scoped-block-parents)
-                                (contains? scoped-block-parents (:db/id (:block/parent next-block))))
-                           result
-
-                           (and end-id (= end-id (:db/id next-block)))
-                           (conj result next-block)
-
-                           :else
-                           (recur next-block (conj result next-block)))
-                         result))))]
-      (if include-start?
-        (cons start result)
-        result))))
-
 (defn get-block-last-direct-child
   "Notice: if `not-collapsed?` is true, will skip searching for any collapsed block."
   ([db db-id]
@@ -629,39 +562,6 @@ independent of format as format specific heading characters are stripped"
              all-left (set (concat (map (comp :db/id :block/left) children) [db-id]))
              all-ids (set (map :db/id children))]
          (first (set/difference all-ids all-left)))))))
-
-(defn get-block-last-child
-  [db db-id]
-  (let [last-child (get-block-last-direct-child db db-id)]
-    (loop [prev last-child
-           last-child last-child]
-      (if last-child
-        (recur last-child (get-block-last-direct-child db last-child))
-        prev))))
-
-(defn get-prev-open-block
-  [db id]
-  (let [block (db-utils/entity db id)
-        left (:block/left block)
-        left-id (:db/id left)]
-    (if (= (:db/id left) (:db/id (:block/parent block)))
-      left-id
-      (if (util/collapsed? left)
-        left-id
-        (or (get-block-last-child db (:db/id left)) left-id)))))
-
-(defn recursive-child?
-  [repo child-id parent-id]
-  (let [*last-node (atom nil)]
-    (loop [node (db-utils/entity repo child-id)]
-      (when-not (= @*last-node node)
-        (reset! *last-node node)
-        (if node
-          (let [parent (:block/parent node)]
-            (if (= (:db/id parent) parent-id)
-              true
-              (recur parent)))
-          false)))))
 
 (defn get-prev-sibling
   [db id]
@@ -713,147 +613,6 @@ independent of format as format specific heading characters are stripped"
                                       (nth blocks (inc i)))
           (nth blocks i))))
     blocks)))
-
-(defn- get-start-id-for-pagination-query
-  [repo-url current-db {:keys [db-before tx-meta] :as tx-report}
-   result outliner-op page-id block-id tx-block-ids]
-  (let [db-before (or db-before current-db)
-        cached-ids (map :db/id @result)
-        cached-ids-set (set (conj cached-ids page-id))
-        first-changed-id (cond
-                           (= (:real-outliner-op tx-meta) :indent-outdent)
-                           (if (state/logical-outdenting?)
-                             (first (:move-blocks tx-meta))
-                             (last (:move-blocks tx-meta)))
-
-                           (= outliner-op :move-blocks)
-                           (let [{:keys [move-blocks target from-page to-page]} tx-meta]
-                             (cond
-                               (= page-id target) ; move to the first block
-                               nil
-
-                               (and from-page to-page (not= from-page to-page))
-                               (if (= page-id from-page)
-                                 (first move-blocks)
-                                 target)
-
-                               :else
-                               ;; same page, get the most top block before dragging
-                               (let [match-ids (set (conj move-blocks target))]
-                                 (loop [[id & others] cached-ids]
-                                   (if id
-                                     (if (contains? match-ids id)
-                                       id
-                                       (when (seq others)
-                                         (recur others)))
-                                     nil)))))
-                           :else
-                           (let [insert? (= :insert-blocks outliner-op)]
-                             (some #(when (and (or (and insert? (not (contains? cached-ids-set %)))
-                                                   true)
-                                               (recursive-child? repo-url % block-id))
-                                      %) tx-block-ids)))]
-    (when first-changed-id
-      (or (get-prev-open-block db-before first-changed-id)
-          (get-prev-open-block current-db first-changed-id)))))
-
-(defn- build-paginated-blocks-from-cache
-  "Notice: tx-report could be nil."
-  [repo-url tx-report result outliner-op page-id block-id tx-block-ids scoped-block-id]
-  (let [{:keys [tx-meta]} tx-report
-        current-db (conn/get-db repo-url)]
-    (cond
-      (and (or (:undo? tx-meta) (:redo? tx-meta)) @result)
-      (let [blocks-range (:pagination-blocks-range tx-meta)
-            [start-block-id end-block-id] (:new blocks-range)]
-        (get-paginated-blocks-no-cache current-db start-block-id
-                                       {:end-id end-block-id
-                                        :include-start? true
-                                        :scoped-block-id scoped-block-id}))
-
-      (and (= :delete-blocks outliner-op)
-           (<= (count @result) initial-blocks-length)) ; load more blocks
-      nil
-
-      (= :save-block outliner-op)
-      @result
-
-      (contains? #{:insert-blocks :collapse-expand-blocks :move-blocks} outliner-op)
-      (when-let [start-id (get-start-id-for-pagination-query
-                           repo-url current-db tx-report result outliner-op page-id block-id tx-block-ids)]
-        (let [start-page? (:block/name (db-utils/entity start-id))]
-          (when-not start-page?
-            (let [previous-blocks (take-while (fn [b] (not= start-id (:db/id b))) @result)
-                  limit (-> (max (- initial-blocks-length (count previous-blocks))
-                                 (count tx-block-ids))
-                            (+ 25))
-                  more (get-paginated-blocks-no-cache current-db start-id {:limit limit
-                                                                           :include-start? true
-                                                                           :scoped-block-id scoped-block-id})]
-              (concat previous-blocks more)))))
-
-      :else
-      nil)))
-
-(defn get-paginated-blocks
-  "Get paginated blocks for a page or a specific block.
-   `scoped-block-id`: if specified, returns its children only."
-  ([repo-url block-id]
-   (get-paginated-blocks repo-url block-id {}))
-  ([repo-url block-id {:keys [pull-keys start-block limit use-cache? scoped-block-id]
-                       :or {pull-keys '[* :block/_refs]
-                            limit initial-blocks-length
-                            use-cache? true
-                            scoped-block-id nil}}]
-   (when block-id
-     (assert (integer? block-id) (str "wrong block-id: " block-id))
-     (let [entity (db-utils/entity repo-url block-id)
-           page? (some? (:block/name entity))
-           page-entity (if page? entity (:block/page entity))
-           page-id (:db/id page-entity)
-           bare-page-map {:db/id page-id
-                          :block/name (:block/name page-entity)
-                          :block/original-name (:block/original-name page-entity)
-                          :block/journal-day (:block/journal-day page-entity)}
-           query-key (if page?
-                       :frontend.db.react/page-blocks
-                       :frontend.db.react/block-and-children)]
-       (some->
-        (react/q repo-url [query-key block-id]
-                 {:use-cache? use-cache?
-                  :query-fn (fn [db tx-report result]
-                              (let [tx-data (:tx-data tx-report)
-                                    refs (some->> (filter #(= :block/refs (:a %)) tx-data)
-                                                  (map :v))
-                                    tx-block-ids (distinct (-> (map :e tx-data)
-                                                               (concat refs)))
-                                    [tx-id->block cached-id->block] (when (and tx-report result)
-                                                                      (let [blocks (->> (db-utils/pull-many repo-url pull-keys tx-block-ids)
-                                                                                        (remove nil?))]
-                                                                        [(zipmap (mapv :db/id blocks) blocks)
-                                                                         (zipmap (mapv :db/id @result) @result)]))
-                                    limit (if (and result @result)
-                                            (max (+ (count @result) 5) limit)
-                                            limit)
-                                    outliner-op (get-in tx-report [:tx-meta :outliner-op])
-                                    blocks (build-paginated-blocks-from-cache repo-url tx-report result outliner-op page-id block-id tx-block-ids scoped-block-id)
-                                    blocks (or blocks
-                                               (get-paginated-blocks-no-cache (conn/get-db repo-url) block-id {:limit limit
-                                                                                                               :include-start? (not page?)
-                                                                                                               :scoped-block-id scoped-block-id}))
-                                    block-eids (map :db/id blocks)
-                                    blocks (if (and (seq tx-id->block)
-                                                    (not (contains? #{:move-blocks} outliner-op)))
-                                             (map (fn [id]
-                                                    (or (get tx-id->block id)
-                                                        (get cached-id->block id)
-                                                        (db-utils/pull repo-url pull-keys id))) block-eids)
-                                             (db-utils/pull-many repo-url pull-keys block-eids))
-                                    blocks (remove (fn [b] (nil? (:block/content b))) blocks)]
-
-                                (map (fn [b] (assoc b :block/page bare-page-map)) blocks)))}
-                 nil)
-        react)))))
 
 (defn get-page-blocks-no-cache
   "Return blocks of the designated page, without using cache.
@@ -981,6 +740,7 @@ independent of format as format specific heading characters are stripped"
     (cons (dissoc blocks-tree :block/_parent) (mapcat flatten-tree children))
     [blocks-tree]))
 
+;; TODO: performance enhance
 (defn get-block-and-children
   [repo block-uuid]
   (some-> (d/q
@@ -992,7 +752,8 @@ independent of format as format specific heading characters are stripped"
            block-uuid
            block-attrs)
           first
-          flatten-tree))
+          flatten-tree
+          (->> (map #(db-utils/update-block-content % (:db/id %))))))
 
 (defn get-file-page
   ([file-path]
@@ -1336,29 +1097,28 @@ independent of format as format specific heading characters are stripped"
 (defn get-page-unlinked-references
   [page]
   (when-let [repo (state/get-current-repo)]
-    (when (conn/get-db repo)
-      (let [page (util/safe-page-name-sanity-lc page)
-            page-id     (:db/id (db-utils/entity [:block/name page]))
-            alias-names (get-page-alias-names repo page)
-            patterns    (->> (conj alias-names page)
-                             (map pattern))
-            filter-fn   (fn [datom]
-                          (some (fn [p]
-                                  (re-find p (->> (:v datom)
-                                                  (drawer/remove-logbook))))
-                                patterns))]
-        (->> (react/q repo [:frontend.db.react/page-unlinked-refs page-id]
-                      {:query-fn (fn [db _tx-report _result]
-                                   (let [ids
-                                         (->> (d/datoms db :aevt :block/content)
-                                              (filter filter-fn)
-                                              (map :e))
-                                         result (d/pull-many db block-attrs ids)]
-                                     (remove (fn [block] (= page-id (:db/id (:block/page block)))) result)))}
-                      nil)
-             react
-             (sort-by-left-recursive)
-             db-utils/group-by-page)))))
+    (let [page (util/safe-page-name-sanity-lc page)
+          page-id     (:db/id (db-utils/entity [:block/name page]))
+          alias-names (get-page-alias-names repo page)
+          patterns    (->> (conj alias-names page)
+                           (map pattern))
+          filter-fn   (fn [datom]
+                        (some (fn [p]
+                                (re-find p (->> (:v datom)
+                                                (drawer/remove-logbook))))
+                              patterns))]
+      (->> (react/q repo [:frontend.db.react/page-unlinked-refs page-id]
+             {:query-fn (fn [db _tx-report _result]
+                          (let [ids
+                                (->> (d/datoms db :aevt :block/content)
+                                     (filter filter-fn)
+                                     (map :e))
+                                result (db-utils/pull-many repo block-attrs ids)]
+                            (remove (fn [block] (= page-id (:db/id (:block/page block)))) result)))}
+             nil)
+           react
+           (sort-by-left-recursive)
+           db-utils/group-by-page))))
 
 (defn get-block-referenced-blocks
   ([block-uuid]
@@ -1402,18 +1162,33 @@ independent of format as format specific heading characters are stripped"
                 [(get m :template) e]))
          (into {}))))
 
-(defn get-all-properties
+(defn file-based-get-all-properties
   []
-  (let [properties (d/q
+  (let [db (conn/get-db)
+        properties (d/q
                     '[:find [?p ...]
                       :where
                       [_ :block/properties ?p]]
-                    (conn/get-db))
+                    db)
         properties (remove (fn [m] (empty? m)) properties)]
     (->> (map keys properties)
          (apply concat)
          distinct
          sort)))
+
+(defn db-based-get-all-properties
+  ":block/type could be one of [property, class]."
+  []
+  (let [db (conn/get-db)
+        ids (->> (d/datoms db :aevt :block/schema)
+                 (map :e))]
+    (map #(:block/original-name (db-utils/entity %)) ids)))
+
+(defn get-all-properties
+  []
+  (if (react/db-graph?)
+    (db-based-get-all-properties)
+    (file-based-get-all-properties)))
 
 (defn- property-value-for-refs-and-text
   "Given a property value's refs and full text, determines the value to
@@ -1452,6 +1227,19 @@ independent of format as format specific heading characters are stripped"
      (remove string/blank?)
      (distinct)
      (sort))))
+
+(defn get-block-property-values
+  "Get blocks which have this property."
+  [property-uuid]
+  (d/q
+    '[:find ?b ?v
+      :in $ ?property-uuid
+      :where
+      [?b :block/properties ?p]
+      [(get ?p ?property-uuid) ?v]
+      [(some? ?v)]]
+    (conn/get-db)
+    property-uuid))
 
 (defn get-template-by-name
   [name]
@@ -1647,6 +1435,7 @@ independent of format as format specific heading characters are stripped"
                                 (not (contains? built-in-pages name))
                                 (not (whiteboard-page? page))
                                 (not (:block/_namespace page))
+                                (not (contains? #{"property"} (:block/type page)))
                                  ;; a/b/c might be deleted but a/b/c/d still exists (for backward compatibility)
                                 (not (and (string/includes? name "/")
                                           (not (:block/journal? page))))
@@ -1701,3 +1490,25 @@ independent of format as format specific heading characters are stripped"
        (map (fn [{:block/keys [uuid properties]}]
               {:id (str uuid)
                :nonce (get-in properties [:logseq.tldraw.shape :nonce])}))))
+
+(defn get-all-classes
+  [repo]
+  (d/q
+    '[:find [?name ...]
+      :where
+      [?page :block/type ?t]
+      [(= ?t "class")]
+      [?page :block/original-name ?name]]
+    (conn/get-db repo)))
+
+(comment
+  ;; For debugging
+  (defn get-all-blocks
+    []
+    (let [repo (state/get-current-repo)]
+      (d/q
+       '[:find [(pull ?b [*]) ...]
+         :where
+         [?b :block/uuid]]
+        (conn/get-db repo))))
+  )

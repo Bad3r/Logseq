@@ -29,7 +29,7 @@
 
 (goog-define ENABLE-FILE-SYNC-PRODUCTION false)
 
-;; this is a feature flag to enable the account tab 
+;; this is a feature flag to enable the account tab
 ;; when it launches (when pro plan launches) it should be removed
 (def ENABLE-SETTINGS-ACCOUNT-TAB false)
 
@@ -353,24 +353,38 @@
 ;; - `logseq_local_/absolute/path/to/graph` => local graph, native fs backend
 ;; - `logseq_local_x:/absolute/path/to/graph` => local graph, native fs backend, on Windows
 ;; - `logseq_local_GraphName` => local graph, browser fs backend
+;; - `logseq_db_GraphName` => db based graph, sqlite as backend
 ;; - Use `""` while writing global files
 
 (defonce idb-db-prefix "logseq-db/")
 (defonce local-db-prefix "logseq_local_")
 (defonce local-handle "handle")
+(defonce db-version-prefix "logseq_db_")
+(defonce property-page "$$property")
 
-(defn local-db?
+(defn local-file-based-graph?
   [s]
   (and (string? s)
        (string/starts-with? s local-db-prefix)))
+
+(defn db-based-graph?
+  [s]
+  (boolean
+   (and (string? s)
+        (string/starts-with? s db-version-prefix))))
 
 (defn get-local-asset-absolute-path
   [s]
   (str "/" (string/replace s #"^[./]*" "")))
 
 (defn get-local-dir
-  [s]
-  (string/replace s local-db-prefix ""))
+  [repo]
+  (if (db-based-graph? repo)
+    (path/path-join (get-in @state/state [:system/info :home-dir])
+                    "logseq"
+                    "graphs"
+                    (string/replace repo db-version-prefix ""))
+    (string/replace repo local-db-prefix "")))
 
 ;; FIXME(andelf): this is not the reverse op of get-repo-dir, should be fixed
 (defn get-local-repo
@@ -385,10 +399,13 @@
       (js/console.error "BUG: nil repo")
       nil)
 
-    (and (util/electron?) (local-db? repo-url))
+    (and (util/electron?) (db-based-graph? repo-url))
     (get-local-dir repo-url)
 
-    (and (mobile-util/native-platform?) (local-db? repo-url))
+    (and (util/electron?) (local-file-based-graph? repo-url))
+    (get-local-dir repo-url)
+
+    (and (mobile-util/native-platform?) (local-file-based-graph? repo-url))
     (let [dir (get-local-dir repo-url)]
       (if (string/starts-with? dir "file://")
         dir
@@ -400,7 +417,7 @@
 
     ;; nfs, browser-fs-access
     ;; Format: logseq_local_{dir-name}
-    (local-db? repo-url)
+    (local-file-based-graph? repo-url)
     (string/replace-first repo-url local-db-prefix "")
 
     ;; unit test
@@ -436,7 +453,7 @@
 (defn get-repo-fpath
   [repo-url path]
   (if (and (or (util/electron?) (mobile-util/native-platform?))
-           (local-db? repo-url))
+           (local-file-based-graph? repo-url))
     (path/path-join (get-repo-dir repo-url) path)
     (util/node-path.join (get-repo-dir repo-url) path)))
 
@@ -448,8 +465,10 @@
   ([]
    (get-custom-css-path (state/get-current-repo)))
   ([repo]
-   (when-let [repo-dir (get-repo-dir repo)]
-     (path/path-join repo-dir app-name custom-css-file))))
+   (if (db-based-graph? repo)
+     (path/path-join app-name custom-css-file)
+     (when-let [repo-dir (get-repo-dir repo)]
+       (path/path-join repo-dir app-name custom-css-file)))))
 
 (defn get-export-css-path
   ([]
@@ -475,7 +494,7 @@
 
 (defn get-current-repo-assets-root
   []
-  (when-let [repo-dir (and (local-db? (state/get-current-repo))
+  (when-let [repo-dir (and (local-file-based-graph? (state/get-current-repo))
                            (get-repo-dir (state/get-current-repo)))]
     (path/path-join repo-dir "assets")))
 
@@ -483,9 +502,13 @@
   ([]
    (get-custom-js-path (state/get-current-repo)))
   ([repo]
-   (when-let [repo-dir (get-repo-dir repo)]
-     (path/path-join repo-dir app-name custom-js-file))))
+   (if (db-based-graph? repo)
+     (path/path-join app-name custom-js-file)
+     (when-let [repo-dir (get-repo-dir repo)]
+       (path/path-join repo-dir app-name custom-js-file)))))
 
 (defn get-block-hidden-properties
   []
   (:block-hidden-properties (state/get-config)))
+
+(defonce page-ref-special-chars "~^")

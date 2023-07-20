@@ -21,6 +21,10 @@
                                 goog.string.unescapeEntities
                                 ;; TODO:lint: Fix when fixing all type hints
                                 object]}
+
+  :unused-namespace {:level :warning
+                     :exclude [frontend.db.datascript.entity-plus]}
+
   ;; TODO:lint: Remove node-path excludes once we have a cleaner api
   :unresolved-var {:exclude [frontend.util/node-path.basename
                              frontend.util/node-path.dirname
@@ -103,6 +107,7 @@
              logseq.common.path path
              logseq.common.graph common-graph
              logseq.common.config common-config
+             logseq.db.sqlite.db sqlite-db
              logseq.graph-parser graph-parser
              logseq.graph-parser.text text
              logseq.graph-parser.block gp-block

@@ -31,7 +31,7 @@
 (rum/defc normalized-graph-label
   [{:keys [url remote? GraphName GraphUUID] :as graph} on-click]
   (when graph
-    (let [local? (config/local-db? url)]
+    (let [local? (config/local-file-based-graph? url)]
       [:span.flex.items-center
        (if local?
          (let [local-dir (config/get-local-dir url)
@@ -145,9 +145,16 @@
                        (remove (fn [repo] (= current-repo (:url repo))) repos) repos) ; exclude current repo
         repo-links (mapv
                     (fn [{:keys [url remote? GraphName GraphUUID] :as graph}]
-                      (let [local? (config/local-db? url)
-                            repo-url (if local? (db/get-repo-name url) GraphName)
-                            short-repo-name (if local? (text-util/get-graph-name-from-path repo-url) GraphName)]
+                      (let [local? (config/local-file-based-graph? url)
+                            db-only? (config/db-based-graph? url)
+                            repo-path (cond
+                                        local? (db/get-repo-name url)
+                                        db-only? url
+                                        :else GraphName)
+                            short-repo-name (cond
+                                              local? (text-util/get-graph-name-from-path repo-path)
+                                              db-only? url
+                                              :else GraphName)]
                         (when short-repo-name
                           {:title        [:span.flex.items-center.whitespace-nowrap short-repo-name
                                           (when remote? [:span.pl-1.flex.items-center
@@ -157,11 +164,11 @@
                            :options      {:on-click (fn [e]
                                                       (if (gobj/get e "shiftKey")
                                                         (state/pub-event! [:graph/open-new-window url])
-                                                        (if-not local?
-                                                          (state/pub-event! [:graph/pull-down-remote-graph graph])
-                                                          (state/pub-event! [:graph/switch url]))))}})))
+                                                        (if (or local? db-only?)
+                                                          (state/pub-event! [:graph/switch url])
+                                                          (state/pub-event! [:graph/pull-down-remote-graph graph]))))}})))
                     switch-repos)
-        refresh-link (let [nfs-repo? (config/local-db? current-repo)]
+        refresh-link (let [nfs-repo? (config/local-file-based-graph? current-repo)]
                        (when (and nfs-repo?
                                   (not= current-repo config/local-repo)
                                   (or (nfs-handler/supported?)
@@ -172,9 +179,9 @@
         reindex-link {:title        (t :re-index)
                       :hover-detail (t :re-index-detail)
                       :options (cond->
-                                {:on-click
-                                 (fn []
-                                   (state/pub-event! [:graph/ask-for-re-index *multiple-windows? nil]))})}
+                                 {:on-click
+                                  (fn []
+                                    (state/pub-event! [:graph/ask-for-re-index *multiple-windows? nil]))})}
         new-window-link (when (and (util/electron?)
                                    ;; New Window button in menu bar of macOS is available.
                                    (not util/mac?))
@@ -186,9 +193,12 @@
               (if (or (nfs-handler/supported?) (mobile-util/native-platform?))
                 {:title (t :new-graph) :options {:on-click #(state/pub-event! [:graph/setup-a-repo])}}
                 {:title (t :new-graph) :options {:href (rfe/href :repos)}}) ;; Brings to the repos page for showing fallback message
+              {:title (str (t :new-graph) " - DB version")
+               :options {:on-click #(state/pub-event! [:graph/new-db-graph])}}
               {:title (t :all-graphs) :options {:href (rfe/href :repos)}}
               refresh-link
-              reindex-link
+              (when-not (config/db-based-graph? current-repo)
+                reindex-link)
               new-window-link])
      (remove nil?))))
 
@@ -209,8 +219,8 @@
                              (let [remote? (:remote? (first (filter #(= current-repo (:url %)) repos)))
                                    repo-name (db/get-repo-name current-repo)
                                    short-repo-name (if repo-name
-                                                    (db/get-short-repo-name repo-name)
-                                                    "Select a Graph")]
+                                                     (db/get-short-repo-name repo-name)
+                                                     "Select a Graph")]
                                [:a.item.group.flex.items-center.p-2.text-sm.font-medium.rounded-md
 
                                 {:on-click (fn []
@@ -241,3 +251,25 @@
                                                       (ui/icon "refresh")]))]))]
         (when (seq repos)
           (ui/dropdown-with-links render-content links links-header))))))
+
+(rum/defcs new-db-graph <
+  (rum/local "" ::graph-name)
+  [state]
+  (let [*graph-name (::graph-name state)
+        new-db-f (fn []
+                   (when-not (string/blank? @*graph-name)
+                     (repo-handler/new-db! @*graph-name)
+                     (state/close-modal!)))]
+    [:div.new-graph.p-4
+     [:h1.title "Create new graph: "]
+     [:input.form-input.mb-4 {:value @*graph-name
+                              :auto-focus true
+                              :on-change #(reset! *graph-name (util/evalue %))
+                              :on-key-down   (fn [^js e]
+                                               (when (= (gobj/get e "key") "Enter")
+                                                 (new-db-f)))}]
+     (ui/button "Submit"
+       :on-click new-db-f
+       :on-key-down   (fn [^js e]
+                        (when (= (gobj/get e "key") "Enter")
+                          (new-db-f))))]))

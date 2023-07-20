@@ -18,7 +18,7 @@
    [logseq.publishing.html :as publish-html]
    [frontend.state :as state]
    [frontend.util :as util]
-   [frontend.util.property :as property]
+   [frontend.util.property-edit :as property-edit]
    [goog.dom :as gdom]
    [lambdaisland.glogi :as log]
    [logseq.graph-parser.mldoc :as gp-mldoc]
@@ -301,37 +301,47 @@
                              (gp-property/valid-property-name? (str k))) properties)
                    (into {}))))))
 
-(defn- blocks [db]
+(defn- blocks
+  [repo db]
   {:version 1
    :blocks
    (->> (d/q '[:find (pull ?b [*])
                :in $
                :where
-               [?b :block/file]
                [?b :block/original-name]
                [?b :block/name]] db)
 
         (map (fn [[{:block/keys [name] :as page}]]
-               (let [blocks (db/get-page-blocks-no-cache
+               (let [whiteboard? (= "whiteboard" (:block/type page))
+                     blocks (db/get-page-blocks-no-cache
                              (state/get-current-repo)
                              name
                              {:transform? false})
-                     blocks' (map (fn [b]
-                                    (let [b' (if (seq (:block/properties b))
-                                               (update b :block/content
-                                                       (fn [content] (property/remove-properties (:block/format b) content)))
-                                               b)]
-                                      (safe-keywordize b'))) blocks)
-                     children (outliner-tree/blocks->vec-tree blocks' name)
+                     blocks' (if whiteboard?
+                               blocks
+                               (map (fn [b]
+                                     (let [b' (if (seq (:block/properties b))
+                                                (update b :block/content
+                                                        (fn [content]
+                                                          (property-edit/remove-properties-when-file-based
+                                                           repo (:block/format b) content)))
+                                                b)]
+                                       (safe-keywordize b'))) blocks))
+                     children (if whiteboard?
+                                blocks'
+                                (outliner-tree/blocks->vec-tree blocks' name))
                      page' (safe-keywordize page)]
                  (assoc page' :block/children children))))
         (nested-select-keys
          [:block/id
+          :block/type
           :block/page-name
           :block/properties
           :block/format
           :block/children
-          :block/content]))})
+          :block/content
+          :block/created-at
+          :block/updated-at]))})
 
 (defn- file-name [repo extension]
   (-> (string/replace repo config/local-db-prefix "")
@@ -342,7 +352,7 @@
 (defn- export-repo-as-edn-str [repo]
   (when-let [db (db/get-db repo)]
     (let [sb (StringBuffer.)]
-      (pprint/pprint (blocks db) (StringBufferWriter. sb))
+      (pprint/pprint (blocks repo db) (StringBufferWriter. sb))
       (str sb))))
 
 (defn export-repo-as-edn-v2!
@@ -372,7 +382,7 @@
   [repo]
   (when-let [db (db/get-db repo)]
     (let [json-str
-          (-> (blocks db)
+          (-> (blocks repo db)
               nested-update-id
               clj->js
               js/JSON.stringify)

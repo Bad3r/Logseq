@@ -141,27 +141,35 @@
                        r)
           allowed! (storage/get k)
           should-ask? (or (nil? allowed!)
-                          (> (- (js/Date.now) allowed!) 604800000))]
+                          (> (- (js/Date.now) allowed!) 604800000))
+          exec-fn #(when-let [scripts (and % (string/trim %))]
+                     (when-not (string/blank? scripts)
+                       (when (or (not should-ask?) (ask-allow))
+                         (try
+                           (js/eval scripts)
+                           (execed)
+                           (catch :default e
+                             (js/console.error "[custom js]" e))))))]
       (when (and (not execed?)
                  (not= false allowed!))
-        (if (string/starts-with? href "http")
+        (cond
+          (string/starts-with? href "http")
           (when (or (not should-ask?)
                     (ask-allow))
             (load href #(do (js/console.log "[custom js]" href) (execed))))
+
+          (config/db-based-graph? (state/get-current-repo))
+          (when-let [script (db/get-file href)]
+            (exec-fn script))
+
+          :else
           (let [repo-dir (config/get-repo-dir (state/get-current-repo))
                 rpath (path/relative-path repo-dir href)]
             (p/let [exists? (fs/file-exists? repo-dir rpath)]
               (when exists?
                 (util/p-handle
                  (fs/read-file repo-dir rpath)
-                 #(when-let [scripts (and % (string/trim %))]
-                    (when-not (string/blank? scripts)
-                      (when (or (not should-ask?) (ask-allow))
-                        (try
-                          (js/eval scripts)
-                          (execed)
-                          (catch :default e
-                            (js/console.error "[custom js]" e)))))))))))))))
+                 exec-fn)))))))))
 
 (defn toggle-wide-mode!
   []

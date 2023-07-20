@@ -23,11 +23,14 @@
             [electron.logger :as logger]
             [electron.plugin :as plugin]
             [electron.search :as search]
+            [electron.db :as db]
             [electron.server :as server]
             [electron.shell :as shell]
             [electron.state :as state]
             [electron.utils :as utils]
             [electron.window :as win]
+            [logseq.db.sqlite.db :as sqlite-db]
+            [logseq.db.sqlite.util :as sqlite-util]
             [logseq.common.graph :as common-graph]
             [promesa.core :as p]))
 
@@ -211,7 +214,16 @@
     (fs-extra/ensureDirSync dir)
     dir))
 
-(defn- get-graphs
+(defn- get-db-based-graphs-dir
+  []
+  (let [dir (if utils/ci?
+              (.resolve node-path js/__dirname "../tmp/graphs")
+              (.join node-path (.homedir os) "logseq" "graphs"))]
+    (fs-extra/ensureDirSync dir)
+    dir))
+
+;; TODO: move file based graphs to "~/logseq/graphs" too
+(defn- get-file-based-graphs
   "Returns all graph names in the cache directory (starting with `logseq_local_`)"
   []
   (let [dir (get-graphs-dir)]
@@ -219,6 +231,21 @@
          (remove #{dir})
          (map #(node-path/basename % ".transit"))
          (map graph-name->path))))
+
+(defn- get-db-based-graphs
+  "Returns all graph names in the cache directory"
+  []
+  (let [dir (get-db-based-graphs-dir)]
+    (->> (common-graph/read-directories dir)
+         (remove (fn [s] (= s "Unlinked graphs")))
+         (map graph-name->path)
+         (map (fn [s] (str "logseq_db_" s))))))
+
+(defn- get-graphs
+  []
+  (concat
+   (get-file-based-graphs)
+   (get-db-based-graphs)))
 
 ;; TODO support alias mechanism
 (defn get-graph-name
@@ -281,11 +308,13 @@
     (when-let [file-path (get-graph-path graph-name)]
       (fs/writeFileSync file-path value-str))))
 
-(defmethod handle :deleteGraph [_window [_ graph-name]]
+(defmethod handle :deleteGraph [_window [_ graph graph-name db-based?]]
   (when graph-name
-    (when-let [file-path (get-graph-path graph-name)]
-      (when (fs/existsSync file-path)
-        (fs-extra/removeSync file-path)))))
+    (if (and db-based? graph)
+      (db/unlink-graph! graph)
+      (when-let [file-path (get-graph-path graph-name)]
+       (when (fs/existsSync file-path)
+         (fs-extra/removeSync file-path))))))
 
 (defmethod handle :persistent-dbs-saved [_window _]
   (async/put! state/persistent-dbs-chan true)
@@ -332,6 +361,31 @@
   (search/delete-db! repo))
 ;; ^^^^
 ;; Search related IPCs End
+
+;; DB related IPCs start
+
+;; Needs to be called first for a new graph
+(defmethod handle :db-new [_window [_ repo]]
+  (db/new-db! repo))
+
+(defmethod handle :db-transact-data [_window [_ repo data-str]]
+  (let [data (reader/read-string data-str)
+        {:keys [blocks deleted-block-uuids]} data]
+    (when (seq deleted-block-uuids)
+      (sqlite-db/delete-blocks! repo deleted-block-uuids))
+    (when (seq blocks)
+      (let [blocks' (mapv sqlite-util/ds->sqlite-block blocks)]
+        (sqlite-db/upsert-blocks! repo (bean/->js blocks'))))))
+
+;; Needs to be called first for an existing graph
+(defmethod handle :get-initial-data [_window [_ repo _opts]]
+  (db/open-db! repo)
+  (sqlite-db/get-initial-data repo))
+
+(defmethod handle :get-other-data [_window [_ repo journal-block-uuids _opts]]
+  (sqlite-db/get-other-data repo journal-block-uuids))
+
+;; DB related IPCs End
 
 (defn clear-cache!
   [window]
@@ -711,6 +765,9 @@
 
 (defmethod handle :server/set-config [^js _win [_ config]]
   (server/set-config! config))
+
+(defmethod handle :system/info [^js _win _]
+  {:home-dir (.homedir os)})
 
 (defn set-ipc-handler! [window]
   (let [main-channel "main"]

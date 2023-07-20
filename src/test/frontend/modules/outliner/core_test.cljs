@@ -322,10 +322,10 @@
                                     [21]])
           target-block (get-block 6)]
       (outliner-tx/transact!
-        {:graph test-db}
-        (outliner-core/insert-blocks! new-blocks target-block {:sibling? true
-                                                               :keep-uuid? true
-                                                               :replace-empty-target? false}))
+       {:graph test-db}
+       (outliner-core/insert-blocks! new-blocks target-block {:sibling? true
+                                                              :keep-uuid? true
+                                                              :replace-empty-target? false}))
       (is (= [3 6 18 21 9] (get-children 2)))
 
       (is (= [19 20] (get-children 18))))))
@@ -348,22 +348,22 @@
                             :block/content ""}])
     (let [target-block (get-block 22)]
       (outliner-tx/transact!
-        {:graph test-db}
-        (outliner-core/insert-blocks! [{:block/left [:block/uuid 1]
-                                        :block/content "test"
-                                        :block/parent [:block/uuid 1]
-                                        :block/page 1}]
-                                      target-block
-                                      {:sibling? false
-                                       :outliner-op :paste
-                                       :replace-empty-target? true}))
+       {:graph test-db}
+       (outliner-core/insert-blocks! [{:block/left [:block/uuid 1]
+                                       :block/content "test"
+                                       :block/parent [:block/uuid 1]
+                                       :block/page 1}]
+                                     target-block
+                                     {:sibling? false
+                                      :outliner-op :paste
+                                      :replace-empty-target? true}))
       (is (= "test" (:block/content (get-block 22))))
       (is (= [22] (get-children 1)))
       (is (= [2 12 16] (get-children 22))))))
 
 (deftest test-batch-transact
   (testing "add 4, 5 after 2 and delete 3"
-    (let [tree [[1 [[2] [3]]]]]
+    (let [tree [[10 [[2] [3]]]]]
       (transact-tree! tree)
       (let [new-blocks (build-blocks [[4 [5]]])
             target-block (get-block 2)]
@@ -706,9 +706,8 @@ tags:: tag1, tag2
                total))
 
         ;; 3. verify the outliner parent/left structure
-        (is (= (inc (count (db-model/get-paginated-blocks test-db page-id {:limit total
-                                                                           :use-cache? false})))
-               total))))))
+        ;; TODO
+        ))))
 
 (deftest test-non-consecutive-blocks->vec-tree
   (let [blocks [{:block/page #:db{:id 2313},

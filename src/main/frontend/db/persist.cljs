@@ -14,7 +14,7 @@
             result (vec result)
             ;; backward compatibility (release <= 0.5.4)
             result (if (seq result) result (idb/get-nfs-dbs))]
-      result)
+      (distinct result))
     (idb/get-nfs-dbs)))
 
 (defn get-serialized-graph
@@ -38,9 +38,8 @@
 
 (defn delete-graph!
   [graph]
-  (let [key (db-conn/datascript-db graph)]
+  (let [key (db-conn/datascript-db graph)
+        db-based? (config/db-based-graph? graph)]
     (if (util/electron?)
-      (do
-        (ipc/ipc "deleteGraph" key)
-        (idb/remove-item! key))
+      (ipc/ipc "deleteGraph" graph key db-based?)
      (idb/remove-item! key))))

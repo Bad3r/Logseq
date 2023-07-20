@@ -8,6 +8,7 @@
             [frontend.util.text :as text-util]
             [logseq.graph-parser.text :as text]
             [logseq.db :as ldb]
+            [logseq.db.schema :as db-schema]
             [logseq.graph-parser.util :as gp-util]))
 
 (defonce conns (atom {}))
@@ -26,7 +27,7 @@
     (mobile-util/native-platform?)
     (text-util/get-graph-name-from-path repo-url)
 
-    (config/local-db? repo-url)
+    (config/local-file-based-graph? repo-url)
     (config/get-local-dir repo-url)
 
     :else
@@ -51,6 +52,13 @@
     (let [path (get-repo-path repo)]
       (str (if (util/electron?) "" config/idb-db-prefix)
            path))))
+
+(defn get-schema
+  "Returns schema for given repo"
+  [repo]
+  (if (config/db-based-graph? repo)
+    db-schema/schema-for-db-based-graph
+    db-schema/schema))
 
 (defn get-db
   ([]
@@ -78,10 +86,11 @@
    (start! repo {}))
   ([repo {:keys [listen-handler]}]
    (let [db-name (datascript-db repo)
-         db-conn (ldb/start-conn)]
+         db-conn (ldb/start-conn :schema (get-schema repo) :create-default-pages? false)]
      (swap! conns assoc db-name db-conn)
      (when listen-handler
-       (listen-handler repo)))))
+       (listen-handler repo))
+     (ldb/create-default-pages! db-conn))))
 
 (defn destroy-all!
   []

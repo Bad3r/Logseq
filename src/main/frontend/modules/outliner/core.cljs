@@ -12,9 +12,11 @@
             [frontend.modules.outliner.utils :as outliner-u]
             [frontend.state :as state]
             [frontend.util :as util]
-            [frontend.util.property :as property]
+            [frontend.util.property-edit :as property-edit]
+            [frontend.config :as config]
             [logseq.graph-parser.util :as gp-util]
-            [cljs.spec.alpha :as s]))
+            [cljs.spec.alpha :as s]
+            [frontend.format.block :as block]))
 
 (s/def ::block-map (s/keys :opt [:db/id :block/uuid :block/page :block/left :block/parent]))
 
@@ -63,6 +65,11 @@
                 (assoc :block/created-at updated-at))]
     block))
 
+(defn block-with-updated-at
+  [block]
+  (let [updated-at (util/time-ms)]
+    (assoc block :block/updated-at updated-at)))
+
 (defn- remove-orphaned-page-refs!
   [db-id txs-state old-refs new-refs]
   (when (not= old-refs new-refs)
@@ -84,6 +91,83 @@
       (when (seq orphaned-pages)
         (let [tx (mapv (fn [page] [:db/retractEntity (:db/id page)]) orphaned-pages)]
           (swap! txs-state (fn [state] (vec (concat state tx)))))))))
+
+(defn- update-page-when-save-block
+  [txs-state block-entity m]
+  (when-let [e (:block/page block-entity)]
+          (let [m' (cond-> {:db/id (:db/id e)
+                            :block/updated-at (util/time-ms)}
+                     (not (:block/created-at e))
+                     (assoc :block/created-at (util/time-ms)))
+                txs (if (or (:block/pre-block? block-entity)
+                            (:block/pre-block? m))
+                      (let [properties (:block/properties m)
+                            alias (set (:alias properties))
+                            tags (set (:tags properties))
+                            alias (map (fn [p] {:block/name (util/page-name-sanity-lc p)}) alias)
+                            tags (map (fn [p] {:block/name (util/page-name-sanity-lc p)}) tags)
+                            deleteable-page-attributes {:block/alias alias
+                                                        :block/tags tags
+                                                        :block/properties properties
+                                                        :block/properties-text-values (:block/properties-text-values m)}
+                            ;; Retract page attributes to allow for deletion of page attributes
+                            page-retractions
+                            (mapv #(vector :db/retract (:db/id e) %) (keys deleteable-page-attributes))]
+                        (conj page-retractions (merge m' deleteable-page-attributes)))
+                      [m'])]
+            (swap! txs-state into txs))))
+
+(defn- remove-orphaned-refs-when-save
+  [txs-state block-entity m]
+  (when-not (config/db-based-graph? (state/get-current-repo))
+    (let [remove-self-page #(remove (fn [b]
+                                      (= (:db/id b) (:db/id (:block/page block-entity)))) %)
+          old-refs (remove-self-page (:block/refs block-entity))
+          new-refs (remove-self-page (:block/refs m))]
+      (remove-orphaned-page-refs! (:db/id block-entity) txs-state old-refs new-refs))))
+
+
+(defn- assoc-instance-when-save
+  [txs-state block-entity m]
+  (let [tags (seq (:block/tags m))]
+    (when (and (config/db-based-graph? (state/get-current-repo))
+               (:block/page block-entity)
+               tags)
+      (when-let [instance-id (first (remove (set (map :block/uuid tags))
+                                            (map :block/uuid (:block/refs m))))]
+        (swap! txs-state (fn [txs]
+                           (concat txs
+                                   [{:block/uuid instance-id
+                                     :block/tags (:block/tags m)}
+                                    {:db/id (:db/id block-entity)
+                                     :block/instance [:block/uuid instance-id]}])))))))
+
+(defn rebuild-block-refs
+  [block new-properties & {:keys [skip-content-parsing?]}]
+  (let [property-key-refs (keys new-properties)
+        property-value-refs (->> (vals new-properties)
+                                 (mapcat (fn [v]
+                                           (cond
+                                             (and (coll? v) (uuid? (first v)))
+                                             v
+                                             (uuid? v)
+                                             [v]
+                                             :else
+                                             nil))))
+        property-refs (->> (concat property-key-refs property-value-refs)
+                           (map (fn [id] {:block/uuid id})))
+        content-refs (when-not skip-content-parsing?
+                       (some-> (:block/content block) block/extract-refs-from-text))]
+    (concat property-refs content-refs)))
+
+(defn- rebuild-refs
+  [txs-state block m]
+  (when (config/db-based-graph? (state/get-current-repo))
+    (let [refs (->> (rebuild-block-refs block (:block/properties block)
+                                        :skip-content-parsing? true)
+                    (concat (:block/refs m)))]
+      (swap! txs-state (fn [txs] (concat txs [{:db/id (:db/id block)
+                                               :block/refs refs}]))))))
 
 ;; -get-id, -get-parent-id, -get-left-id return block-id
 ;; the :block/parent, :block/left should be datascript lookup ref
@@ -142,15 +226,10 @@
     (let [m (-> (:data this)
                 (dissoc :block/children :block/meta :block.temp/top? :block.temp/bottom?
                         :block/title :block/body :block/level)
-                (gp-util/remove-nils))
-          m (if (state/enable-block-timestamps?) (block-with-timestamps m) m)
-          other-tx (:db/other-tx m)
+                gp-util/remove-nils
+                block-with-timestamps)
           id (:db/id (:data this))
           block-entity (db/entity id)]
-      (when (seq other-tx)
-        (swap! txs-state (fn [txs]
-                           (vec (concat txs other-tx)))))
-
       (when id
         ;; Retract attributes to prepare for tx which rewrites block attributes
         (swap! txs-state (fn [txs]
@@ -161,37 +240,21 @@
                                          db-schema/retract-attributes)))))
 
         ;; Update block's page attributes
-        (when-let [e (:block/page block-entity)]
-          (let [m' (cond-> {:db/id (:db/id e)
-                            :block/updated-at (util/time-ms)}
-                     (not (:block/created-at e))
-                     (assoc :block/created-at (util/time-ms)))
-                txs (if (or (:block/pre-block? block-entity)
-                            (:block/pre-block? m))
-                      (let [properties (:block/properties m)
-                            alias (set (:alias properties))
-                            tags (set (:tags properties))
-                            alias (map (fn [p] {:block/name (util/page-name-sanity-lc p)}) alias)
-                            tags (map (fn [p] {:block/name (util/page-name-sanity-lc p)}) tags)
-                            deleteable-page-attributes {:block/alias alias
-                                                        :block/tags tags
-                                                        :block/properties properties
-                                                        :block/properties-text-values (:block/properties-text-values m)}
-                            ;; Retract page attributes to allow for deletion of page attributes
-                            page-retractions
-                            (mapv #(vector :db/retract (:db/id e) %) (keys deleteable-page-attributes))]
-                        (conj page-retractions (merge m' deleteable-page-attributes)))
-                      [m'])]
-            (swap! txs-state into txs)))
+        (update-page-when-save-block txs-state block-entity m)
 
         ;; Remove orphaned refs from block
-        (let [remove-self-page #(remove (fn [b]
-                                          (= (:db/id b) (:db/id (:block/page block-entity)))) %)
-              old-refs (remove-self-page (:block/refs block-entity))
-              new-refs (remove-self-page (:block/refs m))]
-          (remove-orphaned-page-refs! (:db/id block-entity) txs-state old-refs new-refs)))
+        (remove-orphaned-refs-when-save txs-state block-entity m))
 
-      (swap! txs-state conj (dissoc m :db/other-tx))
+      ;; handle others txs
+      (let [other-tx (:db/other-tx m)]
+        (when (seq other-tx)
+          (swap! txs-state (fn [txs]
+                             (vec (concat txs other-tx)))))
+        (swap! txs-state conj (dissoc m :db/other-tx)))
+
+      (assoc-instance-when-save txs-state block-entity m)
+
+      (rebuild-refs txs-state block-entity m)
 
       this))
 
@@ -213,8 +276,8 @@
                               (map-indexed (fn [idx child]
                                              (let [parent [:block/uuid left-id]]
                                                (cond->
-                                                 {:db/id (:db/id child)
-                                                  :block/parent parent}
+                                                {:db/id (:db/id child)
+                                                 :block/parent parent}
                                                  (zero? idx)
                                                  (assoc :block/left parent))))
                                            immediate-children)))
@@ -428,7 +491,7 @@
               (and (some? (:block/uuid block))
                    (nil? (list-type-fn block)))
               (-> (update :block/properties #(assoc % :logseq.order-list-type list-type))
-                  (assoc :block/content (property/insert-property format content :logseq.order-list-type list-type)))))
+                  (assoc :block/content (property-edit/insert-property-when-file-based (state/get-current-repo) format content :logseq.order-list-type list-type)))))
           blocks)
         blocks))))
 

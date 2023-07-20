@@ -234,7 +234,6 @@
  :settings-page/customize-shortcuts "キーボードショートカット"
  :settings-page/shortcut-settings "ショートカットをカスタマイズ"
  :settings-page/home-default-page "デフォルトのホームページを設定"
- :settings-page/enable-block-time "ブロックタイムスタンプ"
  :settings-page/clear-cache "キャッシュをクリア"
  :settings-page/clear "クリア"
  :settings-page/clear-cache-warning "キャッシュをクリアすると、開いているグラフは破棄されます。保存されていない変更は失われます。"

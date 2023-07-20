@@ -13,6 +13,7 @@
             [frontend.config :as config]
             [frontend.context.i18n :as i18n :refer [t]]
             [frontend.db :as db]
+            [frontend.db.restore :as db-restore]
             [frontend.db.conn :as conn]
             [frontend.db.persist :as db-persist]
             [frontend.db.react :as react]
@@ -42,7 +43,9 @@
             [goog.object :as gobj]
             [lambdaisland.glogi :as log]
             [promesa.core :as p]
-            [frontend.mobile.core :as mobile]))
+            [frontend.mobile.core :as mobile]
+            [frontend.db.listener :as db-listener]
+            [cljs-bean.core :as bean]))
 
 (defn- set-global-error-notification!
   []
@@ -63,9 +66,11 @@
   (let [f (fn []
             #_:clj-kondo/ignore
             (let [repo (state/get-current-repo)]
-              (when (and (not (state/nfs-refreshing?))
-                         (not (contains? (:file/unlinked-dirs @state/state)
-                                         (config/get-repo-dir repo))))
+              (when (or
+                     (config/db-based-graph? repo)
+                     (and (not (state/nfs-refreshing?))
+                          (not (contains? (:file/unlinked-dirs @state/state)
+                                          (config/get-repo-dir repo)))))
                 ;; Don't create the journal file until user writes something
                 (page-handler/create-today-journal!))))]
     (f)
@@ -79,9 +84,10 @@
 (defn restore-and-setup!
   [repos]
   (when-let [repo (or (state/get-current-repo) (:url (first repos)))]
-    (-> (db/restore! repo)
+    (-> (db-restore/restore-graph! repo)
         (p/then
          (fn []
+           (db-listener/listen-and-persist! repo)
            ;; try to load custom css only for current repo
            (ui-handler/add-style-if-exists!)
 
@@ -99,7 +105,7 @@
                 (cond
                   (and (not (seq (db/get-files config/local-repo)))
                        ;; Not native local directory
-                       (not (some config/local-db? (map :url repos)))
+                       (not (some config/local-file-based-graph? (map :url repos)))
                        (not (mobile-util/native-platform?)))
                   ;; will execute `(state/set-db-restoring! false)` inside
                   (repo-handler/setup-local-repo-if-not-exists!)
@@ -192,10 +198,17 @@
   (state/set-component! :editor/box editor/box)
   (command-palette/register-global-shortcut-commands))
 
-(reset! db/*db-listener outliner-db/after-transact-pipelines)
+(reset! db-listener/*db-listener outliner-db/after-transact-pipelines)
+
+(defn- get-system-info
+  []
+  (when (util/electron?)
+    (p/let [info (ipc/ipc :system/info)]
+      (state/set-state! :system/info (bean/->clj info)))))
 
 (defn start!
   [render]
+  (get-system-info)
   (set-global-error-notification!)
 
   (set! js/window.onhashchange #(state/hide-custom-context-menu!)) ;; close context menu when page navs
@@ -234,7 +247,6 @@
        (p/finally (fn []
                     (state/set-db-restoring! false))))
 
-   (db/run-batch-txs!)
    (file/<ratelimit-file-writes!)
    (util/<app-wake-up-from-sleep-loop (atom false))
 

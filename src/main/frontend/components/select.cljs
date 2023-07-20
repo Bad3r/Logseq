@@ -53,7 +53,11 @@
                close-modal? true
                extract-fn :value}}]
   (let [input (::input state)
-        *selected-choices (::selected-choices state)]
+        *selected-choices (::selected-choices state)
+        search-result (cond-> (search/fuzzy-search items @input :limit limit :extract-fn extract-fn)
+                        (fn? transform-fn)
+                        (transform-fn @input))
+        input-opts' (if (fn? input-opts) (input-opts (empty? search-result)) input-opts)]
     (when (fn? tap-*input-val)
       (tap-*input-val input))
     [:div.cp__select
@@ -68,14 +72,11 @@
                               (let [v (util/evalue e)]
                                 (reset! input v)
                                 (and (fn? on-input) (on-input v))))}
-              input-opts)]]
+              input-opts')]]
 
      [:div.item-results-wrap
       (ui/auto-complete
-       (cond-> (search/fuzzy-search items @input :limit limit :extract-fn extract-fn)
-         (fn? transform-fn)
-         (transform-fn @input))
-
+       search-result
        {:item-render       (or item-cp (fn [result chosen?]
                                          (render-item result chosen? multiple-choices? *selected-choices)))
         :class             "cp__select-results"
@@ -115,7 +116,12 @@
                            (or (config/demo-graph? url)
                                (= url (state/get-current-repo)))))
                  (map (fn [{:keys [url]}]
-                        {:value (text-util/get-graph-name-from-path url)
+                        {:value (text-util/get-graph-name-from-path
+                                 ;; TODO: Use helper when a common one is refactored
+                                 ;; from components.repo
+                                 (if (config/local-file-based-graph? url)
+                                   (config/get-local-dir url)
+                                   (db/get-repo-path url)))
                          :id (config/get-repo-dir url)
                          :graph url}))))
     :prompt-key :select.graph/prompt
@@ -133,7 +139,12 @@
                      (remove (fn [{:keys [url]}]
                                (config/demo-graph? url)))
                      (map (fn [{:keys [url] :as original-graph}]
-                            {:value (text-util/get-graph-name-from-path url)
+                            {:value (text-util/get-graph-name-from-path
+                                     ;; TODO: Use helper when a common one is refactored
+                                     ;; from components.repo
+                                     (if (config/local-file-based-graph? url)
+                                       (config/get-local-dir url)
+                                       (db/get-repo-path url)))
                              :id (config/get-repo-dir url)
                              :graph url
                              :original-graph original-graph}))))

@@ -12,11 +12,11 @@
             [frontend.search.protocol :as protocol]
             [frontend.state :as state]
             [frontend.util :as util]
-            [frontend.util.property :as property]
+            [frontend.util.property-edit :as property-edit]
             [goog.object :as gobj]
             [promesa.core :as p]
             [clojure.set :as set]
-            [frontend.modules.datascript-report.core :as db-report]))
+            [datascript.core :as d]))
 
 (defn get-engine
   [repo]
@@ -184,9 +184,12 @@
 (defn get-all-properties
   []
   (->> (db-model/get-all-properties)
-       (remove (property/hidden-properties))
+       (remove (property-edit/hidden-properties))
        ;; Complete full keyword except the ':'
-       (map #(subs (str %) 1))))
+       (map (fn [property]
+              (if (keyword? property)
+                (subs (str property) 1)
+                property)))))
 
 (defn property-search
   ([q]
@@ -250,8 +253,10 @@
                                      blocks-result)
                              (map search-db/block->index)
                              (remove nil?))
+          added (set (map :id blocks-to-add))
           blocks-to-remove-set (->> (remove :added blocks)
                                     (map :e)
+                                    (remove added)
                                     (set))]
       {:blocks-to-remove-set blocks-to-remove-set
        :blocks-to-add        blocks-to-add})))
@@ -288,15 +293,15 @@
                    (let [tar-db  (:db-after tx-report)]
                      ;; Reverse query the corresponding page id of the modified `:file/content`)
                      (when-let [page-id (->> (:e datom)
-                                             (db-report/safe-pull tar-db '[:block/_file])
+                                             (d/pull tar-db '[:block/_file])
                                              (:block/_file)
                                              (first)
                                              (:db/id))]
                        ;; Fetch page entity according to what page->index requested
-                       (db-report/safe-pull tar-db '[:db/id :block/uuid
-                                                     :block/original-name
-                                                     {:block/file [:file/content]}]
-                                            page-id)))))
+                       (d/pull tar-db '[:db/id :block/uuid
+                                        :block/original-name
+                                        {:block/file [:file/content]}]
+                               page-id)))))
            (remove nil?)))))
 
 ;; TODO merge with logic in `invoke-hooks` when feature and test is sufficient

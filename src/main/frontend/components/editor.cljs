@@ -5,6 +5,7 @@
             [frontend.components.block :as block]
             [frontend.components.datetime :as datetime-comp]
             [frontend.components.search :as search]
+            [frontend.components.search.highlight :as highlight]
             [frontend.components.svg :as svg]
             [frontend.context.i18n :refer [t]]
             [frontend.db :as db]
@@ -110,7 +111,7 @@
             input (gdom/getElement id)]
         (when input
           (let [current-pos (cursor/pos input)
-                edit-content (or (state/sub [:editor/content id]) "")
+                edit-content (or (state/sub :editor/content :path-in-sub-atom id) "")
                 sidebar? (in-sidebar? input)
                 q (or
                    (editor-handler/get-selected-text)
@@ -157,7 +158,7 @@
                                  (when (db-model/whiteboard-page? page-name) [:span.mr-1 (ui/icon "whiteboard" {:extension? true})])
                                  [:div.flex.space-x-1
                                   [:div (when-not (db/page-exists? page-name) (t :new-page))]
-                                  (search/highlight-exact-query page-name q)]]
+                                  (highlight/highlight-exact-query page-name q)]]
                                 :open?           chosen?
                                 :manual?         true
                                 :fixed-position? true
@@ -213,7 +214,7 @@
           input (gdom/getElement id)
           [id format] (:rum/args state)
           current-pos (cursor/pos input)
-          edit-content (state/sub [:editor/content id])
+          edit-content (state/sub :editor/content :path-in-sub-atom id)
           edit-block (state/get-edit-block)
           selected-text (editor-handler/get-selected-text)
           q (or
@@ -229,7 +230,7 @@
         input (gdom/getElement id)]
     (when input
       (let [current-pos (cursor/pos input)
-            edit-content (state/sub [:editor/content id])
+            edit-content (state/sub :editor/content :path-in-sub-atom id)
             q (or
                (when (>= (count edit-content) current-pos)
                  (subs edit-content pos current-pos))
@@ -272,7 +273,7 @@
     (when (and input
                (not (string/blank? property)))
       (let [current-pos (cursor/pos input)
-            edit-content (state/sub [:editor/content id])
+            edit-content (state/sub :editor/content :path-in-sub-atom id)
             start-idx (string/last-index-of (subs edit-content 0 current-pos)
                                             gp-property/colons)
             q (or
@@ -547,7 +548,7 @@
   rum/static
   {:did-update
    (fn [state]
-     (when-not (:editor/on-paste? @state/state)
+     (when-not @(:editor/on-paste? @state/state)
        (try (editor-handler/handle-last-input)
             (catch :default _e
               nil)))
@@ -645,21 +646,27 @@
   (mixins/event-mixin setup-key-listener!)
   (shortcut/mixin :shortcut.handler/block-editing-only)
   lifecycle/lifecycle
-  [state {:keys [format block]} id _config]
+  [state {:keys [format block parent-block]} id config]
   (let [content (state/sub-edit-content id)
-        heading-class (get-editor-style-class block content format)]
+        heading-class (get-editor-style-class block content format)
+        opts (cond->
+                 {:id                id
+                  :cacheMeasurements (editor-row-height-unchanged?) ;; check when content updated (as the content variable is binded)
+                  :default-value     (or content "")
+                  :minRows           (if (state/enable-grammarly?) 2 1)
+                  :on-click          (editor-handler/editor-on-click! id)
+                  :on-change         (editor-handler/editor-on-change! block id search-timeout)
+                  :on-paste          (paste-handler/editor-on-paste! id)
+                  :auto-focus        false
+                  :class             heading-class}
+               (some? parent-block)
+               (assoc :parentblockid (str (:block/uuid parent-block)))
+
+               true
+               (merge (:editor-opts config)))]
     [:div.editor-inner {:class (if block "block-editor" "non-block-editor")}
 
-     (ui/ls-textarea
-      {:id                id
-       :cacheMeasurements (editor-row-height-unchanged?) ;; check when content updated (as the content variable is binded)
-       :default-value     (or content "")
-       :minRows           (if (state/enable-grammarly?) 2 1)
-       :on-click          (editor-handler/editor-on-click! id)
-       :on-change         (editor-handler/editor-on-change! block id search-timeout)
-       :on-paste          (paste-handler/editor-on-paste! id)
-       :auto-focus        false
-       :class             heading-class})
+     (ui/ls-textarea opts)
 
      (mock-textarea content)
      (modals id format)

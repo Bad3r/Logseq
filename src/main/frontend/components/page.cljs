@@ -9,6 +9,7 @@
             [frontend.components.plugins :as plugins]
             [frontend.components.reference :as reference]
             [frontend.components.svg :as svg]
+            [frontend.components.property :as property]
             [frontend.components.scheduled-deadlines :as scheduled]
             [frontend.config :as config]
             [frontend.context.i18n :refer [t]]
@@ -63,41 +64,27 @@
            str)))
   (def get-block-uuid-by-block-route-name (constantly nil)))
 
-(defn- get-blocks
-  [repo page-name block-id]
-  (when page-name
-    (let [root (if block-id
-                 (db/pull [:block/uuid block-id])
-                 (model/get-page page-name))
-          opts (if block-id
-                 {:scoped-block-id (:db/id root)}
-                 {})]
-      (db/get-paginated-blocks repo (:db/id root) opts))))
+(defn- get-block
+  [page-name-or-uuid]
+  (when page-name-or-uuid
+    (when-let [block (model/get-page page-name-or-uuid)]
+      (model/sub-block (:db/id block)))))
 
-(defn- open-first-block!
+(defn- open-root-block!
   [state]
-  (let [[_ blocks _ sidebar? preview?] (:rum/args state)]
+  (let [[_ block _ sidebar? preview?] (:rum/args state)]
     (when (and
            (or preview?
                (not (contains? #{:home :all-journals :whiteboard} (state/get-current-route))))
            (not sidebar?))
-      (let [block (first blocks)]
-        (when (and (= (count blocks) 1)
-                   (string/blank? (:block/content block))
-                   (not preview?))
-          (editor-handler/edit-block! block :max (:block/uuid block))))))
+      (when (and (string/blank? (:block/content block))
+                 (not preview?))
+        (editor-handler/edit-block! block :max (:block/uuid block)))))
   state)
 
 (rum/defc page-blocks-inner <
-  {:did-mount  open-first-block!
-   :did-update open-first-block!
-   :should-update (fn [prev-state state]
-                    (let [[old-page-name _ old-hiccup _ old-block-uuid] (:rum/args prev-state)
-                          [page-name _ hiccup _ block-uuid] (:rum/args state)]
-                      (or (not= page-name old-page-name)
-                          (not= hiccup old-hiccup)
-                          (not= block-uuid old-block-uuid))))}
-  [page-name _blocks hiccup sidebar? whiteboard? _block-uuid]
+  {:did-mount open-root-block!}
+  [page-name _block hiccup sidebar? whiteboard? _block-uuid]
   [:div.page-blocks-inner {:style {:margin-left (if (or sidebar? whiteboard?) 0 -20)}}
    (rum/with-key
      (content/content page-name
@@ -151,24 +138,32 @@
                         (str (:block/uuid page-e)))
           block-id (parse-uuid page-name)
           block? (boolean block-id)
-          page-blocks (get-blocks repo page-name block-id)]
-      (if (empty? page-blocks)
+          block (get-block page-name)
+          block-unloaded? (state/sub-block-unloaded? repo (:block/uuid block))]
+      (cond
+        block-unloaded?
+        (ui/loading "Loading...")
+
+        (and (not block?)
+             (empty? (:block/_parent block)))
         (dummy-block page-name)
+
+        :else
         (let [document-mode? (state/sub :document/mode?)
-              block-entity (db/entity (if block-id
-                                       [:block/uuid block-id]
-                                       [:block/name page-name]))
               hiccup-config (merge
                              {:id (if block? (str block-id) page-name)
-                              :db/id (:db/id block-entity)
+                              :db/id (:db/id block)
                               :block? block?
                               :editor-box editor/box
                               :document/mode? document-mode?}
                              config)
               hiccup-config (common-handler/config-with-document-mode hiccup-config)
-              hiccup (component-block/->hiccup page-blocks hiccup-config {})]
+              blocks (if block? [block] (db/sort-by-left (:block/_parent block) block))
+              non-collapsed-blocks-count (count (remove :block/collapsed? (:block/_page (db/entity (:db/id page-e)))))
+              lazy? (> non-collapsed-blocks-count 300)
+              hiccup (component-block/->hiccup blocks (assoc hiccup-config :lazy? lazy?) {})]
           [:div
-           (page-blocks-inner page-name page-blocks hiccup sidebar? whiteboard? block-id)
+           (page-blocks-inner page-name block hiccup sidebar? whiteboard? block-id)
            (when-not config/publishing?
              (let [args (if block-id
                           {:block-uuid block-id}
@@ -460,6 +455,18 @@
                            :block? true}]
                [:div.mb-4
                 (component-block/breadcrumb config repo block-id {:level-limit 3})]))
+
+           (when (and
+                  (config/db-based-graph? repo)
+                  (not block?)
+                  (not whiteboard?)
+                  (seq (:block/properties page)))
+             (let [edit-input-id (str "edit-block-" (:block/uuid page) "-schema")]
+               (component-block/db-properties-cp
+                {:editor-box editor/box}
+                page
+                edit-input-id
+                {:selected? false})))
 
            ;; blocks
            (let [page (if block?
@@ -1140,3 +1147,58 @@
                      :total total-items
                      :per-page per-page-num
                      :on-change #(to-page %))]])]))
+
+(rum/defcs configure < rum/reactive
+  [state repo page]
+  (let [page-id (:db/id page)
+        page (when page-id (db/sub-block page-id))
+        type (:block/type page)
+        class? (= "class" type)
+        property? (= "property" type)
+        journal? (:block/journal? page)]
+    (when page
+      [:div.page-configure
+       [:h1.title "Configure page"]
+
+       [:div.grid.gap-4.p-1
+        (when-not journal?
+          [:div.grid.grid-cols-2.gap-2.leading-8.items-center
+           [:label.cols-1 "Is this page a structured page?"]
+           (ui/checkbox {:checked class?
+                         :on-change (fn []
+                                      (db/transact! [{:db/id page-id
+                                                      :block/type (if class? ; class->normal page
+                                                                    "page"
+                                                                    "class")}]))})])
+
+        (case type
+          "class"
+          [:div.structured-schema
+           ;; properties
+           [:h2.text-lg.font-medium.mb-2 "Properties:"]
+           [:div.grid.gap-1
+            (let [edit-input-id (str "edit-block-" (:block/uuid page) "-schema")]
+              (component-block/db-properties-cp
+               {:editor-box editor/box}
+               page
+               edit-input-id
+               {:selected? false
+                :page-configure? true
+                :class-schema? true}))]]
+
+          [:div
+           [:h2.text-lg.font-medium.mb-2 "Properties:"]
+           (let [edit-input-id (str "edit-block-" (:block/uuid page))]
+             [:div
+              (component-block/db-properties-cp
+               {:editor-box editor/box}
+               page
+               edit-input-id
+               {:selected? false
+                :page-configure? true})])])]
+
+       (when config/dev?
+         [:div {:style {:max-width 900}}
+          [:hr]
+          [:p "Debug data:"]
+          [:pre (util/pp-str page)]])])))

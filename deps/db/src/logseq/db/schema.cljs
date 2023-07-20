@@ -1,5 +1,5 @@
 (ns logseq.db.schema
-  "Main db schema for the Logseq app")
+  "Main db schemas for the Logseq app")
 
 (defonce version 2)
 (defonce ast-version 1)
@@ -15,7 +15,10 @@
    ;; :block/type is a string type of the current block
    ;; "whiteboard" for whiteboards
    ;; "macros" for macro
-   :block/type {}
+   ;; "property" for property blocks
+   ;; "class" for structured page
+   :block/type {:db/index true}
+   :block/schema {}
    :block/uuid {:db/unique :db.unique/identity}
    :block/parent {:db/valueType :db.type/ref
                   :db/index true}
@@ -36,9 +39,13 @@
    :block/path-refs {:db/valueType   :db.type/ref
                      :db/cardinality :db.cardinality/many}
 
-   ;; for pages
+   ;; tags are structured classes
    :block/tags {:db/valueType :db.type/ref
                 :db/cardinality :db.cardinality/many}
+
+   ;; an instance created by this block
+   :block/instance {:db/valueType :db.type/ref
+                    :db/index true}
 
    ;; for pages
    :block/alias {:db/valueType :db.type/ref
@@ -78,6 +85,7 @@
    ;; page additional attributes
    ;; page's name, lowercase
    :block/name {:db/unique :db.unique/identity}
+
    ;; page's original name
    :block/original-name {:db/unique :db.unique/identity}
    ;; whether page's is a journal
@@ -101,6 +109,11 @@
    ;; :file/size {}
    ;; :file/handle {}
    })
+
+(def schema-for-db-based-graph
+  (merge
+   schema
+   {}))
 
 (def retract-attributes
   #{
@@ -140,3 +153,15 @@
     :block/invalid-properties
     :block/alias
     :block/tags})
+
+(def ref-type-attributes
+  #{:block/parent
+    :block/left
+    :block/page
+    :block/refs
+    :block/path-refs
+    :block/tags
+    :block/alias
+    :block/namespace
+    :block/macros
+    :block/file})

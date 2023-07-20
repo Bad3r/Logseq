@@ -1,14 +1,19 @@
 (ns ^:no-doc frontend.handler.editor.lifecycle
   (:require [frontend.handler.editor :as editor-handler :refer [get-state]]
             [frontend.handler.editor.keyboards :as keyboards-handler]
+            [frontend.handler.property :as property-handler]
             [frontend.state :as state :refer [sub]]
             [frontend.util :as util]
-            [goog.dom :as gdom]))
+            [goog.dom :as gdom]
+            [dommy.core :as d]
+            [goog.object :as gobj]
+            [clojure.string :as string]
+            [frontend.db :as db]))
 
 (defn did-mount!
   [state]
   (let [[{:keys [block-parent-id]} id] (:rum/args state)
-        content (get-in @state/state [:editor/content id])]
+        content (get @(get @state/state :editor/content) id)]
     (when block-parent-id
       (state/set-editing-block-dom-id! block-parent-id))
     (when content
@@ -34,13 +39,25 @@
 
 (defn will-unmount
   [state]
-  (let [{:keys [value]} (get-state)]
+  (let [{:keys [block value node]} (get-state)
+        property? (= "property" (:block/type block))
+        repo (state/get-current-repo)]
     (editor-handler/clear-when-saved!)
     (when (and
            (not (contains? #{:insert :indent-outdent :auto-save :undo :redo :delete} (state/get-editor-op)))
            ;; Don't trigger auto-save if the latest op is undo or redo
            (not (contains? #{:undo :redo} (state/get-editor-latest-op))))
-      (editor-handler/save-block! (get-state) value)))
+      (if property?
+        ;; click outside property value to save it
+        (let [parent-block (when-let [id (d/attr node "parentblockid")]
+                             (when (util/uuid-string? id)
+                               (db/entity [:block/uuid (uuid id)])))
+              property (:block/name block)
+              old-value (:property-value (last (state/get-editor-args)))]
+          (when (and parent-block property)
+            (property-handler/add-property! repo parent-block property value
+                                            :old-value old-value)))
+        (editor-handler/save-block! (get-state) value))))
   state)
 
 (def lifecycle
