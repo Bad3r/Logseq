@@ -11,11 +11,12 @@ rules:
 
   - id: logseq-clj-dynamic-eval
     languages: [clojure]
-    severity: WARNING
+    severity: ERROR
     message: >
-      Dynamic code evaluation (eval / load-string / read-string). If the
-      argument can be influenced by user input this is remote code execution.
-      For parsing untrusted data use clojure.edn/read-string instead.
+      Dynamic code evaluation (eval / load-string / read-string, including the
+      cljs.reader and tools.reader aliases). If the argument can be influenced
+      by user input this is remote code execution. For parsing untrusted data
+      use clojure.edn/read-string instead.
     metadata:
       category: security
       cwe: "CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code"
@@ -23,15 +24,23 @@ rules:
       - pattern-either:
           - pattern: (eval $X)
           - pattern: (load-string $X)
+          # read-string is unsafe through clojure.core and the cljs.reader /
+          # tools.reader aliases (honors *read-eval* / tagged literals). The
+          # safe clojure.edn/read-string is intentionally NOT matched.
           - pattern: (read-string $X)
           - pattern: (clojure.core/read-string $X)
+          - pattern: (cljs.reader/read-string $X)
+          - pattern: (reader/read-string $X)
+          - pattern: (cljs.tools.reader/read-string $X)
+          - pattern: (clojure.tools.reader/read-string $X)
 
   - id: logseq-clj-shell-exec
     languages: [clojure]
     severity: WARNING
     message: >
-      Shell / process execution. Ensure the command and arguments are not
-      built from untrusted input (command injection).
+      Shell / process execution (clojure.java.shell, a bare sh refer, or
+      babashka.process shell/process). Ensure the command and arguments are
+      not built from untrusted input (command injection).
     metadata:
       category: security
       cwe: "CWE-78: OS Command Injection"
@@ -39,11 +48,17 @@ rules:
       - pattern-either:
           - pattern: (clojure.java.shell/sh ...)
           - pattern: (sh/sh ...)
+          - pattern: (sh ...)
           - pattern: (.exec (Runtime/getRuntime) ...)
+          # babashka.process (dev/build scripts): bare :refer and qualified.
+          - pattern: (shell ...)
+          - pattern: (process ...)
+          - pattern: (babashka.process/shell ...)
+          - pattern: (babashka.process/process ...)
 
   - id: logseq-cljs-js-eval
     languages: [clojure]
-    severity: WARNING
+    severity: ERROR
     message: >
       js/eval executes arbitrary JavaScript in the renderer/main process.
       Avoid evaluating strings; this is a common XSS / RCE sink.
@@ -56,14 +71,38 @@ rules:
     languages: [clojure]
     severity: WARNING
     message: >
-      Assigning innerHTML can introduce DOM-based XSS. Prefer text nodes or a
-      sanitizer (e.g. dompurify) for untrusted markup.
+      Assigning innerHTML / set-html! can introduce DOM-based XSS. Prefer text
+      nodes or a sanitizer (e.g. dompurify) for untrusted markup.
     metadata:
       category: security
       cwe: "CWE-79: Cross-site Scripting"
-    pattern: (set! (.-innerHTML $EL) $X)
+    patterns:
+      - pattern-either:
+          - pattern: (set! (.-innerHTML $EL) $X)
+          - pattern: (set-html! $EL $X)
+          - pattern: (dom/set-html! $EL $X)
+          - pattern: (gdom/set-html! $EL $X)
+      # Clearing an element with a constant empty string is not an XSS sink.
+      - pattern-not: (set! (.-innerHTML $EL) "")
+
+  - id: logseq-cljs-react-raw-html
+    languages: [clojure]
+    severity: WARNING
+    message: >
+      React raw-HTML injection: the :__html payload renders unescaped markup.
+      Ensure the value is sanitized (e.g. via security/sanitize-html) before
+      rendering untrusted content.
+    metadata:
+      category: security
+      cwe: "CWE-79: Cross-site Scripting"
+    # The Hiccup map-literal form is not reliably matched by the experimental
+    # Clojure parser, so match the React payload key directly.
+    pattern-regex: ":__html"
 
   # ---- OCaml (cli/) -----------------------------------------------------
+  #
+  # These match no call sites in the current tree (cli/ uses none of these
+  # sinks yet); they are forward-looking coverage for future OCaml code.
 
   - id: logseq-ocaml-unsafe-deserialization
     languages: [ocaml]
