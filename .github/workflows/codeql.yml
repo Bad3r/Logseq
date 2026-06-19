@@ -1,0 +1,150 @@
+# CodeQL "advanced" code scanning, tailored to this repository.
+#
+# Language scope notes (important):
+#   * Logseq's core is ClojureScript/Clojure (~900 files) and the CLI is OCaml
+#     (~120 files). CodeQL has NO analyzer for either, so the bulk of the
+#     codebase is out of scope for code scanning. CodeQL only covers the
+#     languages listed in the matrix below.
+#   * Reliable, no-build, high-value targets are enabled by default:
+#       - actions                GitHub Actions workflows (release pipelines, secrets handling)
+#       - javascript-typescript  packages/ui, libs SDK, deps/db-sync worker, capacitor.config.ts
+#       - python                 sidecar/embedding_server.py and the cli-e2e scripts/tests
+#   * Native mobile targets are opt-in (commented out in the matrix):
+#       - java-kotlin            android/ native plugins  (Kotlin/Java)
+#       - swift                  ios/App native plugins    (Swift/Obj-C)
+#     They require the full Capacitor mobile build (pnpm release-mobile +
+#     `cap sync`) before CodeQL can observe compilation, and swift needs a
+#     macOS runner. The gated setup steps further down prepare those builds;
+#     uncomment the matrix entry to enable. See build-android.yml /
+#     build-ios-release.yml for the canonical pipeline these mirror.
+#
+# Dropped from the GitHub default template:
+#   * c-cpp  - only a single OCaml<->JS FFI stub (cli/lib/js_bytecode_stubs.c);
+#              not worth standing up a compiled-language build.
+#   * ruby   - no first-party Ruby source (auto-detected from the iOS Podfile).
+
+name: "CodeQL Advanced"
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+  schedule:
+    - cron: '39 14 * * 1'
+
+# Versions mirror build-android.yml so the opt-in native builds match CI.
+env:
+  NODE_VERSION: '24'
+  JAVA_VERSION: '21'
+  PNPM_VERSION: '10.33.0'
+  CLOJURE_VERSION: '1.12.4.1618'
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ${{ (matrix.language == 'swift' && 'macos-latest') || 'ubuntu-latest' }}
+    permissions:
+      # required for all workflows
+      security-events: write
+      # required to fetch internal or private CodeQL packs
+      packages: read
+      # only required for workflows in private repositories
+      actions: read
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - language: actions
+          build-mode: none
+        - language: javascript-typescript
+          build-mode: none
+        - language: python
+          build-mode: none
+        # ---- Native mobile: opt-in (require the full Capacitor build) -------
+        # Uncomment to scan the Android native plugins (Kotlin/Java). Needs
+        # JDK 21 + Android SDK + `pnpm release-mobile` + `cap sync` (the gated
+        # "native setup" steps below provide these; mirrors build-android.yml).
+        # If autobuild cannot locate the Gradle project (it lives under
+        # android/), switch build-mode to `manual` and run `./gradlew` there.
+        # - language: java-kotlin
+        #   build-mode: autobuild
+        #
+        # Uncomment to scan the iOS native plugins (Swift/Obj-C). Runs on
+        # macos-latest and needs CocoaPods + the mobile build.
+        # - language: swift
+        #   build-mode: autobuild
+        #
+        # CodeQL 'language' keywords: 'actions', 'c-cpp', 'csharp', 'go',
+        # 'java-kotlin', 'javascript-typescript', 'python', 'ruby', 'rust', 'swift'.
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    # ---- Native-mobile setup (opt-in languages only) ----------------------
+    # Every step here is gated on java-kotlin / swift, so it is skipped for the
+    # default JS / Python / actions scans and costs them nothing. These steps
+    # build the web bundle and sync Capacitor BEFORE `init`, because that work
+    # contains no Kotlin/Swift compilation to trace; CodeQL traces only the
+    # autobuild that runs between `init` and `analyze`.
+
+    - name: Install Node.js
+      if: matrix.language == 'java-kotlin' || matrix.language == 'swift'
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+
+    - name: Set up pnpm
+      if: matrix.language == 'java-kotlin' || matrix.language == 'swift'
+      uses: pnpm/action-setup@v4
+      with:
+        version: ${{ env.PNPM_VERSION }}
+
+    - name: Setup Java JDK
+      if: matrix.language == 'java-kotlin' || matrix.language == 'swift'
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'zulu'
+        java-version: ${{ env.JAVA_VERSION }}
+
+    - name: Setup Clojure
+      if: matrix.language == 'java-kotlin' || matrix.language == 'swift'
+      uses: DeLaGuardo/setup-clojure@13.5
+      with:
+        cli: ${{ env.CLOJURE_VERSION }}
+
+    - name: Build mobile web bundle (CLJS) and sync Capacitor
+      if: matrix.language == 'java-kotlin' || matrix.language == 'swift'
+      env:
+        # Controlled matrix value (not untrusted input); kept in env so the
+        # run block contains no ${{ }} interpolation.
+        CAP_PLATFORM: ${{ (matrix.language == 'swift' && 'ios') || 'android' }}
+      run: |
+        pnpm install --frozen-lockfile
+        pnpm release-mobile
+        pnpm exec cap sync "$CAP_PLATFORM"
+
+    - name: Setup Android SDK
+      if: matrix.language == 'java-kotlin'
+      uses: android-actions/setup-android@v3.2.2
+
+    - name: Install CocoaPods (iOS)
+      if: matrix.language == 'swift'
+      run: pod install --project-directory=ios/App
+
+    # ---- CodeQL -----------------------------------------------------------
+
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v4
+      with:
+        languages: ${{ matrix.language }}
+        build-mode: ${{ matrix.build-mode }}
+        config-file: ./.github/codeql/codeql-config.yml
+
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v4
+      with:
+        category: "/language:${{ matrix.language }}"
