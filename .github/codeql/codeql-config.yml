@@ -1,0 +1,15 @@
+# Shared CodeQL configuration for Logseq.
+# Referenced by .github/workflows/codeql.yml through the `config-file` input.
+name: "Logseq CodeQL config"
+
+# Add the broader security suite on top of CodeQL's default queries.
+# `security-extended` widens security coverage while avoiding the
+# maintainability/style findings that `security-and-quality` adds.
+queries:
+  - uses: security-extended
+
+# Vendored, minified third-party bundles checked into the tree. These are not
+# reviewable source and only produce noise. node_modules/, static/** and
+# /public are untracked (gitignored) or auto-excluded, so they are not listed.
+paths-ignore:
+  - "**/*.min.js"
