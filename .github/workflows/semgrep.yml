@@ -33,9 +33,11 @@ jobs:
   semgrep:
     name: Scan (clojure, ocaml)
     runs-on: ubuntu-latest
-    # Official Semgrep image ships the CLI and language analyzers.
+    # Official Semgrep image ships the CLI and language analyzers. Pinned to a
+    # release tag (not :latest) so scans are reproducible and the image cannot
+    # change underneath the workflow.
     container:
-      image: semgrep/semgrep
+      image: semgrep/semgrep:1.167.0
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -52,7 +54,9 @@ jobs:
           .
 
       - name: Upload SARIF to code scanning
-        if: always()
+        # Skip when the scan errored without writing a SARIF: uploading a
+        # missing or empty file would fail with a second, misleading error.
+        if: ${{ !cancelled() && hashFiles('semgrep.sarif') != '' }}
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: semgrep.sarif
