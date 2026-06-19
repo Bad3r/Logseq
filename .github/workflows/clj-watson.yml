@@ -1,0 +1,77 @@
+# clj-watson: dependency (SCA) vulnerability scanning for Clojure deps.edn.
+#
+# Covers JVM/Clojure (Maven) coordinates that OSV-Scanner does not parse. Uses
+# the GitHub Advisory database strategy (no NVD API key required) and uploads
+# SARIF to the code-scanning dashboard, under the "clj-watson" category.
+#
+# Runs on changes to any deps.edn (path-filtered), weekly, and on demand.
+# Dependency-tree resolution is slow, so PR-time SCA is left to OSV-Scanner.
+# To use the OWASP/NVD strategy instead, swap `-t github-advisory` for
+# `-t dependency-check` and provide an NVD API key.
+
+name: "clj-watson"
+
+on:
+  push:
+    branches: [ "master" ]
+    paths:
+      - "**/deps.edn"
+      - ".github/workflows/clj-watson.yml"
+  schedule:
+    - cron: '39 14 * * 5'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # Upload SARIF to the code-scanning dashboard.
+  security-events: write
+  # Only required for workflows in private repositories.
+  actions: read
+
+# Toolchain versions mirror build-android.yml.
+env:
+  JAVA_VERSION: '21'
+  CLOJURE_VERSION: '1.12.4.1618'
+
+jobs:
+  clj-watson:
+    name: Clojure dependency CVE scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Clojure
+        uses: DeLaGuardo/setup-clojure@13.5
+        with:
+          cli: ${{ env.CLOJURE_VERSION }}
+
+      - name: Scan deps.edn with clj-watson
+        # clj-watson v6.1.0 pinned by git tag + sha. `-o sarif` writes SARIF to
+        # stdout (redirected to a file); `--no-fail-on-result` keeps the build
+        # green so findings are triaged in the Security tab. GITHUB_TOKEN (the
+        # safe env pattern, not untrusted input) authenticates the advisory API.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          clojure \
+            -Sdeps '{:deps {io.github.clj-holmes/clj-watson {:git/tag "v6.1.0" :git/sha "be98e4db74fb8927db4825cc73bbe2606e44e5e3"}}}' \
+            -M -m clj-watson.cli scan \
+            -p deps.edn \
+            -t github-advisory \
+            -o sarif \
+            --no-fail-on-result \
+            > clj-watson.sarif
+
+      - name: Upload SARIF to code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: clj-watson.sarif
+          category: clj-watson
