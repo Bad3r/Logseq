@@ -1,0 +1,50 @@
+# clj-holmes: pattern-based SAST for Clojure / ClojureScript.
+#
+# Complements the custom Semgrep ruleset with clj-holmes' prebuilt open-source
+# rules (clj-holmes-rules). Like Semgrep on these languages it is pattern-based,
+# not source-to-sink taint analysis. Results are uploaded as SARIF to the same
+# code-scanning dashboard, under the "clj-holmes" category.
+#
+# The upstream action publishes no release tags, so it is pinned to a commit SHA
+# (supply-chain hygiene for a security workflow).
+
+name: "clj-holmes"
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+  schedule:
+    - cron: '39 14 * * 3'
+
+permissions:
+  contents: read
+  # Upload SARIF to the code-scanning dashboard.
+  security-events: write
+  # Only required for workflows in private repositories.
+  actions: read
+
+jobs:
+  clj-holmes:
+    name: Clojure SAST
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run clj-holmes
+        # No upstream release tags; pinned to clj-holmes-action main @53daa4d (2026-06-19).
+        uses: clj-holmes/clj-holmes-action@53daa4da4ff495cccf791e4ba4222a8317ddae9e
+        with:
+          output-type: sarif
+          output-file: clj-holmes.sarif
+          # Findings are triaged in the Security tab; do not fail the build.
+          fail-on-result: 'false'
+
+      - name: Upload SARIF to code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: clj-holmes.sarif
+          category: clj-holmes
