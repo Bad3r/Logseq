@@ -2,7 +2,13 @@
 #
 # Covers JVM/Clojure (Maven) coordinates that OSV-Scanner does not parse. Uses
 # the GitHub Advisory database strategy (no NVD API key required) and uploads
-# SARIF to the code-scanning dashboard, under the "clj-watson" category.
+# SARIF to the code-scanning dashboard, under per-manifest "clj-watson:<path>"
+# categories.
+#
+# Every deps.edn in the tree is scanned: clj-watson resolves a single
+# -p deps.edn at a time, and the standalone manifests (deps/publish, clj-e2e,
+# scripts, libs/cljs-sdk) are not reachable from the root via :local/root. A
+# discover job enumerates them and the scan job fans out over a matrix.
 #
 # Runs on changes to any deps.edn (path-filtered), weekly, and on demand.
 # Dependency-tree resolution is slow, so PR-time SCA is left to OSV-Scanner.
@@ -34,9 +40,32 @@ env:
   CLOJURE_VERSION: '1.12.4.1618'
 
 jobs:
-  clj-watson:
-    name: Clojure dependency CVE scan
+  # Enumerate every deps.edn so the scan matrix covers them all, not just the
+  # root manifest.
+  discover:
+    name: Discover deps.edn files
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.find.outputs.matrix }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build deps.edn matrix
+        id: find
+        run: |
+          files=$(find . -name deps.edn -not -path '*/node_modules/*' \
+            | sed 's|^\./||' | sort | jq -R . | jq -cs .)
+          echo "matrix=${files}" >> "$GITHUB_OUTPUT"
+
+  clj-watson:
+    name: CVE scan
+    needs: discover
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        deps: ${{ fromJson(needs.discover.outputs.matrix) }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -54,12 +83,18 @@ jobs:
 
       - name: Scan deps.edn with clj-watson
         # clj-watson v6.1.0 pinned by git tag + sha. `-o sarif` writes SARIF to
-        # stdout (redirected to a file); `--no-fail-on-result` keeps the build
-        # green so findings are triaged in the Security tab. GITHUB_TOKEN (the
-        # safe env pattern, not untrusted input) authenticates the advisory API.
+        # stdout; `--no-fail-on-result` keeps the build green so findings are
+        # triaged in the Security tab. GITHUB_TOKEN (the safe env pattern, not
+        # untrusted input) authenticates the advisory API. cd into the manifest's
+        # directory so :local/root paths resolve per project; DEPS_EDN is a
+        # matrix value passed via env, never interpolated into the shell.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEPS_EDN: ${{ matrix.deps }}
         run: |
+          cd "$(dirname "$DEPS_EDN")" || exit 1
+          raw="${GITHUB_WORKSPACE}/clj-watson.raw.json"
+          out="${GITHUB_WORKSPACE}/clj-watson.sarif"
           clojure \
             -Sdeps '{:deps {io.github.clj-holmes/clj-watson {:git/tag "v6.1.0" :git/sha "be98e4db74fb8927db4825cc73bbe2606e44e5e3"}}}' \
             -M -m clj-watson.cli scan \
@@ -67,11 +102,18 @@ jobs:
             -t github-advisory \
             -o sarif \
             --no-fail-on-result \
-            > clj-watson.sarif
+            > "$raw"
+          # clj-watson appends a human summary ("Dependencies scanned: N" ...) to
+          # stdout after the SARIF JSON, which makes the raw file invalid SARIF.
+          # Extract only the leading JSON object so the upload gets clean SARIF;
+          # this also fails the step if clj-watson wrote a non-JSON error instead.
+          python3 -c 'import json,sys; data=open(sys.argv[1]).read().lstrip(); obj=json.JSONDecoder().raw_decode(data)[0]; json.dump(obj, open(sys.argv[2],"w"))' "$raw" "$out"
 
       - name: Upload SARIF to code scanning
-        if: always()
+        # Skip when the scan errored without writing a SARIF: uploading a
+        # missing or empty file would fail with a second, misleading error.
+        if: ${{ !cancelled() && hashFiles('clj-watson.sarif') != '' }}
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: clj-watson.sarif
-          category: clj-watson
+          category: clj-watson:${{ matrix.deps }}
