@@ -1,0 +1,66 @@
+# OSV-Scanner: dependency (SCA) scanning via lockfiles.
+#
+# Covers the npm ecosystem (the five pnpm-lock.yaml files: root, packages/ui,
+# resources, scripts, cli) and any other OSV-supported manifest in the tree.
+# Clojure deps.edn is NOT an OSV-supported lockfile, so JVM/Clojure dependencies
+# are handled separately by clj-watson.yml.
+#
+# The OSV reusable workflows are NOT used: they export the full results JSON as a
+# job output, which exceeds the Actions output size limit on this repo (~191
+# findings across 1100+ packages -> "Maximum object size exceeded"). Running the
+# pinned CLI and uploading SARIF directly avoids that and keeps full control.
+
+name: "OSV-Scanner"
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+  schedule:
+    - cron: '39 14 * * 4'
+
+permissions:
+  contents: read
+  # Upload SARIF to the code-scanning dashboard.
+  security-events: write
+  # Only required for workflows in private repositories.
+  actions: read
+
+env:
+  OSV_SCANNER_VERSION: '2.3.8'
+  # sha256 of osv-scanner_linux_amd64 from the v2.3.8 release SHA256SUMS.
+  OSV_SCANNER_SHA256: 'bc98e15319ed0d515e3f9235287ba53cdc5535d576d24fd573978ecfe9ab92dc'
+
+jobs:
+  osv-scan:
+    name: Dependency scan (lockfiles)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install osv-scanner (pinned, checksum verified)
+        run: |
+          url="https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64"
+          curl -sSfL "$url" -o osv-scanner
+          echo "${OSV_SCANNER_SHA256}  osv-scanner" | sha256sum -c -
+          chmod +x osv-scanner
+
+      - name: Scan lockfiles
+        # osv-scanner exits 1 when vulnerabilities are found (expected; findings
+        # are triaged in the Security tab) and >1 on a real error. Tolerate 1,
+        # surface anything worse. SARIF is written regardless of the exit code.
+        run: |
+          ./osv-scanner scan --recursive --format=sarif --output=osv.sarif ./ || code=$?
+          if [ "${code:-0}" -gt 1 ]; then
+            echo "osv-scanner failed with exit code ${code}"
+            exit "${code}"
+          fi
+
+      - name: Upload SARIF to code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: osv.sarif
+          category: osv-scanner
