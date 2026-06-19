@@ -1,0 +1,98 @@
+# Custom Semgrep rules for the languages CodeQL cannot analyze:
+# Clojure / ClojureScript (language id: clojure) and OCaml (language id: ocaml).
+#
+# These are SYNTACTIC pattern matches (Semgrep treats both languages as
+# "experimental"), not source-to-sink taint analysis. They flag dangerous
+# sinks for human review; they do not prove the input is attacker-controlled.
+# Tune severity / add `pattern-not` exceptions as false positives surface.
+
+rules:
+  # ---- Clojure / ClojureScript -----------------------------------------
+
+  - id: logseq-clj-dynamic-eval
+    languages: [clojure]
+    severity: WARNING
+    message: >
+      Dynamic code evaluation (eval / load-string / read-string). If the
+      argument can be influenced by user input this is remote code execution.
+      For parsing untrusted data use clojure.edn/read-string instead.
+    metadata:
+      category: security
+      cwe: "CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code"
+    patterns:
+      - pattern-either:
+          - pattern: (eval $X)
+          - pattern: (load-string $X)
+          - pattern: (read-string $X)
+          - pattern: (clojure.core/read-string $X)
+
+  - id: logseq-clj-shell-exec
+    languages: [clojure]
+    severity: WARNING
+    message: >
+      Shell / process execution. Ensure the command and arguments are not
+      built from untrusted input (command injection).
+    metadata:
+      category: security
+      cwe: "CWE-78: OS Command Injection"
+    patterns:
+      - pattern-either:
+          - pattern: (clojure.java.shell/sh ...)
+          - pattern: (sh/sh ...)
+          - pattern: (.exec (Runtime/getRuntime) ...)
+
+  - id: logseq-cljs-js-eval
+    languages: [clojure]
+    severity: WARNING
+    message: >
+      js/eval executes arbitrary JavaScript in the renderer/main process.
+      Avoid evaluating strings; this is a common XSS / RCE sink.
+    metadata:
+      category: security
+      cwe: "CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code"
+    pattern: (js/eval $X)
+
+  - id: logseq-cljs-inner-html
+    languages: [clojure]
+    severity: WARNING
+    message: >
+      Assigning innerHTML can introduce DOM-based XSS. Prefer text nodes or a
+      sanitizer (e.g. dompurify) for untrusted markup.
+    metadata:
+      category: security
+      cwe: "CWE-79: Cross-site Scripting"
+    pattern: (set! (.-innerHTML $EL) $X)
+
+  # ---- OCaml (cli/) -----------------------------------------------------
+
+  - id: logseq-ocaml-unsafe-deserialization
+    languages: [ocaml]
+    severity: WARNING
+    message: >
+      Marshal.from_* deserializes data without validation. Deserializing
+      untrusted bytes is unsafe (can corrupt memory or be abused for RCE).
+    metadata:
+      category: security
+      cwe: "CWE-502: Deserialization of Untrusted Data"
+    patterns:
+      - pattern-either:
+          - pattern: Marshal.from_string $S $O
+          - pattern: Marshal.from_bytes $B $O
+          - pattern: Marshal.from_channel $C
+
+  - id: logseq-ocaml-command-exec
+    languages: [ocaml]
+    severity: WARNING
+    message: >
+      Executing a shell command / subprocess. Ensure the argument is not
+      attacker-controlled (command injection).
+    metadata:
+      category: security
+      cwe: "CWE-78: OS Command Injection"
+    patterns:
+      - pattern-either:
+          - pattern: Sys.command $CMD
+          - pattern: Unix.system $CMD
+          - pattern: Unix.open_process $CMD
+          - pattern: Unix.open_process_in $CMD
+          - pattern: Unix.open_process_out $CMD

@@ -1,0 +1,59 @@
+# Semgrep code scanning, covering the languages CodeQL cannot analyze.
+#
+# CodeQL has no analyzer for Clojure/ClojureScript (~900 files, the core app)
+# or OCaml (~120 files, cli/). Semgrep treats both as "experimental" (syntactic
+# pattern matching, not source-to-sink taint analysis), but it parses them and
+# can flag dangerous sinks for review. Results are uploaded as SARIF and appear
+# in the same GitHub code-scanning UI as CodeQL, under the "semgrep" category.
+#
+# This runs ONLY the repo-local ruleset in .github/semgrep/logseq-rules.yml, so
+# it is self-contained and needs no Semgrep Registry / login / network. To widen
+# coverage, add more `--config` flags (e.g. `--config p/secrets`, `--config auto`)
+# in the scan step below.
+
+name: "Semgrep"
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+  schedule:
+    # Offset one day from the CodeQL schedule.
+    - cron: '39 14 * * 2'
+
+permissions:
+  contents: read
+  # Upload SARIF to the code-scanning dashboard.
+  security-events: write
+  # Only required for workflows in private repositories.
+  actions: read
+
+jobs:
+  semgrep:
+    name: Scan (clojure, ocaml)
+    runs-on: ubuntu-latest
+    # Official Semgrep image ships the CLI and language analyzers.
+    container:
+      image: semgrep/semgrep
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Semgrep scan (SARIF)
+        # No `--error`, so findings do not fail the build; they are triaged in
+        # the Security tab. The step still fails on a real scanner error.
+        run: >
+          semgrep scan
+          --config .github/semgrep/logseq-rules.yml
+          --metrics off
+          --disable-version-check
+          --sarif --output semgrep.sarif
+          .
+
+      - name: Upload SARIF to code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
