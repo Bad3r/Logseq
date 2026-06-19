@@ -1,9 +1,9 @@
 # OSV-Scanner: dependency (SCA) scanning via lockfiles.
 #
-# Covers the npm ecosystem (the five pnpm-lock.yaml files: root, packages/ui,
-# resources, scripts, cli) and any other OSV-supported manifest in the tree.
-# Clojure deps.edn is NOT an OSV-supported lockfile, so JVM/Clojure dependencies
-# are handled separately by clj-watson.yml.
+# Scans every OSV-supported manifest in the tree via `--recursive`, which here is
+# the npm ecosystem (all pnpm-lock.yaml files). Clojure deps.edn is NOT an
+# OSV-supported lockfile, so JVM/Clojure dependencies are handled separately by
+# clj-watson.yml.
 #
 # The OSV reusable workflows are NOT used: they export the full results JSON as a
 # job output, which exceeds the Actions output size limit on this repo (~191
@@ -48,9 +48,11 @@ jobs:
           chmod +x osv-scanner
 
       - name: Scan lockfiles
-        # osv-scanner exits 1 when vulnerabilities are found (expected; findings
-        # are triaged in the Security tab) and >1 on a real error. Tolerate 1,
-        # surface anything worse. SARIF is written regardless of the exit code.
+        # osv-scanner exits 0 (no vulnerabilities) or 1 (vulnerabilities found,
+        # expected: findings are triaged in the Security tab). Tolerate 0 and 1;
+        # any higher code is a real error (e.g. 127 general error, 128 "no
+        # packages found") and fails the job. SARIF is written on exit 0 and 1;
+        # on a hard error it may be absent, so the upload step is gated on it.
         run: |
           ./osv-scanner scan --recursive --format=sarif --output=osv.sarif ./ || code=$?
           if [ "${code:-0}" -gt 1 ]; then
@@ -59,7 +61,9 @@ jobs:
           fi
 
       - name: Upload SARIF to code scanning
-        if: always()
+        # Skip when the scan errored without writing a SARIF: uploading a
+        # missing or empty file would fail with a second, misleading error.
+        if: ${{ !cancelled() && hashFiles('osv.sarif') != '' }}
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: osv.sarif
