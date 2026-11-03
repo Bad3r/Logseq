@@ -4,14 +4,20 @@
   logseq/config.edn. In the future it may manage more files. This component
   depends on a repo."
   (:require [clojure.edn :as edn]
+            [clojure.string :as string]
+            [frontend.config :as config]
             [frontend.context.i18n :refer [t]]
-            [frontend.db :as db]
             [frontend.handler.notification :as notification]
-            [frontend.state :as state]))
+            [frontend.state :as state]
+            [promesa.core :as p]))
+
+(defn <get-file-content
+  [repo-url path]
+  (state/<invoke-db-worker :thread-api/get-file-content repo-url path))
 
 (defn- get-repo-config-content
   [repo-url]
-  (db/get-file repo-url "logseq/config.edn"))
+  (<get-file-content repo-url "logseq/config.edn"))
 
 (defn read-repo-config
   "Converts file content to edn"
@@ -23,6 +29,15 @@
       ;; Rethrow so we know how long this is an issue and to prevent downstream errors
       (throw e))))
 
+(defn readable-config-content?
+  "True when file content parses into a config map. When parsing fails the user
+  is notified by read-repo-config."
+  [content]
+  (and (not (string/blank? content))
+       (try
+         (map? (read-repo-config content))
+         (catch :default _ false))))
+
 (defn set-repo-config-state!
   "Sets repo config state using given file content"
   [repo-url content]
@@ -33,9 +48,14 @@
 (defn restore-repo-config!
   "Sets repo config state from db"
   ([repo-url]
-   (restore-repo-config! repo-url (get-repo-config-content repo-url)))
+   (p/let [content (get-repo-config-content repo-url)]
+     (restore-repo-config! repo-url content)))
   ([repo-url config-content]
-   (set-repo-config-state! repo-url config-content)))
+   ;; A missing or unparsable config.edn is treated as the default config so
+   ;; `[:config repo]` state is always populated
+   (set-repo-config-state! repo-url (if (readable-config-content? config-content)
+                                      config-content
+                                      config/config-default-content))))
 
 (defn start
   "This component only has one responsibility on start, to manage db and ui state

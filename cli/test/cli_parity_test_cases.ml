@@ -4,6 +4,14 @@ let expect_equal name expected actual =
   if expected = actual then pass
   else fail_test (Printf.sprintf "%s: expected %S, got %S" name expected actual)
 
+let expect_string_vec name expected actual =
+  if Vec.to_array actual = expected then pass
+  else
+    fail_test
+      (Printf.sprintf "%s: expected %S, got %S" name
+         (Vec.string_concat "," (Vec.of_array expected))
+         (Vec.string_concat "," actual))
+
 let expect_bool name expected actual =
   if expected = actual then pass
   else fail_test (Printf.sprintf "%s: expected %b, got %b" name expected actual)
@@ -45,7 +53,7 @@ let expect_error_code name expected = function
         else code
       in
       expect_equal name (normalize_code expected)
-        (normalize_code (Edn_util.keyword_to_string err.Error.code))
+        (normalize_code (Error.code_to_string err.Error.code))
   | Ok _ -> fail_test (name ^ ": expected Error")
 
 let expect_error_context_code name expected err =
@@ -57,22 +65,24 @@ let expect_error_context_code name expected err =
            (Option.bind (Edn_util.get context "code") Edn_util.as_keyword))
 
 let expect_parse_ok name argv =
-  match Cli_parse.parse argv with
+  match Cli_parse.parse (Vec.of_array argv) with
   | Ok request -> request
   | Error err ->
       fail_test (name ^ ": " ^ err.Error.message);
       assert false
 
 let expect_parse_error_code name expected argv =
-  expect_error_code name expected (Cli_parse.parse argv)
+  expect_error_code name expected (Cli_parse.parse (Vec.of_array argv))
 
 let keyword_text value = Edn_util.keyword_to_string value
-let edn_of_string text = Melange_edn.of_edn_string text
+let edn_of_string text = Melange_edn_melange.of_edn_string text
 let repo_text repo = Cli_primitive.string_of_repo repo
 let graph_text graph = Cli_primitive.string_of_graph graph
 
 let unicode_text codepoints =
-  String.concat "" (List.map Js.String.fromCodePoint codepoints)
+  codepoints |> Vec.of_array
+  |> Vec.map Js.String.fromCodePoint
+  |> Vec.string_concat ""
 
 let start_open_url_capture () : unit =
   [%mel.raw
@@ -87,7 +97,7 @@ let start_open_url_capture () : unit =
   globalThis.__logseqOpenUrlCapture = capture;
   childProcess.spawn = function (command, args, options) {
     capture.calls.push({ command, args: Array.from(args), options });
-    return { pid: 4242, unref: function () {} };
+    return { pid: undefined, on: function () {}, unref: function () {} };
   };
   Object.defineProperty(process, "platform", { value: "win32", configurable: true });
 })()
@@ -114,6 +124,49 @@ let open_url_capture_calls () : string =
 JSON.stringify((globalThis.__logseqOpenUrlCapture && globalThis.__logseqOpenUrlCapture.calls) || [])
 |}]
 
+let start_spawn_capture () : unit =
+  [%mel.raw
+    {|
+(function () {
+  const childProcess = require("child_process");
+  const capture = {
+    originalSpawn: childProcess.spawn,
+    calls: []
+  };
+  globalThis.__logseqSpawnCapture = capture;
+  childProcess.spawn = function (command, args, options) {
+    capture.calls.push({ command, args: Array.from(args), options });
+    if (typeof capture.onSpawn === "function") capture.onSpawn(command, args, options);
+    return { pid: undefined, on: function () {}, unref: function () {} };
+  };
+})()
+|}]
+
+let stop_spawn_capture () : unit =
+  [%mel.raw
+    {|
+(function () {
+  const capture = globalThis.__logseqSpawnCapture;
+  if (!capture) return;
+  const childProcess = require("child_process");
+  childProcess.spawn = capture.originalSpawn;
+  delete globalThis.__logseqSpawnCapture;
+})()
+|}]
+
+let spawn_capture_calls () : string =
+  [%mel.raw
+    {|
+JSON.stringify((globalThis.__logseqSpawnCapture && globalThis.__logseqSpawnCapture.calls) || [])
+|}]
+
+let set_env key value : unit = Js.Dict.set Node.Process.process##env key value
+
+let unset_env_raw : string -> unit =
+  [%mel.raw {| function (key) { delete process.env[key]; } |}]
+
+let unset_env key : unit = unset_env_raw key
+
 let property_key_text = function
   | Property.Key_ident ident -> keyword_text ident
   | Property.Key_id id -> Int64.to_string id
@@ -129,42 +182,39 @@ let empty_common_opts =
   }
 
 let entity ?id ?title ?name ?ident ?updated_at ?created_at () =
+  let add_field fields key value =
+    Vec.push_back fields (Edn_util.keyword key, value)
+  in
   let raw_fields =
-    ( ( ( ( ( [] |> fun fields ->
+    ( ( ( ( ( Vec.empty |> fun fields ->
               match id with
-              | Some id ->
-                  (Edn_util.keyword "db/id", Edn_util.int64 id) :: fields
+              | Some id -> add_field fields "db/id" (Edn_util.int64 id)
               | None -> fields )
           |> fun fields ->
             match title with
             | Some title ->
-                (Edn_util.keyword "block/title", Edn_util.string title)
-                :: fields
+                add_field fields "block/title" (Edn_util.string title)
             | None -> fields )
         |> fun fields ->
           match name with
-          | Some name ->
-              (Edn_util.keyword "block/name", Edn_util.string name) :: fields
+          | Some name -> add_field fields "block/name" (Edn_util.string name)
           | None -> fields )
       |> fun fields ->
         match ident with
-        | Some ident ->
-            (Edn_util.keyword "db/ident", Edn_util.keyword ident) :: fields
+        | Some ident -> add_field fields "db/ident" (Edn_util.keyword ident)
         | None -> fields )
     |> fun fields ->
       match updated_at with
       | Some updated_at ->
-          (Edn_util.keyword "block/updated-at", Edn_util.int64 updated_at)
-          :: fields
+          add_field fields "block/updated-at" (Edn_util.int64 updated_at)
       | None -> fields )
     |> fun fields ->
     match created_at with
     | Some created_at ->
-        (Edn_util.keyword "block/created-at", Edn_util.int64 created_at)
-        :: fields
+        add_field fields "block/created-at" (Edn_util.int64 created_at)
     | None -> fields
   in
-  Entity.of_value (Edn_util.map raw_fields)
+  Entity.of_value (Edn_util.map_vec raw_fields)
 
 let span stage span_id start_ms end_ms =
   let start_time = Time.time_of_epoch_ms (Int64.of_int start_ms) in
@@ -179,7 +229,7 @@ let span stage span_id start_ms end_ms =
 
 let stage_count stage summaries =
   summaries
-  |> List.find_map (fun (summary : Profile_types.stage_summary) ->
+  |> Vec.find_map (fun (summary : Profile_types.stage_summary) ->
       if summary.stage = stage then Some summary.count else None)
 
 let config ?graph ?repo ?output_format ?auth_path ?id_token ?access_token
@@ -210,6 +260,7 @@ let config ?graph ?repo ?output_format ?auth_path ?id_token ?access_token
     owner_source = Cli_primitive.Cli;
     project_dir = None;
     raw_file_config;
+    graph_generation = None;
     profile_session = None;
   }
 
@@ -245,19 +296,53 @@ let effect_to_promise task =
 
 type lifecycle_output = {
   stdout : string option;
-  stderr : string list;
+  stderr : string Rrbvec.t;
   exit_code : int;
 }
 
-let run_cli_lifecycle ?(env = []) argv =
-  let result = spawn_cli ~env:(Array.of_list env) argv in
+let run_cli_lifecycle ?(env = [||]) argv =
+  let result = spawn_cli ~env argv in
   let stderr =
     let stderr = string_trim_end result##stderr in
-    if stderr = "" then [] else Array.to_list (string_split stderr "\n")
+    if stderr = "" then Vec.empty else Vec.of_array (string_split stderr "\n")
   in
   { stdout = Some result##stdout; stderr; exit_code = result_status result }
 
 let stdout_text name output = expect_some name output.stdout
+
+let expect_graph_list_output root expected =
+  Vec.iter
+    (fun (Output.Mode.Packed mode) ->
+      let output = Output.Mode.to_string mode in
+      let cfg = config ~root_dir:root ~graph:"alpha" () in
+      let result =
+        run_cli_lifecycle
+          [|
+            "--root-dir";
+            root;
+            "--graph";
+            "alpha";
+            "--output";
+            output;
+            "graph";
+            "list";
+          |]
+      in
+      expect_int (output ^ " exit") 0 result.exit_code;
+      expect_string_vec (output ^ " stderr") [||] result.stderr;
+      expect_equal
+        (output ^ " directory listing")
+        (Format_types.format_result
+           (Cli_result.ok ~command:Command_id.Graph_list mode
+              (Cli_result.Raw expected))
+           (config_with_output cfg mode))
+        (string_trim_end (stdout_text output result)))
+    (Vec.of_array
+       [|
+         Output.Mode.Packed Output.Mode.Human;
+         Output.Mode.Packed Output.Mode.Json;
+         Output.Mode.Packed Output.Mode.Edn;
+       |])
 
 let invoke_args body =
   match Json_util.object_of_json_string body with
@@ -265,13 +350,13 @@ let invoke_args body =
       match
         Option.bind (Js.Dict.get object_ "argsTransit") Js.Json.decodeString
       with
-      | Some args -> Transit.Json.(of_string args |> to_edn)
+      | Some args -> Transit_melange.Transit.Json.(of_string args |> to_edn)
       | None ->
           fail_test ("missing invoke argsTransit: " ^ body);
-          Edn_util.vector [])
+          Edn_util.vector_vec Vec.empty)
   | None ->
       fail_test ("invalid invoke JSON body: " ^ body);
-      Edn_util.vector []
+      Edn_util.vector_vec Vec.empty
 
 let invoke_arg_string body index =
   let args =
@@ -279,7 +364,7 @@ let invoke_arg_string body index =
   in
   expect_some
     ("invoke arg " ^ string_of_int index)
-    (Edn_util.as_string (List.nth args index))
+    (Edn_util.as_string (Vec.nth args index))
 
 let sample_auth ?(id_token = Some "id-token-1")
     ?(access_token = Some "access-token-1")
@@ -297,9 +382,9 @@ let sample_auth ?(id_token = Some "id-token-1")
     updated_at = Time.time_of_epoch_ms updated_at;
   }
 
-let env_from_pairs pairs key = List.assoc_opt key pairs
+let env_from_pairs pairs key = Vec.assoc_opt key (Vec.of_array pairs)
 
-let resolve_config ?(env = []) globals =
+let resolve_config ?(env = [||]) globals =
   let resolved =
     expect_ok "resolve config"
       (effect_result "resolve config"
@@ -311,58 +396,64 @@ let resolve_config ?(env = []) globals =
 let mode_text (Output.Mode.Packed mode) = Output.Mode.to_string mode
 
 let agent_task_entity ?(uuid = Some "11111111-1111-4111-8111-111111111111")
-    ?(tags = [ "logseq.class/Task" ]) ?(status = Some "todo")
-    ?(assignees = [ "build-host" ]) ?session_id () =
+    ?(tags = [| "logseq.class/Task" |]) ?(status = Some "todo")
+    ?(assignees = [| "build-host" |]) ?session_id () =
   let tag_values =
-    tags
-    |> List.map (fun ident ->
-        Edn_util.map
-          [
-            (Edn_util.keyword "db/ident", Edn_util.keyword ident);
-            (Edn_util.keyword "block/title", Edn_util.string "Task");
-          ])
+    tags |> Vec.of_array
+    |> Vec.map (fun ident ->
+        Edn_util.map_vec
+          (Vec.of_array
+             [|
+               (Edn_util.keyword "db/ident", Edn_util.keyword ident);
+               (Edn_util.keyword "block/title", Edn_util.string "Task");
+             |]))
   in
   let assignee_values =
-    assignees
-    |> List.map (fun title ->
-        Edn_util.map [ (Edn_util.keyword "block/title", Edn_util.string title) ])
+    assignees |> Vec.of_array
+    |> Vec.map (fun title ->
+        Edn_util.map_vec
+          (Vec.of_array
+             [| (Edn_util.keyword "block/title", Edn_util.string title) |]))
   in
   let fields =
-    [
-      (Edn_util.keyword "db/id", Edn_util.int64 42L);
-      (Edn_util.keyword "block/title", Edn_util.string "Ship the CLI bridge");
-      (Edn_util.keyword "block/tags", Edn_util.vector tag_values);
-      ( Edn_util.keyword "logseq.property/assignee",
-        Edn_util.vector assignee_values );
-    ]
+    Vec.of_array
+      [|
+        (Edn_util.keyword "db/id", Edn_util.int64 42L);
+        (Edn_util.keyword "block/title", Edn_util.string "Ship the CLI bridge");
+        (Edn_util.keyword "block/tags", Edn_util.vector_vec tag_values);
+        ( Edn_util.keyword "logseq.property/assignee",
+          Edn_util.vector_vec assignee_values );
+      |]
   in
   let fields =
     match uuid with
     | Some uuid ->
-        (Edn_util.keyword "block/uuid", Edn_util.string uuid) :: fields
+        Vec.push_front fields
+          (Edn_util.keyword "block/uuid", Edn_util.string uuid)
     | None -> fields
   in
   let fields =
     match status with
     | Some status ->
-        ( Edn_util.keyword "logseq.property/status",
-          Edn_util.map
-            [
-              ( Edn_util.keyword "db/ident",
-                Edn_util.keyword ("logseq.property/status." ^ status) );
-            ] )
-        :: fields
+        Vec.push_front fields
+          ( Edn_util.keyword "logseq.property/status",
+            Edn_util.map_vec
+              (Vec.of_array
+                 [|
+                   ( Edn_util.keyword "db/ident",
+                     Edn_util.keyword ("logseq.property/status." ^ status) );
+                 |]) )
     | None -> fields
   in
   let fields =
     match session_id with
     | Some session_id ->
-        ( Edn_util.keyword "logseq.property.agent/session-id",
-          Edn_util.string session_id )
-        :: fields
+        Vec.push_front fields
+          ( Edn_util.keyword "logseq.property.agent/session-id",
+            Edn_util.string session_id )
     | None -> fields
   in
-  Entity.of_value (Edn_util.map fields)
+  Entity.of_value (Edn_util.map_vec fields)
 
 let routable_reason_text = function
   | Agent.Missing_stable_uuid -> "missing-stable-uuid"
@@ -407,15 +498,27 @@ let () =
 
   test "CLI parity ustring decodes utf8 byte strings to JS unicode strings"
     (fun () ->
+      let ascii = Ustring.of_string "ABC" |> Ustring.to_string in
+      expect_equal "ascii text" "ABC" ascii;
       let utf8_byte_string =
         Js.String.fromCharCode 0xe4
         ^ Js.String.fromCharCode 0xb8
         ^ Js.String.fromCharCode 0xad
       in
       let decoded = Ustring.of_string utf8_byte_string |> Ustring.to_string in
-      expect_equal "decoded unicode text" (unicode_text [ 0x4e2d ]) decoded;
+      expect_equal "decoded unicode text" (unicode_text [| 0x4e2d |]) decoded;
       expect_int "decoded JS length" 1 (String.length decoded);
-      expect_int "decoded char code" 0x4e2d (string_char_code_at decoded 0));
+      expect_int "decoded char code" 0x4e2d (string_char_code_at decoded 0);
+      let latin1_unicode =
+        "Diese Vorteile " ^ unicode_text [| 0x00f6 |] ^ " und "
+        ^ unicode_text [| 0x00fc |]
+      in
+      let preserved = Ustring.of_string latin1_unicode |> Ustring.to_string in
+      expect_equal "latin1 supplement unicode text" latin1_unicode preserved;
+      expect_int "latin1 supplement char code" 0x00f6
+        (string_char_code_at preserved 15);
+      expect_int "latin1 supplement char code 2" 0x00fc
+        (string_char_code_at preserved 21));
 
   test
     "CLI parity id parser accepts single multi comma whitespace and vector \
@@ -428,32 +531,72 @@ let () =
         expect_ok "multi ids" (Id_parse.parse_id_string "[1, 2  3\t4]")
       in
       expect_bool "multi flag" true multi.multi;
-      expect_int "multi length" 4 (List.length multi.ids);
+      expect_int "multi length" 4 (Vec.length multi.ids);
       expect_none "multi to_single" (Id_parse.to_single multi);
       expect_error_code "zero id" ":invalid-options"
         (Id_parse.parse_id_string "0");
       expect_error_code "non numeric id" ":invalid-options"
         (Id_parse.parse_id_string "abc"));
 
-  test
-    "CLI parity graph directory names preserve canonical and old-format \
-     encoding" (fun () ->
-      expect_equal "space graph dir" "space name"
-        (Graph_dir.encode_graph_dir_name "space name");
-      expect_equal "slash graph dir" "old~2Fname"
-        (Graph_dir.encode_graph_dir_name "old/name");
-      expect_equal "tilde graph dir" "tilde~7Ename"
-        (Graph_dir.encode_graph_dir_name "tilde~name");
-      expect_equal "decode canonical" "old/name"
-        (expect_some "canonical"
-           (Graph_dir.canonical_graph_name_of_dir "old~2Fname"));
-      expect_none "old-format dir is not canonical"
-        (Graph_dir.canonical_graph_name_of_dir "old++name");
-      expect_equal "decode old-format slash" "old/name"
-        (expect_some "old-format"
-           (Graph_dir.decode_legacy_graph_dir_name "old++name")));
+  test "CLI parity graph directory names use only standard encoding" (fun () ->
+      let padded =
+        unicode_text [| 0x00a0 |] ^ "space name" ^ unicode_text [| 0x3000 |]
+      in
+      expect_equal "encoding trims graph names" "space name~2Fchild"
+        (Graph_dir.encode_graph_dir_name " \tspace name/child\n ");
+      expect_equal "encoding trims Unicode whitespace" "space name"
+        (Graph_dir.encode_graph_dir_name padded);
+      expect_equal "graph identity trims Unicode whitespace" "space name"
+        (Cli_primitive.create_graph padded |> Cli_primitive.string_of_graph);
+      expect_equal "repo identity trims prefixed graph name"
+        "logseq_db_space name"
+        (Cli_primitive.create_repo (" logseq_db_ " ^ padded)
+        |> Cli_primitive.string_of_repo);
+      Vec.iter
+        (fun (graph, dir) ->
+          expect_equal "standard encoding" dir
+            (Graph_dir.encode_graph_dir_name graph);
+          expect_equal "standard decoding" graph
+            (expect_some "canonical name"
+               (Graph_dir.canonical_graph_name_of_dir dir)))
+        (Vec.of_array
+           [|
+             ("space name", "space name");
+             ("old/name", "old~2Fname");
+             ("colon:name", "colon~3Aname");
+             ("plus+name", "plus~2Bname");
+             ("percent%name", "percent~25name");
+             ("tilde~name", "tilde~7Ename");
+             (unicode_text [| 0x4e2d; 0x6587 |], "~E4~B8~AD~E6~96~87");
+           |]);
+      Vec.iter
+        (fun dir ->
+          expect_none
+            ("nonstandard directory " ^ dir)
+            (Graph_dir.canonical_graph_name_of_dir dir))
+        (Vec.of_array
+           [|
+             "";
+             "old++name";
+             "c+3A+name";
+             "yy%20y";
+             "yy~20y";
+             "old~2fname";
+             "mix%20~2Fname";
+             "bad%ZZname";
+             "foo~2G";
+             "trailing~";
+             " alpha ";
+             "   ";
+             "~20alpha";
+             "alpha~20";
+             "~C2~A0alpha";
+             "alpha~E3~80~80";
+             "invalid~FF";
+           |]));
 
-  test "CLI parity unlink graph moves canonical encoded dir to unlinked dir"
+  test_promise
+    "CLI parity unlink graph moves canonical encoded dir to unlinked dir"
     (fun () ->
       let root = temp_dir "logseq-cli-parity-unlink-graph-" in
       let graphs_dir = Node.Path.join [| root; "graphs" |] in
@@ -467,8 +610,8 @@ let () =
       try
         mkdir_p graph_path;
         write_file (Node.Path.join [| graph_path; "db.sqlite" |]) "test-data";
-        let result =
-          effect_result "graph remove slash"
+        let* result =
+          effect_to_promise
             (execute_with_output Graph.execute
                (Graph.Graph_remove { graph; repo })
                (config ~root_dir:root ()) Output.Mode.Human)
@@ -480,12 +623,13 @@ let () =
           (Cli_unix.file_exists unlinked_path);
         expect_equal "contents preserved" "test-data"
           (read_file (Node.Path.join [| unlinked_path; "db.sqlite" |]));
-        remove_tree root
+        remove_tree root;
+        Js.Promise.resolve pass
       with exn ->
         remove_tree root;
-        fail_test (Printexc.to_string exn));
+        fail_promise (Printexc.to_string exn));
 
-  test
+  test_promise
     "CLI parity unlink graph moves space-preserving canonical dir to unlinked \
      dir" (fun () ->
       let root = temp_dir "logseq-cli-parity-unlink-space-" in
@@ -499,8 +643,8 @@ let () =
       try
         mkdir_p graph_path;
         write_file (Node.Path.join [| graph_path; "db.sqlite" |]) "test-data";
-        let result =
-          effect_result "graph remove space"
+        let* result =
+          effect_to_promise
             (execute_with_output Graph.execute
                (Graph.Graph_remove { graph; repo })
                (config ~root_dir:root ()) Output.Mode.Human)
@@ -513,10 +657,11 @@ let () =
           (Cli_unix.file_exists unlinked_path);
         expect_equal "space contents preserved" "test-data"
           (read_file (Node.Path.join [| unlinked_path; "db.sqlite" |]));
-        remove_tree root
+        remove_tree root;
+        Js.Promise.resolve pass
       with exn ->
         remove_tree root;
-        fail_test (Printexc.to_string exn));
+        fail_promise (Printexc.to_string exn));
 
   test "CLI parity root-dir helpers create directories and reject files"
     (fun () ->
@@ -693,14 +838,14 @@ let () =
   test_promise
     "CLI parity auth refresh uses token endpoint and validates id token"
     (fun () ->
-      let request_bodies = ref [] in
+      let request_bodies = ref Vec.empty in
       let token_server response_body =
         create_server (fun[@u] req res ->
             let body = ref "" in
             req_set_encoding req "utf8";
             req_on_data req "data" (fun[@u] chunk -> body := !body ^ chunk);
             req_on_end req "end" (fun[@u] () ->
-                request_bodies := !request_bodies @ [ !body ];
+                request_bodies := Vec.push_back !request_bodies !body;
                 if req_method req <> "POST" || req_url req <> "/oauth2/token"
                 then write_json res 404 (error_response "not found")
                 else write_json res 200 response_body))
@@ -740,7 +885,7 @@ let () =
               (expect_some "fresh access token" refreshed.access_token);
             expect_equal "refresh token preserved" "refresh-token-1"
               (expect_some "fresh refresh token" refreshed.refresh_token);
-            let body = String.concat "\n" !request_bodies in
+            let body = Vec.string_concat "\n" !request_bodies in
             expect_named_contains "refresh grant type" body
               "grant_type=refresh_token";
             expect_named_contains "refresh token body" body
@@ -822,7 +967,7 @@ let () =
           Js.Promise.resolve pass
       | Error err ->
           expect_equal "missing id token code" "missing-id-token"
-            (Edn_util.keyword_to_string err.Error.code);
+            (Error.code_to_string err.Error.code);
           Js.Promise.resolve pass);
 
   test_promise
@@ -891,19 +1036,21 @@ let () =
 
   test "CLI parity auth commands parse and build login logout actions"
     (fun () ->
-      let login_request = expect_parse_ok "login parse" [ "login" ] in
+      let login_request = expect_parse_ok "login parse" [| "login" |] in
       (match login_request.command with
-      | Cli_request.Auth Auth_command.Parsed_login -> pass
+      | Cli_request.Auth
+          (Auth_command.Parsed_login { username = None; password = None }) ->
+          pass
       | _ -> fail_test "login parse: expected auth login");
-      let logout_request = expect_parse_ok "logout parse" [ "logout" ] in
+      let logout_request = expect_parse_ok "logout parse" [| "logout" |] in
       (match logout_request.command with
       | Cli_request.Auth Auth_command.Parsed_logout -> pass
       | _ -> fail_test "logout parse: expected auth logout");
       (match
          Auth_command.build (config ()) (Global_opts.create ())
-           Auth_command.Parsed_login
+           (Auth_command.Parsed_login { username = None; password = None })
        with
-      | Ok Auth_command.Login -> pass
+      | Ok (Auth_command.Login Auth_state.Browser_login) -> pass
       | Ok _ -> fail_test "login build: expected Login"
       | Error err -> fail_test ("login build: " ^ err.Error.message));
       match
@@ -995,14 +1142,14 @@ let () =
         let config =
           resolve_config
             ~env:
-              [
+              [|
                 ("LOGSEQ_CLI_GRAPH", "env-graph");
                 ("LOGSEQ_CLI_ROOT_DIR", "env-root");
                 ("LOGSEQ_CLI_TIMEOUT_MS", "222");
                 ("LOGSEQ_CLI_LOGIN_TIMEOUT_MS", "666");
                 ("LOGSEQ_CLI_LOGOUT_TIMEOUT_MS", "777");
                 ("LOGSEQ_CLI_OUTPUT", "json");
-              ]
+              |]
             (Global_opts.create
                ~graph:(Cli_primitive.create_graph "argv-graph")
                ~root_dir:"argv-root" ~config_path:cfg_path
@@ -1039,7 +1186,7 @@ let () =
         write_file cfg_path "{:output-format :edn}\n";
         let config =
           resolve_config
-            ~env:[ ("LOGSEQ_CLI_OUTPUT", "json") ]
+            ~env:[| ("LOGSEQ_CLI_OUTPUT", "json") |]
             (Global_opts.create ~config_path:cfg_path ())
         in
         expect_equal "env output" "json"
@@ -1196,14 +1343,14 @@ let () =
         let result =
           effect_result "resolve invalid title width fallback"
             (Cli_config.resolve ~defaults:(Cli_config.defaults ())
-               ~env:(env_from_pairs [])
+               ~env:(env_from_pairs [||])
                (Global_opts.create ~config_path:cfg_path ()))
         in
         (match result with
         | Ok _ -> fail_test "invalid width: expected Error"
         | Error err ->
             expect_equal "invalid width code" "invalid-config"
-              (Edn_util.keyword_to_string err.Error.code);
+              (Error.code_to_string err.Error.code);
             expect_named_contains "invalid width message" err.Error.message
               "Expected integer");
         remove_tree root
@@ -1219,14 +1366,14 @@ let () =
         let result =
           effect_result "resolve invalid output fallback"
             (Cli_config.resolve ~defaults:(Cli_config.defaults ())
-               ~env:(env_from_pairs [ ("LOGSEQ_CLI_OUTPUT", "yaml") ])
+               ~env:(env_from_pairs [| ("LOGSEQ_CLI_OUTPUT", "yaml") |])
                (Global_opts.create ~config_path:cfg_path ()))
         in
         (match result with
         | Ok _ -> fail_test "invalid output: expected Error"
         | Error err ->
             expect_equal "invalid output code" "invalid-config"
-              (Edn_util.keyword_to_string err.Error.code);
+              (Error.code_to_string err.Error.code);
             expect_named_contains "invalid output message" err.Error.message
               "Expected one of human, json, edn");
         remove_tree root
@@ -1245,12 +1392,12 @@ let () =
         ^ "]] A [[" ^ first ^ "]]"
       in
       let refs = Uuid_refs_types.extract_uuid_refs text in
-      expect_int "uuid ref count" 2 (List.length refs);
-      expect_equal "first uuid" first (List.nth refs 0);
-      expect_equal "second uuid" upper (List.nth refs 1);
+      expect_int "uuid ref count" 2 (Vec.length refs);
+      expect_equal "first uuid" first (Vec.nth refs 0);
+      expect_equal "second uuid" upper (Vec.nth refs 1);
       let replaced =
         Uuid_refs_types.replace_uuid_refs text
-          [ (first, "First"); (upper, "Second") ]
+          (Vec.of_array [| (first, "First"); (upper, "Second") |])
       in
       expect_named_contains "replace first" replaced "[[First]]";
       expect_named_contains "replace second" replaced "[[Second]]";
@@ -1259,17 +1406,21 @@ let () =
   test "CLI parity uuid refs are collected from entity string fields" (fun () ->
       let uuid = "33333333-3333-4333-8333-333333333333" in
       let items =
-        [
-          entity ~title:("Title [[" ^ uuid ^ "]]") ();
-          entity ~name:("Name [[" ^ uuid ^ "]]") ();
-        ]
+        Vec.of_array
+          [|
+            entity ~title:("Title [[" ^ uuid ^ "]]") ();
+            entity ~name:("Name [[" ^ uuid ^ "]]") ();
+          |]
       in
       let refs =
         Uuid_refs_types.collect_uuid_refs_from_items items
-          [ Edn_util.keyword_t "block/title"; Edn_util.keyword_t "block/name" ]
+          (Vec.of_array
+             [|
+               Edn_util.keyword_t "block/title"; Edn_util.keyword_t "block/name";
+             |])
       in
-      expect_int "collected uuid refs" 1 (List.length refs);
-      expect_equal "collected uuid" uuid (List.hd refs));
+      expect_int "collected uuid refs" 1 (Vec.length refs);
+      expect_equal "collected uuid" uuid (Vec.peek_front refs));
 
   test "CLI parity human count helpers use grouped counts and pluralization"
     (fun () ->
@@ -1283,13 +1434,23 @@ let () =
     (fun () ->
       let cjk = decode_uri_component "%E7%95%8C" in
       let combining_acute = decode_uri_component "%CC%81" in
+      let o_umlaut = decode_uri_component "%C3%B6" in
+      let accented_title =
+        decode_uri_component
+          "Diese%20Vorteile%20k%C3%B6nnten%20besonders%20f%C3%BCr%20eine"
+      in
       let repeat count value =
-        String.concat "" (List.init count (fun _ -> value))
+        Vec.string_concat "" (Vec.init count (fun _ -> value))
       in
       expect_int "ascii width" 5 (Display_width.width "Hello");
       expect_int "cjk width" 2 (Display_width.width cjk);
       expect_int "combining width" 1
         (Display_width.width ("e" ^ combining_acute));
+      expect_int "latin-1 code point width" 1 (Display_width.width o_umlaut);
+      expect_int "latin-1 followed by ascii width" 4
+        (Display_width.width (o_umlaut ^ "abc"));
+      expect_int "accented latin title width" 41
+        (Display_width.width accented_title);
       expect_equal "short segment" "Project Alpha"
         (Display_width.truncate "Project Alpha" 24);
       expect_equal "exact ascii segment" "123456789012345678901234"
@@ -1301,7 +1462,12 @@ let () =
         (Display_width.truncate (repeat 12 cjk) 24);
       expect_equal "one over cjk segment"
         (repeat 11 cjk ^ Cli_platform.Symbols.ellipsis)
-        (Display_width.truncate (repeat 13 cjk) 24));
+        (Display_width.truncate (repeat 13 cjk) 24);
+      expect_equal "accented latin title truncation"
+        (decode_uri_component
+           "Diese%20Vorteile%20k%C3%B6nnten%20besonders%20f%C3%BCr%20ei"
+        ^ Cli_platform.Symbols.ellipsis)
+        (Display_width.truncate accented_title 40));
 
   test "CLI parity profile sessions aggregate repeated stages" (fun () ->
       expect_none "disabled profile" (Profile_types.create_session false);
@@ -1331,32 +1497,33 @@ let () =
           command = "graph-list";
           status = Edn_util.keyword_t "ok";
           total_span = Time.span_of_ms 42L;
-          stages = [];
+          stages = Vec.empty;
           spans =
-            [
-              span "cli.total" 0 0 42;
-              span "cli.parse-argv" 1 1 3;
-              span "cli.execute-action" 2 5 35;
-              span "transport.invoke:thread-api/q" 3 12 20;
-            ];
+            Vec.of_array
+              [|
+                span "cli.total" 0 0 42;
+                span "cli.parse-argv" 1 1 3;
+                span "cli.execute-action" 2 5 35;
+                span "transport.invoke:thread-api/q" 3 12 20;
+              |];
         }
       in
       let lines = Profile_types.render_lines report in
       expect_equal "profile headline" "42ms command=graph-list status=ok"
-        (List.hd lines);
+        (Vec.peek_front lines);
       expect_bool "profile stages heading" true
-        (List.exists (fun line -> String.trim line = "stages") lines);
+        (Vec.exists (fun line -> String.trim line = "stages") lines);
       expect_bool "profile total line" true
-        (List.exists
+        (Vec.exists
            (fun line -> Js.String.includes ~search:"cli.total" line)
            lines);
       expect_bool "profile nested transport" true
-        (List.exists
+        (Vec.exists
            (fun line ->
              Js.String.includes ~search:"transport.invoke:thread-api/q" line)
            lines);
       expect_bool "profile no aggregate count labels" false
-        (List.exists
+        (Vec.exists
            (fun line -> Js.String.includes ~search:"count=" line)
            lines));
 
@@ -1367,34 +1534,66 @@ let () =
           command = "query";
           status = Edn_util.keyword_t "ok";
           total_span = Time.span_of_ms 30L;
-          stages = [];
+          stages = Vec.empty;
           spans =
-            [
-              span "outer" 0 0 30;
-              span "transport.invoke:thread-api/q" 1 5 10;
-              span "transport.invoke:thread-api/q" 2 15 20;
-            ];
+            Vec.of_array
+              [|
+                span "outer" 0 0 30;
+                span "transport.invoke:thread-api/q" 1 5 10;
+                span "transport.invoke:thread-api/q" 2 15 20;
+              |];
         }
       in
       let lines = Profile_types.render_lines report in
       let q_lines =
-        List.filter
+        Vec.filter
           (fun line ->
             Js.String.includes ~search:"transport.invoke:thread-api/q" line)
           lines
       in
-      expect_int "repeated stage lines" 2 (List.length q_lines));
+      expect_int "repeated stage lines" 2 (Vec.length q_lines));
 
   test "CLI parity human table formats blanks and appends footer" (fun () ->
       let output =
-        Output.Human_output.create ~headers:[ "ID"; "TITLE" ]
-          ~rows:[ [ "1"; "Alpha" ]; [ "2"; "" ] ]
+        Output.Human_output.create
+          ~headers:(Vec.of_array [| "ID"; "TITLE" |])
+          ~rows:
+            (Vec.of_array
+               [| Vec.of_array [| "1"; "Alpha" |]; Vec.of_array [| "2"; "" |] |])
           ~footer:"Count: 2" ()
         |> Output.Human_output.to_string
       in
       expect_named_contains "header" output "ID  TITLE";
       expect_named_contains "blank value" output "2   -";
       expect_named_contains "footer" output "Count: 2");
+
+  test "CLI parity human table renders keyword headers without namespaces"
+    (fun () ->
+      let output =
+        Output.Human_output.create
+          ~headers:
+            (Vec.of_array
+               [|
+                 "db/id";
+                 "block/title";
+                 ":logseq.property/status";
+                 "Input/Output";
+               |])
+          ~rows:
+            (Vec.of_array
+               [|
+                 Vec.of_array
+                   [| "1"; "Ship"; "logseq.property/status.todo"; "Ready" |];
+               |])
+          ()
+        |> Output.Human_output.to_string
+      in
+      expect_named_contains "keyword headers" output "id  title  status";
+      expect_named_contains "plain slash header" output "Input/Output";
+      expect_named_not_contains "db namespace" output "db/id";
+      expect_named_not_contains "block namespace" output "block/title";
+      expect_named_not_contains "property namespace" output
+        ":logseq.property/status");
 
   test "CLI parity output mode parser accepts exact lowercase values only"
     (fun () ->
@@ -1426,7 +1625,8 @@ let () =
       expect_bool "nil not truncated" false nil_preview.truncated;
       let vector_preview =
         Log_types.truncate_preview ~max_len:100
-          (Edn_util.vector [ Edn_util.int 1; Edn_util.int 2; Edn_util.int 3 ])
+          (Edn_util.vector_vec
+             (Vec.of_array [| Edn_util.int 1; Edn_util.int 2; Edn_util.int 3 |]))
       in
       expect_equal "vector preview" "[1 2 3]" vector_preview.preview;
       expect_bool "vector not truncated" false vector_preview.truncated);
@@ -1481,15 +1681,14 @@ let () =
       let ok = Cli_result.ok Output.Mode.Human (Cli_result.Message "ok") in
       expect_bool "ok is not error" false (Cli_result.is_error ok);
       expect_int "ok exit" 0 (Cli_result.exit_code ok);
-      let err = Error.make (Edn_util.keyword_t "missing-auth") "missing auth" in
+      let err = Error.make Error.Missing_auth "missing auth" in
       let error = Cli_result.error Output.Mode.Human err in
       expect_bool "error is error" true (Cli_result.is_error error);
       expect_int "error exit" 1 (Cli_result.exit_code error));
 
   test "CLI parity edn includes hint and human error stays concise" (fun () ->
       let err =
-        Error.make ~hint:"Run `logseq login` first."
-          (Edn_util.keyword_t "missing-auth")
+        Error.make ~hint:"Run `logseq login` first." Error.Missing_auth
           "missing auth"
       in
       let edn = Format_types.to_edn (Cli_result.error Output.Mode.Edn err) in
@@ -1505,16 +1704,17 @@ let () =
   test
     "CLI parity parse rejects unknown command and retired qmd qsearch commands"
     (fun () ->
-      expect_parse_error_code "unknown command" ":unknown-command" [ "bogus" ];
-      expect_parse_error_code "qmd retired" ":unknown-command" [ "qmd" ];
-      expect_parse_error_code "qsearch retired" ":unknown-command" [ "qsearch" ]);
+      expect_parse_error_code "unknown command" ":unknown-command" [| "bogus" |];
+      expect_parse_error_code "qmd retired" ":unknown-command" [| "qmd" |];
+      expect_parse_error_code "qsearch retired" ":unknown-command"
+        [| "qsearch" |]);
 
   test
     "CLI parity parse reads global graph output timeout verbose and profile \
      flags" (fun () ->
       let request =
         expect_parse_ok "global parse"
-          [
+          [|
             "--graph";
             "demo";
             "--output";
@@ -1525,9 +1725,9 @@ let () =
             "--profile";
             "graph";
             "list";
-          ]
+          |]
       in
-      expect_equal "path" "graph/list" (String.concat "/" request.path);
+      expect_equal "path" "graph/list" (Vec.string_concat "/" request.path);
       expect_equal "graph" "demo"
         (Cli_primitive.string_of_graph
            (expect_some "graph" request.globals.Global_opts.graph));
@@ -1537,10 +1737,20 @@ let () =
       | Some (Output.Mode.Packed Output.Mode.Json) -> pass
       | _ -> fail_test "expected json output mode");
 
+  test "CLI parity parse skips an earlier duplicate option without a value"
+    (fun () ->
+      let request =
+        expect_parse_ok "duplicate output parse"
+          [| "--output"; "--output"; "json"; "graph"; "list" |]
+      in
+      match request.globals.output_format with
+      | Some (Output.Mode.Packed Output.Mode.Json) -> pass
+      | _ -> fail_test "expected later json output mode");
+
   test "CLI parity parse supports list page filters and validation" (fun () ->
       let request =
         expect_parse_ok "list page parse"
-          [
+          [|
             "list";
             "page";
             "--fields";
@@ -1554,7 +1764,7 @@ let () =
             "--order";
             "asc";
             "--include-hidden";
-          ]
+          |]
       in
       match request.command with
       | Cli_request.List (List_command.Parsed_page opts) ->
@@ -1568,28 +1778,28 @@ let () =
       | _ ->
           fail_test "expected list page request";
           expect_parse_error_code "bad order" ":invalid-options"
-            [ "list"; "page"; "--order"; "sideways" ];
+            [| "list"; "page"; "--order"; "sideways" |];
           expect_parse_error_code "bad limit" ":invalid-options"
-            [ "list"; "page"; "--limit"; "nope" ]);
+            [| "list"; "page"; "--limit"; "nope" |]);
 
   test "CLI parity parse rejects malformed boolean and selector values"
     (fun () ->
       expect_parse_error_code "bad boolean equals" ":invalid-options"
-        [ "list"; "page"; "--include-built-in=maybe" ];
+        [| "list"; "page"; "--include-built-in=maybe" |];
       expect_parse_error_code "bad boolean value" ":invalid-options"
-        [ "show"; "--id"; "1"; "--linked-references=maybe" ];
+        [| "show"; "--id"; "1"; "--linked-references=maybe" |];
       expect_parse_error_code "bad remove page id" ":invalid-options"
-        [ "remove"; "page"; "--id"; "abc"; "--page"; "Home" ];
+        [| "remove"; "page"; "--id"; "abc"; "--page"; "Home" |];
       expect_parse_error_code "bad sync asset id" ":invalid-options"
-        [ "sync"; "asset"; "download"; "--id"; "abc"; "--uuid"; "id" ];
+        [| "sync"; "asset"; "download"; "--id"; "abc"; "--uuid"; "id" |];
       expect_parse_error_code "bad debug id" ":invalid-options"
-        [ "debug"; "pull"; "--id"; "abc"; "--uuid"; "id" ]);
+        [| "debug"; "pull"; "--id"; "abc"; "--uuid"; "id" |]);
 
   test "CLI parity parse supports list tag property task node and asset options"
     (fun () ->
       let tag =
         expect_parse_ok "list tag parse"
-          [
+          [|
             "list";
             "tag";
             "--expand";
@@ -1598,7 +1808,7 @@ let () =
             "--with-extends";
             "--fields";
             "title,properties";
-          ]
+          |]
       in
       (match tag.command with
       | Cli_request.List (List_command.Parsed_tag opts) ->
@@ -1608,11 +1818,11 @@ let () =
           expect_bool "tag with properties" true opts.with_properties;
           expect_bool "tag with extends" true opts.with_extends;
           expect_int "tag fields" 2
-            (List.length (expect_some "tag fields" opts.common.fields))
+            (Vec.length (expect_some "tag fields" opts.common.fields))
       | _ -> fail_test "expected list tag");
       let property =
         expect_parse_ok "list property parse"
-          [
+          [|
             "list";
             "property";
             "--expand";
@@ -1623,7 +1833,7 @@ let () =
             "cardinality";
             "--fields";
             "title,type,cardinality";
-          ]
+          |]
       in
       (match property.command with
       | Cli_request.List (List_command.Parsed_property opts) ->
@@ -1637,7 +1847,7 @@ let () =
       | _ -> fail_test "expected list property");
       let task =
         expect_parse_ok "list task parse"
-          [
+          [|
             "list";
             "task";
             "--status";
@@ -1656,7 +1866,7 @@ let () =
             "priority";
             "--order";
             "desc";
-          ]
+          |]
       in
       (match task.command with
       | Cli_request.List (List_command.Parsed_task opts) ->
@@ -1674,7 +1884,7 @@ let () =
       | _ -> fail_test "expected list task");
       let node =
         expect_parse_ok "list node parse"
-          [
+          [|
             "list";
             "node";
             "--tags";
@@ -1691,18 +1901,18 @@ let () =
             "updated-at";
             "--order";
             "desc";
-          ]
+          |]
       in
       (match node.command with
       | Cli_request.List (List_command.Parsed_node opts) ->
-          expect_int "node tags" 2 (List.length opts.tags);
-          expect_int "node properties" 2 (List.length opts.properties);
+          expect_int "node tags" 2 (Vec.length opts.tags);
+          expect_int "node properties" 2 (Vec.length opts.properties);
           expect_equal "node sort" "updated-at"
             (expect_some "node sort" opts.common.sort)
       | _ -> fail_test "expected list node");
       let asset =
         expect_parse_ok "list asset parse"
-          [
+          [|
             "list";
             "asset";
             "--fields";
@@ -1715,7 +1925,7 @@ let () =
             "updated-at";
             "--order";
             "desc";
-          ]
+          |]
       in
       match asset.command with
       | Cli_request.List (List_command.Parsed_asset opts) ->
@@ -1730,21 +1940,25 @@ let () =
 
   test "CLI parity list rejects old name fields for tag and property" (fun () ->
       expect_parse_error_code "list tag old name field" ":invalid-options"
-        [ "list"; "tag"; "--fields"; "name,properties" ];
+        [| "list"; "tag"; "--fields"; "name,properties" |];
       expect_parse_error_code "list property old name field" ":invalid-options"
-        [ "list"; "property"; "--fields"; "name,type,cardinality" ]);
+        [| "list"; "property"; "--fields"; "name,type,cardinality" |]);
 
   test "CLI parity list apply offset limit returns requested window" (fun () ->
       let opts = { empty_common_opts with offset = Some 1; limit = Some 2 } in
       let items =
-        [
-          entity ~id:1L (); entity ~id:2L (); entity ~id:3L (); entity ~id:4L ();
-        ]
+        Vec.of_array
+          [|
+            entity ~id:1L ();
+            entity ~id:2L ();
+            entity ~id:3L ();
+            entity ~id:4L ();
+          |]
       in
       let result = List_command.apply_offset_limit opts items in
-      expect_int "window size" 2 (List.length result);
+      expect_int "window size" 2 (Vec.length result);
       expect_int64 "first window id" 2L
-        (expect_some "id" (List.hd result).Entity.id));
+        (expect_some "id" (Vec.peek_front result).Entity.id));
 
   test "CLI parity list build action validates repo and option contracts"
     (fun () ->
@@ -1754,7 +1968,7 @@ let () =
             common =
               {
                 empty_common_opts with
-                fields = Some [ "id"; "title" ];
+                fields = Some (Vec.of_array [| "id"; "title" |]);
                 limit = Some 20;
                 sort = Some "updated-at";
                 order = Some List_command.Desc;
@@ -1817,7 +2031,11 @@ let () =
            task);
       let node =
         List_command.Parsed_node
-          { common = empty_common_opts; tags = []; properties = [] }
+          {
+            common = empty_common_opts;
+            tags = Vec.empty;
+            properties = Vec.empty;
+          }
       in
       expect_error_code "node requires filters" "invalid-options"
         (List_command.build (config ~repo:"demo" ()) (Global_opts.create ())
@@ -1891,10 +2109,10 @@ let () =
                 (Option.bind (Edn_util.get data "items") Edn_util.as_seq)
             in
             items
-            |> List.map (fun item ->
+            |> Vec.map (fun item ->
                 Int64.to_string
                   (expect_some "item id" (Edn_util.get_int64 item "db/id")))
-            |> String.concat ","
+            |> Vec.string_concat ","
           in
           let* default_result = effect_to_promise (run ()) in
           expect_equal "default updated-at desc with id tie" "11,7,5"
@@ -1949,7 +2167,9 @@ let () =
                         {
                           empty_common_opts with
                           sort = Some "cardinality";
-                          fields = Some [ "id"; "title"; "cardinality" ];
+                          fields =
+                            Some
+                              (Vec.of_array [| "id"; "title"; "cardinality" |]);
                         };
                       expand = false;
                       include_built_in = None;
@@ -1971,13 +2191,13 @@ let () =
           in
           let ids =
             items
-            |> List.map (fun item ->
+            |> Vec.map (fun item ->
                 Int64.to_string
                   (expect_some "item id" (Edn_util.get_int64 item "db/id")))
-            |> String.concat ","
+            |> Vec.string_concat ","
           in
           expect_equal "cardinality sort ids" "30,20,10" ids;
-          List.iter
+          Vec.iter
             (fun item ->
               expect_bool "has id" true
                 (Option.is_some (Edn_util.get item "db/id"));
@@ -1987,17 +2207,17 @@ let () =
                 (Option.is_some (Edn_util.get item "db/cardinality"));
               expect_bool "only selected fields" true
                 (match Edn_util.as_map item with
-                | Some fields -> List.length fields = 3
+                | Some fields -> Vec.length fields = 3
                 | None -> false))
             items;
           Js.Promise.resolve pass));
 
   test_promise "CLI parity list asset execute filters by asset tag id"
     (fun () ->
-      let calls = ref [] in
+      let calls = ref Vec.empty in
       let server =
         invoke_server (fun body ->
-            calls := body :: !calls;
+            calls := Vec.push_front !calls body;
             if Js.String.includes ~search:"thread-api/pull" body then
               "[\"^ \",\"~:db/id\",900]"
             else if Js.String.includes ~search:"thread-api/cli-list-nodes" body
@@ -2033,17 +2253,17 @@ let () =
             expect_some "asset items"
               (Option.bind (Edn_util.get data "items") Edn_util.as_seq)
           in
-          expect_int "asset limit" 1 (List.length items);
+          expect_int "asset limit" 1 (Vec.length items);
           expect_int64 "newest asset first" 2L
             (expect_some "asset id"
-               (Edn_util.get_int64 (List.hd items) "db/id"));
-          expect_int "pull plus list calls" 2 (List.length !calls);
+               (Edn_util.get_int64 (Vec.peek_front items) "db/id"));
+          expect_int "pull plus list calls" 2 (Vec.length !calls);
           Js.Promise.resolve pass));
 
   test "CLI parity parse supports search scopes and rejects unknown option"
     (fun () ->
       let request =
-        expect_parse_ok "search tag" [ "search"; "tag"; "--content"; "quote" ]
+        expect_parse_ok "search tag" [| "search"; "tag"; "--content"; "quote" |]
       in
       match request.command with
       | Cli_request.Search (Search.Parsed_tag opts) ->
@@ -2051,14 +2271,14 @@ let () =
       | _ ->
           fail_test "expected search tag";
           expect_parse_error_code "unknown search option" ":invalid-options"
-            [ "search"; "tag"; "--unknown"; "x"; "quote" ]);
+            [| "search"; "tag"; "--unknown"; "x"; "quote" |]);
 
   test
     "CLI parity search parser keeps content alias globals and strict \
      positionals" (fun () ->
       let alias =
         expect_parse_ok "search block alias"
-          [ "search"; "block"; "-c"; "1111"; "--output"; "json" ]
+          [| "search"; "block"; "-c"; "1111"; "--output"; "json" |]
       in
       (match alias.command with
       | Cli_request.Search (Search.Parsed_block opts) ->
@@ -2069,20 +2289,20 @@ let () =
       | _ -> fail_test "expected search json output");
       let page =
         expect_parse_ok "search page multi-word"
-          [ "search"; "page"; "--content"; "project notes" ]
+          [| "search"; "page"; "--content"; "project notes" |]
       in
       (match page.command with
       | Cli_request.Search (Search.Parsed_page opts) ->
           expect_equal "page query" "project notes" opts.content
       | _ -> fail_test "expected search page");
       expect_parse_error_code "search positional command" ":unknown-command"
-        [ "search"; "block"; "alpha" ]);
+        [| "search"; "block"; "alpha" |]);
 
   test "CLI parity search build action validates repo and query text" (fun () ->
       let action =
         expect_ok "search block action"
           (Search.build (config ~repo:"demo" ()) (Global_opts.create ())
-             (Search.Parsed_block { content = "  Alpha Beta  " }))
+             (Search.Parsed_block { content = "  Alpha Beta  "; include_hidden = false }))
       in
       expect_bool "search block scope" true (action.Search.scope = Search.Block);
       expect_equal "search block command" "search-block"
@@ -2094,18 +2314,18 @@ let () =
       expect_equal "search query trim" "Alpha Beta" action.query;
       expect_error_code "search requires repo" "missing-repo"
         (Search.build (config ()) (Global_opts.create ())
-           (Search.Parsed_page { content = "Home" }));
+           (Search.Parsed_page { content = "Home"; include_hidden = false }));
       expect_error_code "search rejects blank content" "missing-query-text"
         (Search.build (config ~repo:"demo" ()) (Global_opts.create ())
-           (Search.Parsed_tag { content = "   " })));
+           (Search.Parsed_tag { content = "   "; include_hidden = false })));
 
   test_promise "CLI parity search execute sorts scopes and strips raw fields"
     (fun () ->
-      let calls = ref [] in
+      let calls = ref Vec.empty in
       let server =
         invoke_server (fun body ->
             if Js.String.includes ~search:"thread-api/q" body then (
-              calls := body :: !calls;
+              calls := Vec.push_front !calls body;
               "[[\"^ \
                \",\"~:db/id\",9,\"~:block/title\",\"beta\",\"~:unused\",true],[\"^ \
                \",\"^0\",7,\"^1\",\"Alpha\"]]")
@@ -2127,6 +2347,7 @@ let () =
                 repo;
                 graph = Cli_config.repo_to_graph repo;
                 query;
+                include_hidden = false;
               }
               cfg Output.Mode.Human
           in
@@ -2138,7 +2359,7 @@ let () =
               expect_some "search items"
                 (Option.bind (Edn_util.get data "items") Edn_util.as_seq)
             in
-            List.map
+            Vec.map
               (fun item ->
                 expect_some "item title"
                   (Edn_util.get_string item "block/title"))
@@ -2157,20 +2378,20 @@ let () =
           let* tag =
             effect_to_promise (run Search.Tag Command_id.Search_tag "quote")
           in
-          List.iter
+          Vec.iter
             (fun result ->
               expect_bool "search ok" false (Cli_result.is_error result);
               expect_equal "sorted titles" "Alpha,beta"
-                (String.concat "," (item_titles result)))
-            [ block; page; property; tag ];
-          expect_int "q calls" 4 (List.length !calls);
+                (Vec.string_concat "," (item_titles result)))
+            (Vec.of_array [| block; page; property; tag |]);
+          expect_int "q calls" 4 (Vec.length !calls);
           expect_named_contains "block query pulls deleted-at"
-            (List.nth !calls 3) "logseq.property/deleted-at";
-          expect_named_contains "page query uses block name" (List.nth !calls 2)
+            (Vec.nth !calls 3) "logseq.property/deleted-at";
+          expect_named_contains "page query uses block name" (Vec.nth !calls 2)
             "block/name";
-          expect_named_contains "property query class" (List.nth !calls 1)
+          expect_named_contains "property query class" (Vec.nth !calls 1)
             "logseq.class/Property";
-          expect_named_contains "tag query class" (List.nth !calls 0)
+          expect_named_contains "tag query class" (Vec.nth !calls 0)
             "logseq.class/Tag";
           Js.Promise.resolve pass));
 
@@ -2217,6 +2438,7 @@ let () =
                 repo;
                 graph = Cli_config.repo_to_graph repo;
                 query;
+                include_hidden = false;
               }
               cfg Output.Mode.Human
           in
@@ -2228,7 +2450,7 @@ let () =
               expect_some "items"
                 (Option.bind (Edn_util.get data "items") Edn_util.as_seq)
             in
-            List.map
+            Vec.map
               (fun item ->
                 expect_some "title" (Edn_util.get_string item "block/title"))
               items
@@ -2237,21 +2459,21 @@ let () =
             effect_to_promise (run Search.Block Command_id.Search_block "alpha")
           in
           expect_equal "live block only" "alpha live"
-            (String.concat "," (titles block));
+            (Vec.string_concat "," (titles block));
           let* page =
             effect_to_promise (run Search.Page Command_id.Search_page "home")
           in
           expect_equal "live pages only" "Home,Homework"
-            (String.concat "," (titles page));
+            (Vec.string_concat "," (titles page));
           Js.Promise.resolve pass));
 
   test_promise "CLI parity search execute replaces uuid refs in block titles"
     (fun () ->
       let ref_uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" in
-      let calls = ref [] in
+      let calls = ref Vec.empty in
       let server =
         invoke_server (fun body ->
-            calls := body :: !calls;
+            calls := Vec.push_front !calls body;
             if Js.String.includes ~search:"thread-api/q" body then
               "[[\"^ \",\"~:db/id\",7,\"~:block/title\",\"foo \
                [[aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa]]\"]]"
@@ -2277,6 +2499,7 @@ let () =
                    repo;
                    graph = Cli_config.repo_to_graph repo;
                    query = "foo";
+                   include_hidden = false;
                  }
                  cfg Output.Mode.Human)
           in
@@ -2287,11 +2510,12 @@ let () =
           in
           let title =
             expect_some "title"
-              (Edn_util.get_string (List.hd items) "block/title")
+              (Edn_util.get_string (Vec.peek_front items) "block/title")
           in
           expect_equal "replaced uuid ref" "foo [[bar]]" title;
-          expect_int "q and pull calls" 2 (List.length !calls);
-          expect_named_contains "pull lookup uuid" (List.hd !calls) ref_uuid;
+          expect_int "q and pull calls" 2 (Vec.length !calls);
+          expect_named_contains "pull lookup uuid" (Vec.peek_front !calls)
+            ref_uuid;
           Js.Promise.resolve pass));
 
   test "CLI parity remove validation rejects ambiguous and blank targets"
@@ -2300,7 +2524,8 @@ let () =
         "only one of --id or --page is allowed"
         (expect_some "invalid"
            (Remove.invalid_options
-              (Remove.Parsed_page { id = Some 1L; page = Some "Home" })));
+              (Remove.Parsed_page
+                 { id = Some 1L; page = Some "Home"; force = false })));
       expect_equal "remove tag blank" "name must be non-empty"
         (expect_some "invalid"
            (Remove.invalid_options
@@ -2319,7 +2544,7 @@ let () =
           expect_equal "remove graph" "demo"
             (Cli_primitive.string_of_graph graph);
           expect_none "remove block single id" id;
-          expect_int "remove block ids" 2 (List.length ids);
+          expect_int "remove block ids" 2 (Vec.length ids);
           expect_bool "remove block multi" true multi_id;
           expect_none "remove block uuid none" uuid
       | _ -> fail_test "expected remove block");
@@ -2337,17 +2562,28 @@ let () =
           expect_equal "remove block uuid"
             "00000000-0000-4000-8000-000000000001" uuid;
           expect_bool "remove uuid multi" false multi_id;
-          expect_int "remove uuid ids" 0 (List.length ids)
+          expect_int "remove uuid ids" 0 (Vec.length ids)
       | _ -> fail_test "expected uuid remove block");
       let page =
         expect_ok "remove page by title"
           (Remove.build (config ~repo:"demo" ()) (Global_opts.create ())
-             (Remove.Parsed_page { id = None; page = Some " Home " }))
+             (Remove.Parsed_page
+                { id = None; page = Some " Home "; force = false }))
       in
       (match page with
       | Remove.Remove_page { page = Some page; id = None; _ } ->
           expect_equal "remove page trims" "Home" page
       | _ -> fail_test "expected remove page by title");
+      let forced_page =
+        expect_ok "remove page with force"
+          (Remove.build (config ~repo:"demo" ()) (Global_opts.create ())
+             (Remove.Parsed_page
+                { id = None; page = Some "Home"; force = true }))
+      in
+      (match forced_page with
+      | Remove.Remove_page { force; _ } ->
+          expect_bool "remove page force flows through" true force
+      | _ -> fail_test "expected remove page with force");
       let tag =
         expect_ok "remove tag by id"
           (Remove.build (config ~repo:"demo" ()) (Global_opts.create ())
@@ -2364,7 +2600,160 @@ let () =
            (Remove.Parsed_block { id_raw = None; uuid = None }));
       expect_error_code "remove page missing" "missing-page-name"
         (Remove.build (config ~repo:"demo" ()) (Global_opts.create ())
-           (Remove.Parsed_page { id = None; page = None })));
+           (Remove.Parsed_page { id = None; page = None; force = false })));
+
+  test_promise "CLI parity remove page unwraps apply result map" (fun () ->
+      let server =
+        invoke_server (fun body ->
+            if Js.String.includes ~search:"thread-api/cli-list-pages" body then
+              "[[\"^ \
+               \",\"~:db/id\",190,\"~:block/title\",\"Home\",\"~:block/name\",\"home\",\"~:block/uuid\",\"~u00000000-0000-4000-8000-000000000190\"]]"
+            else if
+              Js.String.includes ~search:"thread-api/apply-outliner-ops" body
+            then "[\"^ \",\"~:result\",true]"
+            else "null")
+      in
+      with_server server (fun base_url ->
+          let repo = Cli_primitive.create_repo "demo" in
+          let action =
+            Remove.Remove_page
+              {
+                repo;
+                graph = Cli_config.repo_to_graph repo;
+                id = None;
+                page = Some "Home";
+                force = false;
+              }
+          in
+          let cfg =
+            {
+              (config ~repo:"demo" ()) with
+              Cli_config.base_url = Some base_url;
+            }
+          in
+          let* result =
+            effect_to_promise
+              (execute_with_output Remove.execute action cfg Output.Mode.Json)
+          in
+          expect_bool "remove page succeeds" false (Cli_result.is_error result);
+          let data =
+            expect_some "remove page data" (Cli_result.data_value result)
+          in
+          expect_bool "remove page result" true
+            (expect_some "remove page result bool"
+               (Edn_util.get_bool data "result"));
+          expect_bool "remove page not permanent" false
+            (expect_some "remove page permanent flag"
+               (Edn_util.get_bool data "permanently-deleted?"));
+          Js.Promise.resolve pass));
+
+  test_promise "CLI parity remove page --force permanently deletes the page"
+    (fun () ->
+      let calls = ref Vec.empty in
+      let server =
+        invoke_server (fun body ->
+            calls := Vec.push_front !calls body;
+            if Js.String.includes ~search:"thread-api/cli-list-pages" body then
+              "[[\"^ \
+               \",\"~:db/id\",190,\"~:block/title\",\"Home\",\"~:block/name\",\"home\",\"~:block/uuid\",\"~u00000000-0000-4000-8000-000000000190\"]]"
+            else if
+              Js.String.includes ~search:"thread-api/apply-outliner-ops" body
+            then "[\"^ \",\"~:result\",true]"
+            else "null")
+      in
+      with_server server (fun base_url ->
+          let repo = Cli_primitive.create_repo "demo" in
+          let action =
+            Remove.Remove_page
+              {
+                repo;
+                graph = Cli_config.repo_to_graph repo;
+                id = None;
+                page = Some "Home";
+                force = true;
+              }
+          in
+          let cfg =
+            {
+              (config ~repo:"demo" ()) with
+              Cli_config.base_url = Some base_url;
+            }
+          in
+          let* result =
+            effect_to_promise
+              (execute_with_output Remove.execute action cfg Output.Mode.Json)
+          in
+          expect_bool "remove page --force succeeds" false
+            (Cli_result.is_error result);
+          let data =
+            expect_some "remove page --force data" (Cli_result.data_value result)
+          in
+          expect_bool "remove page --force result" true
+            (expect_some "remove page --force result bool"
+               (Edn_util.get_bool data "result"));
+          expect_bool "remove page --force is permanent" true
+            (expect_some "remove page --force permanent flag"
+               (Edn_util.get_bool data "permanently-deleted?"));
+          let ops_call =
+            expect_some "apply-outliner-ops call"
+              (Vec.find_opt
+                 (fun body ->
+                   Js.String.includes ~search:"thread-api/apply-outliner-ops"
+                     body)
+                 !calls)
+          in
+          expect_named_contains "force sends delete-page op" ops_call
+            "delete-page";
+          expect_named_contains "force sends recycle-delete-permanently op"
+            ops_call "recycle-delete-permanently";
+          Js.Promise.resolve pass));
+
+  test_promise "CLI parity remove page rejects non-page id before delete"
+    (fun () ->
+      let apply_called = ref false in
+      let server =
+        invoke_server (fun body ->
+            if Js.String.includes ~search:"thread-api/pull" body then
+              "[\"^ \
+               \",\"~:db/id\",190,\"~:block/uuid\",\"~u00000000-0000-4000-8000-000000000190\",\"~:block/title\",\"a block\"]"
+            else if
+              Js.String.includes ~search:"thread-api/apply-outliner-ops" body
+            then (
+              apply_called := true;
+              "[\"^ \",\"~:result\",true]")
+            else "null")
+      in
+      with_server server (fun base_url ->
+          let repo = Cli_primitive.create_repo "demo" in
+          let action =
+            Remove.Remove_page
+              {
+                repo;
+                graph = Cli_config.repo_to_graph repo;
+                id = Some 190L;
+                page = None;
+                force = true;
+              }
+          in
+          let cfg =
+            {
+              (config ~repo:"demo" ()) with
+              Cli_config.base_url = Some base_url;
+            }
+          in
+          let* result =
+            effect_to_promise
+              (execute_with_output Remove.execute action cfg Output.Mode.Human)
+          in
+          expect_bool "remove page block target is error" true
+            (Cli_result.is_error result);
+          (match result.Cli_result.error with
+          | Some err ->
+              expect_equal "remove page block target code" "page-not-found"
+                (Error.code_to_string err.Error.code)
+          | None -> fail_test "expected remove error");
+          expect_bool "delete not called" false !apply_called;
+          Js.Promise.resolve pass));
 
   test_promise "CLI parity remove block rejects page entities before delete"
     (fun () ->
@@ -2389,7 +2778,7 @@ let () =
                 repo;
                 graph = Cli_config.repo_to_graph repo;
                 id = Some 190L;
-                ids = [ 190L ];
+                ids = Vec.singleton 190L;
                 multi_id = false;
                 uuid = None;
               }
@@ -2409,7 +2798,7 @@ let () =
           (match result.Cli_result.error with
           | Some err ->
               expect_equal "remove page target code" "invalid-target"
-                (keyword_text err.Error.code)
+                (Error.code_to_string err.Error.code)
           | None -> fail_test "expected remove error");
           expect_bool "delete not called" false !apply_called;
           Js.Promise.resolve pass));
@@ -2437,7 +2826,7 @@ let () =
                 repo;
                 graph = Cli_config.repo_to_graph repo;
                 id = Some 190L;
-                ids = [ 190L ];
+                ids = Vec.singleton 190L;
                 multi_id = false;
                 uuid = None;
               }
@@ -2498,7 +2887,10 @@ let () =
              })
       in
       (match multi with
-      | Show.By_ids [ 1L; 2L ] -> pass
+      | Show.By_ids ids ->
+          expect_int "show id count" 2 (Vec.length ids);
+          expect_int64 "show first id" 1L (Vec.nth ids 0);
+          expect_int64 "show second id" 2L (Vec.nth ids 1)
       | _ -> fail_test "expected By_ids");
       expect_equal "ambiguous show"
         "only one of --id, --uuid, or --page is allowed"
@@ -2562,7 +2954,10 @@ let () =
                 }))
       in
       (match custom_action.Show.target with
-      | Show.By_ids [ 1L; 2L ] -> pass
+      | Show.By_ids ids ->
+          expect_int "multi id count" 2 (Vec.length ids);
+          expect_int64 "multi first id" 1L (Vec.nth ids 0);
+          expect_int64 "multi second id" 2L (Vec.nth ids 1)
       | _ -> fail_test "expected multi-id target");
       expect_bool "multi id flag" true custom_action.Show.multi_id;
       expect_bool "linked refs disabled" false
@@ -2580,6 +2975,48 @@ let () =
         (Show.build (config ~repo:"demo" ()) (Global_opts.create ())
            (Show.Parsed_show { base_opts with level = Some 0 })));
 
+  test_promise "CLI parity show rejects recycled pages" (fun () ->
+      let server =
+        invoke_server (fun body ->
+            if Js.String.includes ~search:"thread-api/pull" body then
+              "[\"^ \
+               \",\"~:db/id\",42,\"~:block/uuid\",\"~u00000000-0000-4000-8000-000000000042\",\"~:block/name\",\"home\",\"~:block/title\",\"Home\",\"~:logseq.property/deleted-at\",1712000000000]"
+            else if Js.String.includes ~search:"thread-api/q" body then "[]"
+            else "null")
+      in
+      with_server server (fun base_url ->
+          let repo = Cli_primitive.create_repo "demo" in
+          let cfg =
+            {
+              (config ~repo:"demo" ()) with
+              Cli_config.base_url = Some base_url;
+            }
+          in
+          let action =
+            {
+              Show.repo;
+              graph = Cli_config.repo_to_graph repo;
+              target = Show.By_page "home";
+              multi_id = false;
+              linked_references = false;
+              ref_id_footer = false;
+              page_hierarchy = false;
+              level = Some 10;
+            }
+          in
+          let* result =
+            effect_to_promise
+              (execute_with_output Show.execute action cfg Output.Mode.Human)
+          in
+          expect_bool "show recycled page errors" true
+            (Cli_result.is_error result);
+          (match result.Cli_result.error with
+          | Some err ->
+              expect_equal "show recycled code" "recycled-page"
+                (Error.code_to_string err.Error.code)
+          | None -> fail_test "expected show error");
+          Js.Promise.resolve pass));
+
   test
     "CLI parity upsert validation rejects ambiguous and mode-specific options"
     (fun () ->
@@ -2591,6 +3028,7 @@ let () =
                  {
                    id = Some 1L;
                    page = Some "Home";
+                   restore = false;
                    update_tags_edn = None;
                    update_properties_edn = None;
                    remove_tags_edn = None;
@@ -2634,6 +3072,407 @@ let () =
                    no_deadline = false;
                  }))));
 
+  test "CLI parity upsert page parses restore option" (fun () ->
+      let request =
+        expect_parse_ok "upsert page restore"
+          [|
+            "upsert";
+            "page";
+            "--page";
+            "Home";
+            "--restore";
+            "--update-properties";
+            "{\"status\" \"done\"}";
+          |]
+      in
+      match request.command with
+      | Cli_request.Upsert (Upsert.Parsed_page opts) ->
+          expect_equal "page" "Home" (expect_some "page" opts.page);
+          expect_bool "restore" true opts.restore
+      | _ -> fail_test "expected upsert page");
+
+  test_promise "CLI parity upsert page rejects recycled page by default"
+    (fun () ->
+      let apply_called = ref false in
+      let server =
+        invoke_server (fun body ->
+            if Js.String.includes ~search:"thread-api/q" body then
+              "[[\"^ \
+               \",\"~:db/id\",50,\"~:block/uuid\",\"~u00000000-0000-4000-8000-000000000050\",\"~:block/name\",\"home\",\"~:block/title\",\"Home\",\"~:logseq.property/deleted-at\",1712000000000]]"
+            else if
+              Js.String.includes ~search:"thread-api/apply-outliner-ops" body
+            then (
+              apply_called := true;
+              "true")
+            else "null")
+      in
+      with_server server (fun base_url ->
+          let repo = Cli_primitive.create_repo "demo" in
+          let cfg =
+            {
+              (config ~repo:"demo" ()) with
+              Cli_config.base_url = Some base_url;
+            }
+          in
+          let action =
+            Upsert.Upsert_page
+              {
+                repo;
+                graph = Cli_config.repo_to_graph repo;
+                mode = Upsert.Create;
+                id = None;
+                page = Some "Home";
+                restore = false;
+                plan = Property.empty_update_plan;
+              }
+          in
+          let* result =
+            effect_to_promise
+              (execute_with_output Upsert.execute action cfg Output.Mode.Human)
+          in
+          expect_bool "upsert recycled page errors" true
+            (Cli_result.is_error result);
+          (match result.Cli_result.error with
+          | Some err ->
+              expect_equal "upsert recycled code" "recycled-page"
+                (Error.code_to_string err.Error.code)
+          | None -> fail_test "expected upsert error");
+          expect_bool "no ops applied" false !apply_called;
+          Js.Promise.resolve pass));
+
+  test_promise "CLI parity upsert page update rejects recycled page by default"
+    (fun () ->
+      let apply_called = ref false in
+      let server =
+        invoke_server (fun body ->
+            if Js.String.includes ~search:"thread-api/pull" body then
+              "[\"^ \
+               \",\"~:db/id\",50,\"~:block/uuid\",\"~u00000000-0000-4000-8000-000000000050\",\"~:block/name\",\"home\",\"~:block/title\",\"Home\",\"~:logseq.property/deleted-at\",1712000000000]"
+            else if
+              Js.String.includes ~search:"thread-api/apply-outliner-ops" body
+            then (
+              apply_called := true;
+              "true")
+            else "null")
+      in
+      with_server server (fun base_url ->
+          let repo = Cli_primitive.create_repo "demo" in
+          let cfg =
+            {
+              (config ~repo:"demo" ()) with
+              Cli_config.base_url = Some base_url;
+            }
+          in
+          let action =
+            Upsert.Upsert_page
+              {
+                repo;
+                graph = Cli_config.repo_to_graph repo;
+                mode = Upsert.Update;
+                id = Some 50L;
+                page = None;
+                restore = false;
+                plan = Property.empty_update_plan;
+              }
+          in
+          let* result =
+            effect_to_promise
+              (execute_with_output Upsert.execute action cfg Output.Mode.Human)
+          in
+          expect_bool "upsert recycled page update errors" true
+            (Cli_result.is_error result);
+          (match result.Cli_result.error with
+          | Some err ->
+              expect_equal "upsert recycled update code" "recycled-page"
+                (Error.code_to_string err.Error.code)
+          | None -> fail_test "expected upsert update error");
+          expect_bool "no update ops applied" false !apply_called;
+          Js.Promise.resolve pass));
+
+  test_promise "CLI parity upsert page restores recycled page when requested"
+    (fun () ->
+      let apply_calls = ref Vec.empty in
+      let server =
+        invoke_server (fun body ->
+            if Js.String.includes ~search:"thread-api/q" body then
+              "[[\"^ \
+               \",\"~:db/id\",50,\"~:block/uuid\",\"~u00000000-0000-4000-8000-000000000050\",\"~:block/name\",\"home\",\"~:block/title\",\"Home\",\"~:logseq.property/deleted-at\",1712000000000]]"
+            else if
+              Js.String.includes ~search:"thread-api/apply-outliner-ops" body
+            then (
+              apply_calls := Vec.push_back !apply_calls body;
+              "true")
+            else "null")
+      in
+      with_server server (fun base_url ->
+          let repo = Cli_primitive.create_repo "demo" in
+          let cfg =
+            {
+              (config ~repo:"demo" ()) with
+              Cli_config.base_url = Some base_url;
+            }
+          in
+          let plan =
+            {
+              Property.empty_update_plan with
+              update_properties =
+                Vec.of_array
+                  [|
+                    {
+                      Property.key =
+                        Property.Key_ident
+                          (Edn_util.keyword_t "user.property/status");
+                      value = Edn_util.string "done";
+                    };
+                  |];
+            }
+          in
+          let action =
+            Upsert.Upsert_page
+              {
+                repo;
+                graph = Cli_config.repo_to_graph repo;
+                mode = Upsert.Create;
+                id = None;
+                page = Some "Home";
+                restore = true;
+                plan;
+              }
+          in
+          let* result =
+            effect_to_promise
+              (execute_with_output Upsert.execute action cfg Output.Mode.Human)
+          in
+          expect_bool "upsert restore ok" false (Cli_result.is_error result);
+          expect_int "restore then update calls" 2 (Vec.length !apply_calls);
+          expect_named_contains "first op restores recycled page"
+            (Vec.nth !apply_calls 0) "restore-recycled";
+          expect_named_contains "second op updates restored page"
+            (Vec.nth !apply_calls 1) "batch-set-property";
+          Js.Promise.resolve pass));
+
+  test_promise
+    "CLI parity upsert page restore rejects recycled page without uuid"
+    (fun () ->
+      let apply_called = ref false in
+      let server =
+        invoke_server (fun body ->
+            if Js.String.includes ~search:"thread-api/q" body then
+              "[[\"^ \
+               \",\"~:db/id\",50,\"~:block/name\",\"home\",\"~:block/title\",\"Home\",\"~:logseq.property/deleted-at\",1712000000000]]"
+            else if
+              Js.String.includes ~search:"thread-api/apply-outliner-ops" body
+            then (
+              apply_called := true;
+              "true")
+            else "null")
+      in
+      with_server server (fun base_url ->
+          let repo = Cli_primitive.create_repo "demo" in
+          let cfg =
+            {
+              (config ~repo:"demo" ()) with
+              Cli_config.base_url = Some base_url;
+            }
+          in
+          let action =
+            Upsert.Upsert_page
+              {
+                repo;
+                graph = Cli_config.repo_to_graph repo;
+                mode = Upsert.Create;
+                id = None;
+                page = Some "Home";
+                restore = true;
+                plan = Property.empty_update_plan;
+              }
+          in
+          let* result =
+            effect_to_promise
+              (execute_with_output Upsert.execute action cfg Output.Mode.Human)
+          in
+          expect_bool "upsert recycled restore without uuid errors" true
+            (Cli_result.is_error result);
+          (match result.Cli_result.error with
+          | Some err ->
+              expect_equal "upsert recycled restore without uuid code"
+                "recycled-page"
+                (Error.code_to_string err.Error.code)
+          | None -> fail_test "expected upsert restore error");
+          expect_bool "no restore ops applied" false !apply_called;
+          Js.Promise.resolve pass));
+
+  test_promise
+    "CLI parity upsert page update restore rejects recycled page without uuid"
+    (fun () ->
+      let apply_called = ref false in
+      let server =
+        invoke_server (fun body ->
+            if Js.String.includes ~search:"thread-api/pull" body then
+              "[\"^ \
+               \",\"~:db/id\",50,\"~:block/name\",\"home\",\"~:block/title\",\"Home\",\"~:logseq.property/deleted-at\",1712000000000]"
+            else if
+              Js.String.includes ~search:"thread-api/apply-outliner-ops" body
+            then (
+              apply_called := true;
+              "true")
+            else "null")
+      in
+      with_server server (fun base_url ->
+          let repo = Cli_primitive.create_repo "demo" in
+          let cfg =
+            {
+              (config ~repo:"demo" ()) with
+              Cli_config.base_url = Some base_url;
+            }
+          in
+          let action =
+            Upsert.Upsert_page
+              {
+                repo;
+                graph = Cli_config.repo_to_graph repo;
+                mode = Upsert.Update;
+                id = Some 50L;
+                page = None;
+                restore = true;
+                plan = Property.empty_update_plan;
+              }
+          in
+          let* result =
+            effect_to_promise
+              (execute_with_output Upsert.execute action cfg Output.Mode.Human)
+          in
+          expect_bool "upsert recycled update restore without uuid errors" true
+            (Cli_result.is_error result);
+          (match result.Cli_result.error with
+          | Some err ->
+              expect_equal "upsert recycled update restore without uuid code"
+                "recycled-page"
+                (Error.code_to_string err.Error.code)
+          | None -> fail_test "expected upsert update restore error");
+          expect_bool "no update restore ops applied" false !apply_called;
+          Js.Promise.resolve pass));
+
+  test_promise "CLI parity upsert block create rejects recycled target page"
+    (fun () ->
+      let apply_called = ref false in
+      let server =
+        invoke_server (fun body ->
+            if Js.String.includes ~search:"thread-api/q" body then
+              "[[\"^ \
+               \",\"~:db/id\",50,\"~:block/uuid\",\"~u00000000-0000-4000-8000-000000000050\",\"~:block/name\",\"home\",\"~:block/title\",\"Home\",\"~:logseq.property/deleted-at\",1712000000000]]"
+            else if
+              Js.String.includes ~search:"thread-api/apply-outliner-ops" body
+            then (
+              apply_called := true;
+              "true")
+            else "null")
+      in
+      with_server server (fun base_url ->
+          let repo = Cli_primitive.create_repo "demo" in
+          let cfg =
+            {
+              (config ~repo:"demo" ()) with
+              Cli_config.base_url = Some base_url;
+            }
+          in
+          let action =
+            Upsert.Upsert_block
+              (Upsert.Block_create
+                 {
+                   repo;
+                   graph = Cli_config.repo_to_graph repo;
+                   target = Upsert.Target_page "Home";
+                   pos = Block.Last_child;
+                   status = None;
+                   tags = Vec.empty;
+                   properties = Vec.empty;
+                   blocks = Vec.singleton (Block.make ~title:"Child" ());
+                   markdown_blocks = false;
+                   update_plan = Property.empty_update_plan;
+                   dry_run = false;
+                 })
+          in
+          let* result =
+            effect_to_promise
+              (execute_with_output Upsert.execute action cfg Output.Mode.Human)
+          in
+          expect_bool "upsert block create recycled target errors" true
+            (Cli_result.is_error result);
+          (match result.Cli_result.error with
+          | Some err ->
+              expect_equal "upsert block create recycled code" "recycled-page"
+                (Error.code_to_string err.Error.code)
+          | None -> fail_test "expected upsert block create error");
+          expect_bool "no create ops applied" false !apply_called;
+          Js.Promise.resolve pass));
+
+  test_promise "CLI parity upsert block update rejects recycled target page"
+    (fun () ->
+      let apply_called = ref false in
+      let pull_count = ref 0 in
+      let server =
+        invoke_server (fun body ->
+            if Js.String.includes ~search:"thread-api/pull" body then (
+              incr pull_count;
+              match !pull_count with
+              | 1 ->
+                  "[\"^ \
+                   \",\"~:db/id\",207,\"~:block/uuid\",\"~u00000000-0000-4000-8000-000000000207\",\"~:block/title\",\"Source\"]"
+              | 2 ->
+                  "[\"^ \
+                   \",\"~:db/id\",50,\"~:block/uuid\",\"~u00000000-0000-4000-8000-000000000050\",\"~:block/name\",\"home\",\"~:block/title\",\"Home\",\"~:logseq.property/deleted-at\",1712000000000]"
+              | _ ->
+                  fail_test
+                    (Printf.sprintf "unexpected pull %d: %s" !pull_count body);
+                  "")
+            else if
+              Js.String.includes ~search:"thread-api/apply-outliner-ops" body
+            then (
+              apply_called := true;
+              "true")
+            else "null")
+      in
+      with_server server (fun base_url ->
+          let repo = Cli_primitive.create_repo "demo" in
+          let cfg =
+            {
+              (config ~repo:"demo" ()) with
+              Cli_config.base_url = Some base_url;
+            }
+          in
+          let action =
+            Upsert.Upsert_block
+              (Upsert.Block_update
+                 {
+                   repo;
+                   graph = Cli_config.repo_to_graph repo;
+                   source = Upsert.Source_id 207L;
+                   target = Some (Upsert.Target_page "Home");
+                   pos = Some Block.Last_child;
+                   update_tags = Vec.empty;
+                   update_properties = Vec.empty;
+                   remove_tags = Vec.empty;
+                   remove_properties = Vec.empty;
+                   content = None;
+                   source_label = Some "207";
+                   target_label = Some "page:Home";
+                 })
+          in
+          let* result =
+            effect_to_promise
+              (execute_with_output Upsert.execute action cfg Output.Mode.Human)
+          in
+          expect_bool "upsert block update recycled target errors" true
+            (Cli_result.is_error result);
+          (match result.Cli_result.error with
+          | Some err ->
+              expect_equal "upsert block update recycled code" "recycled-page"
+                (Error.code_to_string err.Error.code)
+          | None -> fail_test "expected upsert block update error");
+          expect_bool "no update ops applied" false !apply_called;
+          Js.Promise.resolve pass));
+
   test "CLI parity upsert block update property parsing keeps update contracts"
     (fun () ->
       let block_update_opts =
@@ -2645,8 +3484,9 @@ let () =
           target_page = None;
           pos = None;
           content = None;
-          blocks_edn = None;
+          blocks_markdown = None;
           blocks_file = None;
+          dry_run = false;
           update_tags_edn = None;
           update_properties_edn = None;
           remove_tags_edn = None;
@@ -2673,9 +3513,10 @@ let () =
       match action with
       | Upsert.Upsert_block (Upsert.Block_update update) ->
           expect_int "update property count" 1
-            (List.length update.update_properties);
+            (Vec.length update.update_properties);
           expect_equal "update property key" "p1"
-            (property_key_text (List.hd update.update_properties).Property.key)
+            (property_key_text
+               (Vec.peek_front update.update_properties).Property.key)
       | _ -> fail_test "expected Upsert_block update action");
 
   test "CLI parity upsert tag parses schema property vectors" (fun () ->
@@ -2693,11 +3534,11 @@ let () =
       (match action with
       | Upsert.Upsert_tag
           { mode = Upsert.Create; add_properties; remove_properties; _ } ->
-          expect_int "add property count" 2 (List.length add_properties);
+          expect_int "add property count" 2 (Vec.length add_properties);
           expect_equal "add property by name" "status"
-            (property_key_text (List.hd add_properties));
+            (property_key_text (Vec.peek_front add_properties));
           expect_equal "remove property by id" "123"
-            (property_key_text (List.hd remove_properties))
+            (property_key_text (Vec.peek_front remove_properties))
       | _ -> fail_test "expected Upsert_tag create action");
       expect_error_code "add-properties map" "invalid-options"
         (Upsert.build (config ~repo:"demo" ()) (Global_opts.create ())
@@ -2774,15 +3615,15 @@ let () =
             (expect_some "status input" task.status_input);
           let property_keys =
             task.update_properties
-            |> List.map (fun item -> item.Property.key)
-            |> List.map property_key_text
+            |> Vec.map (fun item -> item.Property.key)
+            |> Vec.map property_key_text
           in
           expect_bool "priority update" true
-            (List.mem "logseq.property/priority" property_keys);
+            (Vec.mem "logseq.property/priority" property_keys);
           expect_bool "scheduled update" true
-            (List.mem "logseq.property/scheduled" property_keys);
+            (Vec.mem "logseq.property/scheduled" property_keys);
           expect_bool "deadline update" true
-            (List.mem "logseq.property/deadline" property_keys)
+            (Vec.mem "logseq.property/deadline" property_keys)
       | _ -> fail_test "expected Upsert_task create action");
       let updated =
         build_task "update task"
@@ -2799,49 +3640,48 @@ let () =
       | Upsert.Upsert_task task ->
           expect_bool "update mode" true (task.mode = Upsert.Update);
           expect_int64 "update id" 42L (expect_some "update id" task.id);
-          let clear_keys =
-            task.clear_properties |> List.map property_key_text
-          in
+          let clear_keys = task.clear_properties |> Vec.map property_key_text in
           expect_bool "clear status" true
-            (List.mem "logseq.property/status" clear_keys);
+            (Vec.mem "logseq.property/status" clear_keys);
           expect_bool "clear priority" true
-            (List.mem "logseq.property/priority" clear_keys);
+            (Vec.mem "logseq.property/priority" clear_keys);
           expect_bool "clear scheduled" true
-            (List.mem "logseq.property/scheduled" clear_keys);
+            (Vec.mem "logseq.property/scheduled" clear_keys);
           expect_bool "clear deadline" true
-            (List.mem "logseq.property/deadline" clear_keys)
+            (Vec.mem "logseq.property/deadline" clear_keys)
       | _ -> fail_test "expected Upsert_task update action");
-      List.iter
+      Vec.iter
         (fun opts ->
           expect_error_code "task set no conflict" "invalid-options"
             (Upsert.build (config ~repo:"demo" ()) (Global_opts.create ())
                (Upsert.Parsed_task opts)))
-        [
-          {
-            base_task_opts with
-            id = Some 42L;
-            status = Some "todo";
-            no_status = true;
-          };
-          {
-            base_task_opts with
-            id = Some 42L;
-            priority = Some "high";
-            no_priority = true;
-          };
-          {
-            base_task_opts with
-            id = Some 42L;
-            scheduled = Some scheduled;
-            no_scheduled = true;
-          };
-          {
-            base_task_opts with
-            id = Some 42L;
-            deadline = Some deadline;
-            no_deadline = true;
-          };
-        ];
+        (Vec.of_array
+           [|
+             {
+               base_task_opts with
+               id = Some 42L;
+               status = Some "todo";
+               no_status = true;
+             };
+             {
+               base_task_opts with
+               id = Some 42L;
+               priority = Some "high";
+               no_priority = true;
+             };
+             {
+               base_task_opts with
+               id = Some 42L;
+               scheduled = Some scheduled;
+               no_scheduled = true;
+             };
+             {
+               base_task_opts with
+               id = Some 42L;
+               deadline = Some deadline;
+               no_deadline = true;
+             };
+           |]);
       let unknown_status =
         build_task "unknown status"
           {
@@ -2962,14 +3802,14 @@ let () =
       in
       let root =
         Block.make ~uuid:"00000000-0000-4000-8000-000000000101" ~title:"Root"
-          ~children:[ child ] ()
+          ~children:(Vec.singleton child) ()
       in
-      let flat = Block.flatten [ root ] in
-      expect_int "flatten count" 2 (List.length flat);
+      let flat = Block.flatten (Vec.singleton root) in
+      expect_int "flatten count" 2 (Vec.length flat);
       expect_equal "flatten root first" "Root"
-        (expect_some "root label" (Block.label (List.nth flat 0)));
+        (expect_some "root label" (Block.label (Vec.nth flat 0)));
       expect_equal "flatten child second" "Child"
-        (expect_some "child label" (Block.label (List.nth flat 1)));
+        (expect_some "child label" (Block.label (Vec.nth flat 1)));
       let serialized = Edn_util.any (Block.to_value root) in
       expect_equal "serialized block title" "Root"
         (expect_some "serialized title"
@@ -2977,98 +3817,160 @@ let () =
       expect_bool "serialized child vector" true
         (Option.is_some (Edn_util.get serialized "block/children")));
 
-  test "CLI parity add block parsing preserves uuids tags and raw blocks"
+  test "CLI parity add block markdown parsing produces a block tree"
     (fun () ->
       let parsed =
         expect_ok "parse blocks"
-          (Add.parse_blocks_edn ~label:"blocks"
-             "[{:block/title \"Root\" :block/uuid #uuid \
-              \"00000000-0000-4000-8000-000000000301\" :block/tags \
-              [\"Project\" :logseq.class/Tag] :block/children [{:block/content \
-              \"Child\" :block/uuid #uuid \
-              \"00000000-0000-4000-8000-000000000302\"}]} \"Loose\"]")
+          (Markdown_blocks.of_markdown "- Root\n  - Child\n- Loose")
       in
-      expect_int "parsed block count" 2 (List.length parsed);
-      let root = List.nth parsed 0 in
+      expect_int "parsed block count" 2 (Vec.length parsed);
+      let root = Vec.nth parsed 0 in
       expect_equal "root title" "Root" (expect_some "root title" root.title);
-      expect_equal "root uuid" "00000000-0000-4000-8000-000000000301"
-        (expect_some "root uuid" root.uuid);
-      expect_int "root tags" 2 (List.length root.tags);
-      expect_int "root children" 1 (List.length root.children);
-      expect_equal "child content title" "Child"
-        (expect_some "child title" (List.hd root.children).title);
-      expect_equal "string block title" "Loose"
-        (expect_some "loose title" (List.nth parsed 1).title);
-      expect_error_code "blocks must be vector" "invalid-blocks"
-        (Add.parse_blocks_edn ~label:"blocks" "{:block/title \"Root\"}");
-      expect_error_code "invalid blocks edn" "invalid-options"
-        (Add.parse_blocks_edn ~label:"blocks" "[{:block/title"));
+      expect_int "root children" 1 (Vec.length root.children);
+      expect_equal "child title" "Child"
+        (expect_some "child title" (Vec.peek_front root.children).title);
+      expect_equal "loose title" "Loose"
+        (expect_some "loose title" (Vec.nth parsed 1).title);
+      expect_error_code "no headings" "invalid-blocks"
+        (Markdown_blocks.of_markdown "plain text without list items"));
+
+  test "CLI parity add block markdown keeps multibyte titles intact"
+    (fun () ->
+      let parsed =
+        expect_ok "parse multibyte"
+          (Markdown_blocks.of_markdown "- CJK 测试 🎉 tail")
+      in
+      expect_equal "multibyte title" "CJK 测试 🎉 tail"
+        (expect_some "multibyte title" (Vec.nth parsed 0).title));
+
+  test "CLI parity add block markdown heading marker becomes a property"
+    (fun () ->
+      let parsed =
+        expect_ok "parse heading"
+          (Markdown_blocks.of_markdown "- ## Section")
+      in
+      let block = Vec.nth parsed 0 in
+      expect_equal "stripped title" "Section"
+        (expect_some "stripped title" block.title);
+      expect_int "one property" 1 (Vec.length block.properties);
+      let assignment = Vec.nth block.properties 0 in
+      (match assignment.Property.key with
+      | Property.Key_ident _ -> ()
+      | _ -> fail_test "expected logseq.property/heading ident");
+      expect_bool "heading level 2" true
+        (Edn_util.as_int64 assignment.value = Some (Int64.of_int 2)));
+
+  test "CLI parity add block markdown drawer becomes properties" (fun () ->
+      let parsed =
+        expect_ok "parse drawer"
+          (Markdown_blocks.of_markdown "- Note\n  status:: todo")
+      in
+      let block = Vec.nth parsed 0 in
+      expect_int "one property" 1 (Vec.length block.properties);
+      let assignment = Vec.nth block.properties 0 in
+      (match assignment.Property.key with
+      | Property.Key_name "status" -> ()
+      | _ -> fail_test "expected status property key");
+      expect_bool "todo value" true
+        (Edn_util.as_string_like assignment.value = Some "todo"));
+
+  test "CLI parity add block markdown folds irregular indents" (fun () ->
+      let parsed =
+        expect_ok "parse indents"
+          (Markdown_blocks.of_markdown "- a\n    - deep\n  - mid")
+      in
+      expect_int "one root" 1 (Vec.length parsed);
+      let root = Vec.nth parsed 0 in
+      expect_int "root children" 2 (Vec.length root.children);
+      expect_equal "deep title" "deep"
+        (expect_some "deep title" (Vec.nth root.children 0).title);
+      expect_equal "mid title" "mid"
+        (expect_some "mid title" (Vec.nth root.children 1).title));
+
+  test "CLI parity add block markdown rejects leading non-block content"
+    (fun () ->
+      expect_error_code "leading paragraph" "invalid-blocks"
+        (Markdown_blocks.of_markdown "intro paragraph\n- b");
+      expect_error_code "leading ordered list" "invalid-blocks"
+        (Markdown_blocks.of_markdown "1. ordered\n- b");
+      expect_error_code "mid-outline ordered list" "invalid-blocks"
+        (Markdown_blocks.of_markdown "- a\n1. ordered\n- b");
+      expect_error_code "leading drawer" "invalid-blocks"
+        (Markdown_blocks.of_markdown "status:: todo\n- b"));
+
+  test "CLI parity add block markdown keeps fenced code in titles" (fun () ->
+      let parsed =
+        expect_ok "fenced code body"
+          (Markdown_blocks.of_markdown
+             "- Example\n  ```clojure\n  (+ 1 2)\n  ```\n- b")
+      in
+      expect_int "two blocks" 2 (Vec.length parsed);
+      let title =
+        expect_some "first title" (Vec.nth parsed 0).Block.title
+      in
+      if not (String.contains title '`') then
+        fail_test ("fenced code missing from title: " ^ title));
+
+  test "CLI parity add block markdown normalizes ((uuid)) titles"
+    (fun () ->
+      let parsed =
+        expect_ok "block ref rewrite"
+          (Markdown_blocks.of_markdown
+             "- see ((aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa)) done")
+      in
+      expect_equal "normalized ref"
+        "see [[aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa]] done"
+        (expect_some "block title" (Vec.nth parsed 0).Block.title);
+      let parsed =
+        expect_ok "code span kept"
+          (Markdown_blocks.of_markdown
+             "- real ((bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb)) code `((cccccccc-cccc-4ccc-8ccc-cccccccccccc))`")
+      in
+      expect_equal "code verbatim"
+        "real [[bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb]] code `((cccccccc-cccc-4ccc-8ccc-cccccccccccc))`"
+        (expect_some "block title" (Vec.nth parsed 0).Block.title);
+      let parsed =
+        expect_ok "real ref beside code"
+          (Markdown_blocks.of_markdown
+             "- real ((dddddddd-dddd-4ddd-8ddd-dddddddddddd)) code `((dddddddd-dddd-4ddd-8ddd-dddddddddddd))`")
+      in
+      expect_equal "only real ref normalized"
+        "real [[dddddddd-dddd-4ddd-8ddd-dddddddddddd]] code `((dddddddd-dddd-4ddd-8ddd-dddddddddddd))`"
+        (expect_some "block title" (Vec.nth parsed 0).Block.title);
+      let parsed =
+        expect_ok "escaped backtick"
+          (Markdown_blocks.of_markdown
+             "- lit \\` then ((eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee))")
+      in
+      expect_equal "escaped backtick ref"
+        "lit \\` then [[eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee]]"
+        (expect_some "block title" (Vec.nth parsed 0).Block.title);
+      let parsed =
+        expect_ok "backslash inside code"
+          (Markdown_blocks.of_markdown
+             "- text `code\\` then ((ffffffff-ffff-4fff-8fff-ffffffffffff))")
+      in
+      expect_equal "ref after code backslash"
+        "text `code\\` then [[ffffffff-ffff-4fff-8fff-ffffffffffff]]"
+        (expect_some "block title" (Vec.nth parsed 0).Block.title);
+      let parsed =
+        expect_ok "crlf fence"
+          (Markdown_blocks.of_markdown
+             "- ex\r\n  ```\r\n  code\r\n  ```\r\n  see ((ffffffff-ffff-4fff-8fff-ffffffffffff))")
+      in
+      expect_equal "ref after crlf fence"
+        "ex\r\n```\r\ncode\r\n```\r\nsee [[ffffffff-ffff-4fff-8fff-ffffffffffff]]"
+        (expect_some "block title" (Vec.nth parsed 0).Block.title));
 
   test "CLI parity add collect created block uuids depth-first and unique"
     (fun () ->
-      let nested =
-        Edn_util.map
-          [
-            ( Edn_util.keyword "block/uuid",
-              Edn_util.uuid "00000000-0000-4000-8000-000000000401" );
-            ( Edn_util.keyword "block/children",
-              Edn_util.vector
-                [
-                  Edn_util.map
-                    [
-                      ( Edn_util.keyword "block/uuid",
-                        Edn_util.uuid "00000000-0000-4000-8000-000000000402" );
-                    ];
-                  Edn_util.map
-                    [
-                      (Edn_util.keyword "block/title", Edn_util.string "No uuid");
-                      ( Edn_util.keyword "block/children",
-                        Edn_util.vector
-                          [
-                            Edn_util.map
-                              [
-                                ( Edn_util.keyword "block/uuid",
-                                  Edn_util.uuid
-                                    "00000000-0000-4000-8000-000000000403" );
-                              ];
-                          ] );
-                    ];
-                ] );
-          ]
-      in
-      let inserted =
-        Edn_util.vector
-          [
-            nested;
-            Edn_util.map
-              [
-                ( Edn_util.keyword "block/uuid",
-                  Edn_util.uuid "00000000-0000-4000-8000-000000000404" );
-              ];
-            Edn_util.map
-              [
-                ( Edn_util.keyword "block/uuid",
-                  Edn_util.uuid "00000000-0000-4000-8000-000000000402" );
-              ];
-          ]
-      in
-      expect_equal "collected uuids"
-        (String.concat ","
-           [
-             "00000000-0000-4000-8000-000000000401";
-             "00000000-0000-4000-8000-000000000402";
-             "00000000-0000-4000-8000-000000000403";
-             "00000000-0000-4000-8000-000000000404";
-           ])
-        (String.concat ","
-           (Add.collect_uuids_from_value inserted |> Add.unique));
       let child =
         Block.make ~uuid:"00000000-0000-4000-8000-000000000502" ~title:"Child"
           ()
       in
       let root =
         Block.make ~uuid:"00000000-0000-4000-8000-000000000501" ~title:"Root"
-          ~children:[ child ] ()
+          ~children:(Vec.singleton child) ()
       in
       let duplicate =
         Block.make ~uuid:"00000000-0000-4000-8000-000000000502"
@@ -3076,7 +3978,94 @@ let () =
       in
       expect_equal "action uuids"
         "00000000-0000-4000-8000-000000000501,00000000-0000-4000-8000-000000000502"
-        (String.concat "," (Add.collect_action_block_uuids [ root; duplicate ])));
+        (Vec.string_concat ","
+           (Add.collect_action_block_uuids (Vec.of_array [| root; duplicate |]))));
+
+  List.iter
+    (fun missing_child ->
+      test_promise
+        (if missing_child then
+           "CLI parity create rejects an unresolved requested descendant"
+         else "CLI parity create returns only action entities in preorder")
+        (fun () ->
+          let root_uuid = "00000000-0000-4000-8000-000000000801" in
+          let child_uuid = "00000000-0000-4000-8000-000000000802" in
+          let ref_uuid = "00000000-0000-4000-8000-000000000899" in
+          let entity id uuid =
+            Printf.sprintf "[\"^ \",\"~:db/id\",%d,\"~:block/uuid\",\"~u%s\"]"
+              id uuid
+          in
+          let server =
+            invoke_server (fun body ->
+                if
+                  Js.String.includes ~search:"thread-api/apply-outliner-ops"
+                    body
+                then
+                  "[" ^ entity 801 root_uuid ^ "," ^ entity 899 ref_uuid ^ "]"
+                else if Js.String.includes ~search:child_uuid body then
+                  if missing_child then "null" else entity 802 child_uuid
+                else if Js.String.includes ~search:root_uuid body then
+                  entity 801 root_uuid
+                else if Js.String.includes ~search:ref_uuid body then
+                  entity 899 ref_uuid
+                else entity 627 "00000000-0000-4000-8000-000000000627")
+          in
+          with_server server (fun base_url ->
+              let cfg =
+                {
+                  (config ~repo:"demo" ()) with
+                  Cli_config.base_url = Some base_url;
+                }
+              in
+              let action =
+                {
+                  Add.repo = Cli_primitive.create_repo "demo";
+                  graph =
+                    Cli_config.repo_to_graph
+                      (Cli_primitive.create_repo "demo");
+                  target_id = Some 627L;
+                  target_uuid = None;
+                  target_page_name = None;
+                  pos = Block.Last_child;
+                  status = None;
+                  tags = Vec.empty;
+                  properties = Vec.empty;
+                  blocks =
+                    Vec.singleton
+                      (Block.make ~uuid:root_uuid ~title:"Root"
+                         ~children:
+                           (Vec.singleton
+                              (Block.make ~uuid:child_uuid ~title:"Child" ()))
+                         ());
+                  markdown_blocks = false;
+                }
+              in
+              let* result =
+                effect_to_promise
+                  (Add.execute_add_block ~extra_ops:Vec.empty action
+                     (config_with_output cfg Output.Mode.Json)
+                     Output.Mode.Json)
+              in
+              if missing_child then (
+                expect_bool "missing child fails" true
+                  (Cli_result.is_error result);
+                let err =
+                  expect_some "resolution error" result.Cli_result.error
+                in
+                expect_equal "resolution code" "add-id-resolution-failed"
+                  (Error.code_to_string err.Error.code))
+              else (
+                expect_bool "create succeeds" false (Cli_result.is_error result);
+                let data =
+                  expect_some "result data" (Cli_result.data_value result)
+                in
+                let ids =
+                  expect_some "result ids" (Edn_util.get data "result")
+                in
+                expect_equal "requested entity IDs" "[801 802]"
+                  (Melange_edn_melange.to_edn_string ids));
+              Js.Promise.resolve pass)))
+    [ false; true ];
 
   test "CLI parity add action validates targets metadata and status" (fun () ->
       let base_opts =
@@ -3089,38 +4078,38 @@ let () =
           tags_edn = None;
           properties_edn = None;
           content = Some "Hello from add";
-          blocks_edn = None;
+          blocks_markdown = None;
           blocks_file = None;
         }
       in
       expect_error_code "ambiguous target" "invalid-options"
         (Add.build_add_block_action
            { base_opts with target_id = Some 42L }
-           []
+           Vec.empty
            (Cli_primitive.create_repo "demo"));
       expect_error_code "invalid target uuid" "invalid-options"
         (Add.build_add_block_action
            { base_opts with target_page_name = None; target_uuid = Some "bad" }
-           []
+           Vec.empty
            (Cli_primitive.create_repo "demo"));
       expect_error_code "sibling requires block target" "invalid-options"
         (Add.build_add_block_action
            { base_opts with pos = Some Block.Sibling }
-           []
+           Vec.empty
            (Cli_primitive.create_repo "demo"));
       expect_error_code "blocks cannot combine metadata" "invalid-options"
         (Add.build_add_block_action
            {
              base_opts with
-             blocks_edn = Some "[\"Block\"]";
+             blocks_markdown = Some "[\"Block\"]";
              tags_edn = Some "[\"Project\"]";
            }
-           []
+           Vec.empty
            (Cli_primitive.create_repo "demo"));
       expect_error_code "invalid status" "invalid-options"
         (Add.build_add_block_action
            { base_opts with status = Some "wat" }
-           []
+           Vec.empty
            (Cli_primitive.create_repo "demo"));
       let action =
         expect_ok "add action"
@@ -3134,7 +4123,7 @@ let () =
                     \"00000000-0000-4000-8000-000000000601\" 701]";
                properties_edn = Some "{\"Correct Answer\" \"42\" 801 true}";
              }
-             []
+             Vec.empty
              (Cli_primitive.create_repo "demo"))
       in
       expect_equal "repo" "logseq_db_demo" (repo_text action.repo);
@@ -3142,45 +4131,111 @@ let () =
       expect_bool "default position" true (action.pos = Block.Last_child);
       expect_equal "normalized status" "logseq.property/status.doing"
         (keyword_text (expect_some "status" action.status));
-      expect_int "tag selectors" 4 (List.length action.tags);
-      expect_int "property assignments" 2 (List.length action.properties);
-      expect_int "block count" 1 (List.length action.blocks);
+      expect_int "tag selectors" 4 (Vec.length action.tags);
+      expect_int "property assignments" 2 (Vec.length action.properties);
+      expect_int "block count" 1 (Vec.length action.blocks);
       expect_equal "content block" "Hello from add"
-        (expect_some "block title" (List.hd action.blocks).title);
-      ignore (expect_some "generated uuid" (List.hd action.blocks).uuid));
+        (expect_some "block title" (Vec.peek_front action.blocks).title);
+      ignore (expect_some "generated uuid" (Vec.peek_front action.blocks).uuid));
 
   test "CLI parity add metadata ops apply status tags and properties by uuid"
     (fun () ->
       let ops =
         Add.metadata_ops
-          [
-            "00000000-0000-4000-8000-000000000701";
-            "00000000-0000-4000-8000-000000000702";
-          ]
+          (Vec.of_array
+             [|
+               "00000000-0000-4000-8000-000000000701";
+               "00000000-0000-4000-8000-000000000702";
+             |])
           (Some (Edn_util.keyword_t "logseq.property/status.todo"))
-          [
-            Entity.of_value
-              (Edn_util.map [ (Edn_util.keyword "db/id", Edn_util.int64 901L) ]);
-            Entity.of_value
-              (Edn_util.map [ (Edn_util.keyword "db/id", Edn_util.int64 901L) ]);
-          ]
-          [
-            {
-              Property.key =
-                Property.Key_ident
-                  (Edn_util.keyword_t "user.property/root-answer");
-              value = Edn_util.string "root";
-            };
-          ]
+          (Vec.of_array
+             [|
+               Entity.of_value
+                 (Edn_util.map_vec
+                    (Vec.singleton
+                       (Edn_util.keyword "db/id", Edn_util.int64 901L)));
+               Entity.of_value
+                 (Edn_util.map_vec
+                    (Vec.singleton
+                       (Edn_util.keyword "db/id", Edn_util.int64 901L)));
+             |])
+          (Vec.of_array
+             [|
+               {
+                 Property.key =
+                   Property.Key_ident
+                     (Edn_util.keyword_t "user.property/root-answer");
+                 value = Edn_util.string "root";
+               };
+             |])
       in
-      expect_int "metadata ops count" 3 (List.length ops);
+      expect_int "metadata ops count" 3 (Vec.length ops);
       let output =
-        String.concat "\n" (List.map Melange_edn.to_edn_string ops)
+        Vec.string_concat "\n" (Vec.map Melange_edn_melange.to_edn_string ops)
       in
       expect_named_contains "status op" output ":logseq.property/status.todo";
       expect_named_contains "tag op" output ":block/tags 901";
       expect_named_contains "property op" output
         ":user.property/root-answer \"root\"");
+
+  test_promise
+    "CLI parity add reports target-not-found when concurrent delete removes \
+     insert target" (fun () ->
+      let pull_count = ref 0 in
+      let server =
+        invoke_server (fun body ->
+            if Js.String.includes ~search:"thread-api/pull" body then (
+              incr pull_count;
+              match !pull_count with
+              | 1 ->
+                  "[\"^ \
+                   \",\"~:db/id\",627,\"~:block/uuid\",\"~u00000000-0000-4000-8000-000000000627\"]"
+              | _ -> "null")
+            else if
+              Js.String.includes ~search:"thread-api/apply-outliner-ops" body
+            then "null"
+            else "null")
+      in
+      with_server server (fun base_url ->
+          let cfg =
+            {
+              (config ~repo:"demo" ()) with
+              Cli_config.base_url = Some base_url;
+            }
+          in
+          let action =
+            expect_ok "add action"
+              (Add.build_add_block_action
+                 {
+                   Add.target_id = Some 627L;
+                   target_uuid = None;
+                   target_page_name = None;
+                   pos = Some Block.First_child;
+                   status = None;
+                   tags_edn = None;
+                   properties_edn = None;
+                   content = Some "Child";
+                   blocks_markdown = None;
+                   blocks_file = None;
+                 }
+                 Vec.empty
+                 (Cli_primitive.create_repo "demo"))
+          in
+          let* result =
+            effect_to_promise
+              (Add.execute_add_block ~extra_ops:Vec.empty action
+                 (config_with_output cfg Output.Mode.Human)
+                 Output.Mode.Human)
+          in
+          expect_bool "add result is error" true (Cli_result.is_error result);
+          (match result.Cli_result.error with
+          | Some err ->
+              expect_equal "add concurrent target delete code"
+                "target-not-found"
+                (Error.code_to_string err.Error.code)
+          | None -> fail_test "expected add error");
+          expect_int "target was rechecked" 3 !pull_count;
+          Js.Promise.resolve pass));
 
   test "CLI parity update build action validates property and tag edn"
     (fun () ->
@@ -3198,7 +4253,7 @@ let () =
           update_properties_edn = None;
           remove_tags_edn = None;
           remove_properties_edn = None;
-          blocks_edn = None;
+          blocks_markdown = None;
           blocks_file = None;
         }
       in
@@ -3245,11 +4300,18 @@ let () =
         (expect_some "source label" action.source_label);
       expect_equal "target label" "page:Archive"
         (expect_some "target label" action.target_label);
-      expect_int "update tags" 1 (List.length action.update_tags);
-      expect_int "remove tags" 1 (List.length action.remove_tags);
+      expect_int "update tags" 1 (Vec.length action.update_tags);
+      expect_int "remove tags" 1 (Vec.length action.remove_tags);
       expect_int "update properties include status" 2
-        (List.length action.update_properties);
-      expect_int "remove properties" 1 (List.length action.remove_properties));
+        (Vec.length action.update_properties);
+      expect_int "remove properties" 1 (Vec.length action.remove_properties));
+
+  test "CLI parity update tag query uses datascript find syntax" (fun () ->
+      let query =
+        Melange_edn_melange.to_edn_string (Update.tag_query Update.tag_selector)
+      in
+      expect_named_contains "find" query ":find";
+      expect_named_contains "tag class" query "logseq.class/Tag");
 
   test "CLI parity sync config key parser accepts ws-url and http-base only"
     (fun () ->
@@ -3523,7 +4585,7 @@ let () =
           (match result.Cli_result.error with
           | Some err ->
               expect_equal "sync not started code" "sync-not-started"
-                (keyword_text err.Error.code);
+                (Error.code_to_string err.Error.code);
               expect_equal "sync start hint"
                 "Run logseq sync start --graph demo first."
                 (expect_some "sync hint" err.hint)
@@ -3585,7 +4647,7 @@ let () =
             (match result.Cli_result.error with
             | Some err ->
                 expect_equal (label ^ " code") expected_code
-                  (keyword_text err.Error.code)
+                  (Error.code_to_string err.Error.code)
             | None -> fail_test (label ^ ": expected error"));
             expect_bool (label ^ " no request") false !request_called;
             Js.Promise.resolve pass)
@@ -3655,9 +4717,10 @@ let () =
       expect_error_code "db/id datom" ":invalid-query"
         (Query.validate_query invalid);
       expect_error_code "non vector query" ":invalid-options"
-        (Query.validate_query (Edn_util.map [])));
+        (Query.validate_query (Edn_util.map_vec Vec.empty)));
 
-  test "CLI parity datascript query primitive serializes query clauses" (fun () ->
+  test "CLI parity datascript query primitive serializes query clauses"
+    (fun () ->
       let title_clause =
         Edn_util.vector_t
           [
@@ -3683,32 +4746,47 @@ let () =
           ]
       in
       let edn query =
-        Melange_edn.to_edn_string
+        Melange_edn_melange.to_edn_string
           (Edn_util.any (Cli_primitive.datascript_query_to_edn query))
       in
       let without_inputs =
-        Cli_primitive.make_datascript_query ~find:[ Edn_util.symbol "?b" ]
-          ~where:[ Cli_primitive.V title_clause ] ()
+        Cli_primitive.make_datascript_query
+          ~find:(Vec.singleton (Edn_util.symbol "?b"))
+          ~where:(Vec.singleton (Cli_primitive.V title_clause))
+          ()
       in
       expect_equal "datascript query without inputs"
         "[:find ?b :where [?b :block/title ?title]]" (edn without_inputs);
       let with_inputs =
-        Cli_primitive.make_datascript_query ~find:[ Edn_util.symbol "?b" ]
-          ~in_:[ Melange_edn.symbol "$"; Melange_edn.symbol "?title" ]
-          ~where:[ Cli_primitive.V title_clause ] ()
+        Cli_primitive.make_datascript_query
+          ~find:(Vec.singleton (Edn_util.symbol "?b"))
+          ~in_:
+            (Vec.of_array
+               [|
+                 Melange_edn_melange.symbol "$";
+                 Melange_edn_melange.symbol "?title";
+               |])
+          ~where:(Vec.singleton (Cli_primitive.V title_clause))
+          ()
       in
       expect_equal "datascript query with inputs"
         "[:find ?b :in $ ?title :where [?b :block/title ?title]]"
         (edn with_inputs);
       let with_empty_inputs =
-        Cli_primitive.make_datascript_query ~find:[ Edn_util.symbol "?b" ]
-          ~in_:[] ~where:[ Cli_primitive.V title_clause ] ()
+        Cli_primitive.make_datascript_query
+          ~find:(Vec.singleton (Edn_util.symbol "?b"))
+          ~in_:Vec.empty
+          ~where:(Vec.singleton (Cli_primitive.V title_clause))
+          ()
       in
       expect_equal "datascript query with empty inputs"
         "[:find ?b :where [?b :block/title ?title]]" (edn with_empty_inputs);
       let with_multiple_clauses =
-        Cli_primitive.make_datascript_query ~find:[ Edn_util.symbol "?b" ]
-          ~where:[ Cli_primitive.V title_clause; Cli_primitive.V page_clause ]
+        Cli_primitive.make_datascript_query
+          ~find:(Vec.singleton (Edn_util.symbol "?b"))
+          ~where:
+            (Vec.of_array
+               [| Cli_primitive.V title_clause; Cli_primitive.V page_clause |])
           ()
       in
       expect_equal "datascript query with multiple where clauses"
@@ -3716,16 +4794,18 @@ let () =
         (edn with_multiple_clauses);
       let with_list_clause =
         Cli_primitive.make_datascript_query
-          ~find:[ Edn_util.symbol "?b"; Edn_util.symbol "?title" ]
+          ~find:
+            (Vec.of_array [| Edn_util.symbol "?b"; Edn_util.symbol "?title" |])
           ~where:
-            [
-              Cli_primitive.V title_clause;
-              Cli_primitive.L predicate_clause;
-            ]
+            (Vec.of_array
+               [|
+                 Cli_primitive.V title_clause; Cli_primitive.L predicate_clause;
+               |])
           ()
       in
       expect_equal "datascript query with list where clause"
-        "[:find ?b ?title :where [?b :block/title ?title] (clojure.string/includes? ?title ?query)]"
+        "[:find ?b ?title :where [?b :block/title ?title] \
+         (clojure.string/includes? ?title ?query)]"
         (edn with_list_clause));
 
   test
@@ -3737,43 +4817,51 @@ let () =
           source = Query.Custom;
           doc = None;
           inputs =
-            [
-              { name = "?required"; optional = false; default = None };
-              {
-                name = "?optional";
-                optional = true;
-                default = Some (Edn_util.string "fallback");
-              };
-            ];
-          query = Edn_util.vector [];
+            Vec.of_array
+              [|
+                ({ name = "?required"; optional = false; default = None }
+                  : Query.input_spec);
+                ({
+                   name = "?optional";
+                   optional = true;
+                   default = Some (Edn_util.string "fallback");
+                 }
+                  : Query.input_spec);
+              |];
+          query = Edn_util.vector_vec Vec.empty;
         }
       in
       expect_error_code "missing required input" ":invalid-options"
-        (Query.normalize_inputs (Some entry) []);
+        (Query.normalize_inputs (Some entry) Vec.empty);
       let inputs =
         expect_ok "normalize inputs"
-          (Query.normalize_inputs (Some entry) [ Edn_util.string "value" ])
+          (Query.normalize_inputs (Some entry)
+             (Vec.singleton (Edn_util.string "value")))
       in
-      expect_int "input count" 2 (List.length inputs);
+      expect_int "input count" 2 (Vec.length inputs);
       expect_equal "default input" "fallback"
-        (expect_some "default" (Edn_util.as_string (List.nth inputs 1)));
+        (expect_some "default" (Edn_util.as_string (Vec.nth inputs 1)));
       let padded =
         {
           entry with
           Query.name = "padded";
           inputs =
-            [
-              { name = "required"; optional = false; default = None };
-              { name = "?optional"; optional = true; default = None };
-            ];
+            Vec.of_array
+              [|
+                ({ name = "required"; optional = false; default = None }
+                  : Query.input_spec);
+                ({ name = "?optional"; optional = true; default = None }
+                  : Query.input_spec);
+              |];
         }
       in
       let padded_inputs =
         expect_ok "pad optional input"
-          (Query.normalize_inputs (Some padded) [ Edn_util.string "value" ])
+          (Query.normalize_inputs (Some padded)
+             (Vec.singleton (Edn_util.string "value")))
       in
       expect_bool "optional input pads nil" true
-        (Edn_util.is_null (List.nth padded_inputs 1));
+        (Edn_util.is_null (Vec.nth padded_inputs 1));
       let task_search =
         expect_some "task-search entry"
           (Query.find_query (config ()) "task-search")
@@ -3781,20 +4869,20 @@ let () =
       let task_inputs =
         expect_ok "task-search defaults"
           (Query.normalize_inputs (Some task_search)
-             [ Edn_util.string "doing" ])
+             (Vec.singleton (Edn_util.string "doing")))
       in
       expect_equal "task status keyword" "logseq.property/status.doing"
         (expect_some "status keyword"
-           (Edn_util.as_keyword (List.nth task_inputs 0)));
+           (Edn_util.as_keyword (Vec.nth task_inputs 0)));
       expect_equal "task title default" ""
         (expect_some "title default"
-           (Edn_util.as_string (List.nth task_inputs 1)));
+           (Edn_util.as_string (Vec.nth task_inputs 1)));
       expect_int "task recent-days default" 0
         (expect_some "recent-days default"
-           (Edn_util.as_int (List.nth task_inputs 2)));
+           (Edn_util.as_int (Vec.nth task_inputs 2)));
       ignore
         (expect_some "task now-ms default"
-           (Edn_util.as_int64 (List.nth task_inputs 3))));
+           (Edn_util.as_int64 (Vec.nth task_inputs 3))));
 
   test "CLI parity query build action parses query inputs and named queries"
     (fun () ->
@@ -3817,10 +4905,10 @@ let () =
           expect_equal "query graph" "demo"
             (Cli_primitive.string_of_graph graph);
           ignore (expect_ok "built query valid" (Query.validate_query query));
-          expect_int "query inputs length" 1 (List.length inputs);
+          expect_int "query inputs length" 1 (Vec.length inputs);
           expect_equal "query input" "Hello"
             (expect_some "query input string"
-               (Edn_util.as_string (List.hd inputs)));
+               (Edn_util.as_string (Vec.peek_front inputs)));
           expect_none "query name none" name
       | Query.List -> fail_test "expected query run");
       expect_error_code "query invalid edn" "invalid-options"
@@ -3881,7 +4969,8 @@ let () =
                       [
                         (Edn_util.keyword "doc", Edn_util.string "Custom query");
                         ( Edn_util.keyword "inputs",
-                          Edn_util.vector [ Edn_util.string "title" ] );
+                          Edn_util.vector_vec
+                            (Vec.singleton (Edn_util.string "title")) );
                         ( Edn_util.keyword "query",
                           edn_of_string
                             "[:find ?e :in $ ?title :where [?e :block/title \
@@ -3908,11 +4997,13 @@ let () =
             (expect_some "named query name" name);
           expect_equal "named query input" "Alpha"
             (expect_some "named query input"
-               (Edn_util.as_string (List.hd inputs)))
+               (Edn_util.as_string (Vec.peek_front inputs)))
       | Query.List -> fail_test "expected named query run");
       expect_error_code "unknown named query" "unknown-query"
         (Query.build
-           (config ~repo:"demo" ~raw_file_config:(Edn_util.map []) ())
+           (config ~repo:"demo"
+              ~raw_file_config:(Edn_util.map_vec Vec.empty)
+              ())
            (Global_opts.create ())
            (Query.Parsed_run
               { query_edn = None; name = Some "missing"; inputs_edn = None }));
@@ -3998,18 +5089,18 @@ let () =
         Query.list_queries (config ~raw_file_config:raw_config ())
       in
       let names =
-        List.map (fun (entry : Query.query_entry) -> entry.name) queries
+        Vec.map (fun (entry : Query.query_entry) -> entry.name) queries
       in
       expect_bool "task-search built-in listed" true
-        (List.mem "task-search" names);
+        (Vec.mem "task-search" names);
       expect_bool "list-status built-in listed" true
-        (List.mem "list-status" names);
+        (Vec.mem "list-status" names);
       expect_bool "list-priority built-in listed" true
-        (List.mem "list-priority" names);
-      expect_bool "custom query listed" true (List.mem "custom-q" names);
+        (Vec.mem "list-priority" names);
+      expect_bool "custom query listed" true (Vec.mem "custom-q" names);
       let block_search =
         expect_some "block-search override"
-          (List.find_opt
+          (Vec.find_opt
              (fun (entry : Query.query_entry) -> entry.name = "block-search")
              queries)
       in
@@ -4017,23 +5108,23 @@ let () =
         (block_search.source = Query.Custom);
       let list_status =
         expect_some "list-status"
-          (List.find_opt
+          (Vec.find_opt
              (fun (entry : Query.query_entry) -> entry.name = "list-status")
              queries)
       in
-      expect_int "list-status inputs" 0 (List.length list_status.inputs);
-      let status_query = Melange_edn.to_edn_string list_status.query in
+      expect_int "list-status inputs" 0 (Vec.length list_status.inputs);
+      let status_query = Melange_edn_melange.to_edn_string list_status.query in
       expect_named_contains "list-status query status keyword" status_query
         ":logseq.property/status";
       let list_priority =
         expect_some "list-priority"
-          (List.find_opt
+          (Vec.find_opt
              (fun (entry : Query.query_entry) -> entry.name = "list-priority")
              queries)
       in
-      expect_int "list-priority inputs" 0 (List.length list_priority.inputs);
+      expect_int "list-priority inputs" 0 (Vec.length list_priority.inputs);
       expect_named_contains "list-priority query priority keyword"
-        (Melange_edn.to_edn_string list_priority.query)
+        (Melange_edn_melange.to_edn_string list_priority.query)
         ":logseq.property/priority");
 
   test "CLI parity debug selector requires exactly one id uuid or ident"
@@ -4073,7 +5164,7 @@ let () =
           | Debug.By_id 42L -> pass
           | _ -> fail_test "expected debug id lookup");
           expect_equal "debug selector" "[*]"
-            (Melange_edn.to_edn_string selector));
+            (Melange_edn_melange.to_edn_string selector));
       let ident =
         expect_ok "debug ident option"
           (Debug.parse_ident_option ":logseq.class/Tag")
@@ -4105,8 +5196,7 @@ let () =
         (Edn_util.keyword_to_string missing.id);
       expect_bool "doctor missing status" true (missing.status = Doctor.Error);
       expect_equal "doctor missing code" "doctor-script-missing"
-        (Edn_util.keyword_to_string
-           (expect_some "missing script code" missing.code));
+        (Error.code_to_string (expect_some "missing script code" missing.code));
       expect_equal "doctor missing path" missing_path
         (expect_some "missing script path" missing.path);
       let root = temp_dir "logseq-cli-parity-doctor-" in
@@ -4155,103 +5245,134 @@ let () =
       expect_bool "login does not require auth" false
         (Command_id.requires_auth Command_id.Login));
 
+  test "CLI parity command lookup compares path contents" (fun () ->
+      let registry = (Cli.make_app_context ()).Cli.registry in
+      let path = Vec.push_front (Vec.singleton "list") "graph" in
+      let command =
+        expect_some "graph list command"
+          (Command_registry.find_by_path path registry)
+      in
+      expect_equal "graph list command id" "graph-list"
+        (Command_id.to_string command.id));
+
+  test "CLI parity example lookup compares selector contents" (fun () ->
+      let selector = Vec.push_front (Vec.singleton "list") "graph" in
+      let action =
+        expect_ok "graph list examples"
+          (Example.resolve_selector Command_registry.empty selector)
+      in
+      expect_equal "graph list selector" "graph list" action.selector;
+      expect_named_contains "graph list example"
+        (Vec.peek_front action.examples)
+        "logseq graph list");
+
   test "CLI parity example selector returns matched commands and examples"
     (fun () ->
       let registry =
         Command_registry.make
-          [
-            {
-              Command_registry.id = Command_id.Graph_list;
-              path = [ "graph"; "list" ];
-              doc = "List graphs";
-              long_doc = None;
-              examples = [ "logseq graph list" ];
-              options = [];
-              category = Command_registry.Graph_management;
-              requires_graph = false;
-              requires_auth = false;
-              write_command = false;
-            };
-            {
-              id = Command_id.Graph_create;
-              path = [ "graph"; "create" ];
-              doc = "Create graph";
-              long_doc = None;
-              examples = [ "logseq graph create --graph demo" ];
-              options = [];
-              category = Graph_management;
-              requires_graph = true;
-              requires_auth = false;
-              write_command = true;
-            };
-          ]
+          (Vec.of_array
+             [|
+               {
+                 Command_registry.id = Command_id.Graph_list;
+                 path = Vec.of_array [| "graph"; "list" |];
+                 doc = "List graphs";
+                 long_doc = None;
+                 examples = Vec.singleton "logseq graph list";
+                 options = Vec.empty;
+                 category = Command_registry.Graph_management;
+                 requires_graph = false;
+                 requires_auth = false;
+                 write_command = false;
+                 human_table_headers_order = Vec.empty;
+               };
+               {
+                 id = Command_id.Graph_create;
+                 path = Vec.of_array [| "graph"; "create" |];
+                 doc = "Create graph";
+                 long_doc = None;
+                 examples = Vec.singleton "logseq graph create --graph demo";
+                 options = Vec.empty;
+                 category = Graph_management;
+                 requires_graph = true;
+                 requires_auth = false;
+                 write_command = true;
+                 human_table_headers_order = Vec.empty;
+               };
+             |])
       in
       let action =
         expect_ok "graph examples"
-          (Example.resolve_selector registry [ "graph" ])
+          (Example.resolve_selector registry (Vec.singleton "graph"))
       in
       expect_equal "selector" "graph" action.selector;
-      expect_int "matched commands" 2 (List.length action.matched_commands);
-      expect_int "examples" 2 (List.length action.examples);
+      expect_int "matched commands" 2 (Vec.length action.matched_commands);
+      expect_int "examples" 2 (Vec.length action.examples);
       expect_error_code "unknown selector" ":unknown-command"
-        (Example.resolve_selector registry [ "sync" ]));
+        (Example.resolve_selector registry (Vec.singleton "sync")));
 
   test "CLI parity example selector reports missing and large example counts"
     (fun () ->
       let registry =
         Command_registry.make
-          [
-            {
-              Command_registry.id = Command_id.Upsert_page;
-              path = [ "upsert"; "page" ];
-              doc = "Upsert page";
-              long_doc = None;
-              examples = [ "logseq upsert page --graph demo --page Home" ];
-              options = [];
-              category = Graph_inspect_and_edit;
-              requires_graph = true;
-              requires_auth = false;
-              write_command = true;
-            };
-            {
-              id = Command_id.Upsert_tag;
-              path = [ "upsert"; "tag" ];
-              doc = "Upsert tag";
-              long_doc = None;
-              examples = [];
-              options = [];
-              category = Graph_inspect_and_edit;
-              requires_graph = true;
-              requires_auth = false;
-              write_command = true;
-            };
-          ]
+          (Vec.of_array
+             [|
+               {
+                 Command_registry.id = Command_id.Upsert_page;
+                 path = Vec.of_array [| "upsert"; "page" |];
+                 doc = "Upsert page";
+                 long_doc = None;
+                 examples =
+                   Vec.singleton "logseq upsert page --graph demo --page Home";
+                 options = Vec.empty;
+                 category = Graph_inspect_and_edit;
+                 requires_graph = true;
+                 requires_auth = false;
+                 write_command = true;
+                 human_table_headers_order = Vec.empty;
+               };
+               {
+                 id = Command_id.Upsert_tag;
+                 path = Vec.of_array [| "upsert"; "tag" |];
+                 doc = "Upsert tag";
+                 long_doc = None;
+                 examples = Vec.empty;
+                 options = Vec.empty;
+                 category = Graph_inspect_and_edit;
+                 requires_graph = true;
+                 requires_auth = false;
+                 write_command = true;
+                 human_table_headers_order = Vec.empty;
+               };
+             |])
       in
       expect_error_code "missing examples" "missing-examples"
-        (Example.resolve_selector registry [ "upsert" ]);
+        (Example.resolve_selector registry (Vec.singleton "upsert"));
       let large_registry =
         Command_registry.make
-          [
-            {
-              Command_registry.id = Command_id.Upsert_page;
-              path = [ "upsert"; "page" ];
-              doc = "Upsert page";
-              long_doc = None;
-              examples =
-                List.init 1234 (fun index ->
-                    "logseq upsert page --graph demo --page Page-"
-                    ^ string_of_int index);
-              options = [];
-              category = Graph_inspect_and_edit;
-              requires_graph = true;
-              requires_auth = false;
-              write_command = true;
-            };
-          ]
+          (Vec.of_array
+             [|
+               {
+                 Command_registry.id = Command_id.Upsert_page;
+                 path = Vec.of_array [| "upsert"; "page" |];
+                 doc = "Upsert page";
+                 long_doc = None;
+                 examples =
+                   Vec.init 1234 (fun index ->
+                       "logseq upsert page --graph demo --page Page-"
+                       ^ string_of_int index);
+                 options = Vec.empty;
+                 category = Graph_inspect_and_edit;
+                 requires_graph = true;
+                 requires_auth = false;
+                 write_command = true;
+                 human_table_headers_order = Vec.empty;
+               };
+             |])
       in
       let action =
         expect_ok "large example count"
-          (Example.resolve_selector large_registry [ "upsert"; "page" ])
+          (Example.resolve_selector large_registry
+             (Vec.of_array [| "upsert"; "page" |]))
       in
       expect_equal "large example message"
         "Found 1,234 examples for selector upsert page" action.message);
@@ -4259,23 +5380,24 @@ let () =
   test "CLI parity task status normalization resolves available statuses"
     (fun () ->
       let values =
-        [
-          Edn_util.map
-            [
-              ( Edn_util.keyword "ident",
-                Edn_util.keyword "logseq.property/status.todo" );
-              (Edn_util.keyword "value", Edn_util.string "Todo");
-            ];
-          Edn_util.map
-            [
-              ( Edn_util.keyword "ident",
-                Edn_util.keyword "logseq.property/status.done" );
-              (Edn_util.keyword "value", Edn_util.string "Done");
-            ];
-        ]
+        Vec.of_array
+          [|
+            Edn_util.map
+              [
+                ( Edn_util.keyword "ident",
+                  Edn_util.keyword "logseq.property/status.todo" );
+                (Edn_util.keyword "value", Edn_util.string "Todo");
+              ];
+            Edn_util.map
+              [
+                ( Edn_util.keyword "ident",
+                  Edn_util.keyword "logseq.property/status.done" );
+                (Edn_util.keyword "value", Edn_util.string "Done");
+              ];
+          |]
       in
       let statuses = Task_status.normalize_available_statuses values in
-      expect_int "status count" 2 (List.length statuses);
+      expect_int "status count" 2 (Vec.length statuses);
       expect_bool "resolve todo" true
         (Option.is_some (Task_status.resolve_status_ident "todo" statuses));
       expect_named_contains "invalid status message"
@@ -4299,7 +5421,7 @@ let () =
     (fun () ->
       let backup =
         expect_parse_ok "backup restore"
-          [
+          [|
             "graph";
             "backup";
             "restore";
@@ -4307,7 +5429,7 @@ let () =
             "demo-nightly";
             "--dst";
             "demo-restored";
-          ]
+          |]
       in
       (match backup.command with
       | Cli_request.Graph (Graph.Parsed_backup_restore opts) ->
@@ -4317,7 +5439,7 @@ let () =
       | _ -> fail_test "expected backup restore");
       let export =
         expect_parse_ok "graph export"
-          [
+          [|
             "graph";
             "export";
             "--type";
@@ -4325,9 +5447,10 @@ let () =
             "--file";
             "/tmp/export.edn";
             "--edn-options";
-            "{:export-type :graph :include-timestamps? true}";
+            "{:export-type :graph-human :graph-options {:include-timestamps? \
+             true}}";
             "--pretty-print";
-          ]
+          |]
       in
       (match export.command with
       | Cli_request.Graph (Graph.Parsed_export opts) ->
@@ -4339,7 +5462,7 @@ let () =
       | _ -> fail_test "expected graph export");
       let export_aliases =
         expect_parse_ok "graph export aliases"
-          [
+          [|
             "graph";
             "export";
             "-t";
@@ -4349,7 +5472,7 @@ let () =
             "-e";
             "{:export-type :graph}";
             "-p";
-          ]
+          |]
       in
       (match export_aliases.command with
       | Cli_request.Graph (Graph.Parsed_export opts) ->
@@ -4357,12 +5480,12 @@ let () =
           expect_bool "export alias pretty" true opts.pretty_print;
           expect_some "export alias edn options" opts.edn_options |> ignore
       | _ -> fail_test "expected graph export");
-      List.iter
+      Vec.iter
         (fun flag ->
           expect_parse_error_code
             ("retired export option " ^ flag)
             ":invalid-options"
-            [
+            [|
               "graph";
               "export";
               "--type";
@@ -4370,11 +5493,11 @@ let () =
               "--file";
               "/tmp/export.edn";
               flag;
-            ])
-        [ "--include-timestamps"; "--exclude-built-in-pages" ];
+            |])
+        (Vec.of_array [| "--include-timestamps"; "--exclude-built-in-pages" |]);
       expect_parse_error_code "retired export option --exclude-namespaces"
         ":invalid-options"
-        [
+        [|
           "graph";
           "export";
           "--type";
@@ -4383,11 +5506,11 @@ let () =
           "/tmp/export.edn";
           "--exclude-namespaces";
           "journal";
-        ];
+        |];
       expect_parse_error_code "missing backup src" ":invalid-options"
-        [ "graph"; "backup"; "restore"; "--dst"; "demo" ];
+        [| "graph"; "backup"; "restore"; "--dst"; "demo" |];
       expect_parse_error_code "bad sync config key" ":invalid-options"
-        [ "sync"; "config"; "get"; "--key"; "graph" ]);
+        [| "sync"; "config"; "get"; "--key"; "graph" |]);
 
   test "CLI parity graph build validates graph selection and export contracts"
     (fun () ->
@@ -4401,7 +5524,7 @@ let () =
         (Graph.build (config ()) globals
            (Graph.Parsed_create
               { enable_sync = false; e2ee_password = Some "pw" }));
-      List.iter
+      Vec.iter
         (fun graph_name ->
           expect_error_code
             ("reject graph name " ^ graph_name)
@@ -4412,7 +5535,7 @@ let () =
                   ())
                (Graph.Parsed_create
                   { enable_sync = false; e2ee_password = None })))
-        [ ""; "   "; "."; " .. " ];
+        (Vec.of_array [| ""; "   "; "."; " .. " |]);
       let create =
         expect_ok "graph create build"
           (Graph.build (config ()) globals
@@ -4437,7 +5560,7 @@ let () =
                 pretty_print = false;
                 include_timestamps = false;
                 exclude_built_in_pages = false;
-                exclude_namespaces = [];
+                exclude_namespaces = Vec.empty;
               }));
       expect_error_code "sqlite rejects edn options" "invalid-options"
         (Graph.build (config ~graph:"demo" ()) (Global_opts.create ())
@@ -4445,11 +5568,11 @@ let () =
               {
                 export_type = Graph.Sqlite;
                 file = Some "/tmp/demo.sqlite";
-                edn_options = Some (Edn_util.map []);
+                edn_options = Some (Edn_util.map_vec Vec.empty);
                 pretty_print = false;
                 include_timestamps = false;
                 exclude_built_in_pages = false;
-                exclude_namespaces = [];
+                exclude_namespaces = Vec.empty;
               }));
       expect_error_code "export edn options must be map" "invalid-options"
         (Graph.build (config ~graph:"demo" ()) (Global_opts.create ())
@@ -4457,11 +5580,11 @@ let () =
               {
                 export_type = Graph.Edn;
                 file = Some "/tmp/demo.edn";
-                edn_options = Some (Edn_util.vector []);
+                edn_options = Some (Edn_util.vector_vec Vec.empty);
                 pretty_print = false;
                 include_timestamps = false;
                 exclude_built_in_pages = false;
-                exclude_namespaces = [];
+                exclude_namespaces = Vec.empty;
               }));
       let export =
         expect_ok "export edn build"
@@ -4473,11 +5596,12 @@ let () =
                   edn_options =
                     Some
                       (edn_of_string
-                         "{:export-type :graph :include-timestamps? true}");
+                         "{:export-type :graph-human :graph-options \
+                          {:include-timestamps? true}}");
                   pretty_print = true;
                   include_timestamps = false;
                   exclude_built_in_pages = false;
-                  exclude_namespaces = [];
+                  exclude_namespaces = Vec.empty;
                 }))
       in
       match export with
@@ -4490,6 +5614,297 @@ let () =
           expect_bool "export pretty" true opts.pretty_print;
           expect_some "export edn options" opts.edn_options |> ignore
       | _ -> fail_test "expected Graph_export action");
+
+  let build_edn_export options =
+    let request =
+      expect_parse_ok "EDN export request"
+        [|
+          "graph";
+          "export";
+          "--type";
+          "edn";
+          "--file";
+          "/tmp/export.edn";
+          "--edn-options";
+          options;
+        |]
+    in
+    effect_result "build export"
+      (Cli_action.build (config ~graph:"demo" ()) request)
+  in
+  let invalid_edn_export options fragments =
+    test ("CLI parity EDN export rejects " ^ options) (fun () ->
+        match build_edn_export options with
+        | Ok _ -> fail_test "expected invalid-options before worker setup"
+        | Error err ->
+            expect_equal "error code" "invalid-options"
+              (Error.code_to_string err.Error.code);
+            List.iter
+              (expect_named_contains "actionable diagnostic" err.message)
+              fragments)
+  in
+  List.iter
+    (fun (options, fragments) -> invalid_edn_export options fragments)
+    [
+      ( "{:export-type :graph-human :include-timestamps? true}",
+        [
+          ":include-timestamps?";
+          "{:export-type :graph-human :graph-options {:include-timestamps? \
+           true}}";
+        ] );
+      ( "{:export-type :graph-human :include-timestamps? false :graph-options \
+         {:include-timestamps? true}}",
+        [ ":include-timestamps?" ] );
+      ( "{:no-such-option true}",
+        [ ":no-such-option"; "Allowed keys"; ":graph-options" ] );
+      ( "{:export-type :graph-human :graph-options {:no-such-option true}}",
+        [
+          "[:graph-options :no-such-option]";
+          "Allowed keys";
+          ":include-timestamps?";
+        ] );
+      ("{\"export-type\" :graph-human}", [ "\"export-type\"" ]);
+      ( "{:export-type :graph-human :graph-options {\"include-timestamps?\" \
+         true}}",
+        [ "[:graph-options \"include-timestamps?\"]" ] );
+      ("{1 true}", [ "1"; "Allowed keys" ]);
+      ("{:export-type :other}", [ ":export-type"; ":graph-human" ]);
+      ("{:export-type nil}", [ ":export-type" ]);
+      ("{:export-type \"graph-human\"}", [ ":export-type" ]);
+      ( "{:graph-options {:graph-options {}}}",
+        [ "[:graph-options :graph-options]"; "top level" ] );
+      ("{:graph-options nil}", [ ":graph-options"; "map" ]);
+      ("{:graph-options []}", [ ":graph-options"; "map" ]);
+      ("{:block-id 42}", [ ":block-id"; ":block" ]);
+      ("{:export-type :block :block-id 42 :page-id 1}", [ ":page-id"; ":page" ]);
+      ( "{:graph-options {:include-timestamps? false}}",
+        [ "[:graph-options :include-timestamps?]"; ":graph-human"; ":graph" ] );
+      ( "{:export-type :graph-human :graph-options {:catch-validation-errors? \
+         true :typo true}}",
+        [ "[:graph-options :typo]" ] );
+      ( "{:export-type :view-nodes :rows [] :group-by? nil}",
+        [ ":group-by?"; "boolean" ] );
+      ( "{:export-type :view-nodes :rows [] :group-by? 1}",
+        [ ":group-by?"; "boolean" ] );
+      ("{:export-type :block}", [ ":block-id"; "required" ]);
+      ("{:export-type :page}", [ ":page-id"; "required" ]);
+      ("{:export-type :selected-nodes}", [ ":node-ids"; "required" ]);
+      ("{:export-type :view-nodes}", [ ":rows"; "required" ]);
+      ("{:export-type :block :block-id nil}", [ ":block-id"; "entity" ]);
+      ("{:export-type :block :block-id true}", [ ":block-id"; "entity" ]);
+      ("{:export-type :page :page-id \"Home\"}", [ ":page-id"; "entity" ]);
+      ("{:export-type :page :page-id [:block/name]}", [ ":page-id"; "lookup" ]);
+      ("{:export-type :page :page-id [42 \"Home\"]}", [ ":page-id"; "lookup" ]);
+      ( "{:export-type :page :page-id #uuid \
+         \"13071000-0000-4000-8000-000000000001\"}",
+        [ ":page-id" ] );
+      ( "{:export-type :selected-nodes :node-ids nil}",
+        [ ":node-ids"; "collection" ] );
+      ( "{:export-type :selected-nodes :node-ids 42}",
+        [ ":node-ids"; "collection" ] );
+      ( "{:export-type :selected-nodes :node-ids {}}",
+        [ ":node-ids"; "collection" ] );
+      ( "{:export-type :selected-nodes :node-ids [nil]}",
+        [ "[:node-ids 0]"; "entity" ] );
+      ( "{:export-type :selected-nodes :node-ids [#uuid \
+         \"13071000-0000-4000-8000-000000000001\"]}",
+        [ "[:node-ids 0]" ] );
+      ("{:export-type :view-nodes :rows nil}", [ ":rows"; "collection" ]);
+      ("{:export-type :view-nodes :rows {}}", [ ":rows"; "collection" ]);
+      ("{:export-type :view-nodes :rows [true]}", [ "[:rows 0]" ]);
+      ( "{:export-type :view-nodes :group-by? true :rows [42]}",
+        [ "[:rows 0]"; "group" ] );
+      ( "{:export-type :view-nodes :group-by? true :rows [[\"label\" [42] \
+         :extra]]}",
+        [ "[:rows 0]" ] );
+      ( "{:export-type :view-nodes :group-by? true :rows {\"label\" nil}}",
+        [ ":rows"; "collection" ] );
+      ( "{:export-type :view-nodes :group-by? true :rows [[nil [false]]]}",
+        [ "[:rows 0 1 0]" ] );
+    ];
+  List.iter
+    (fun key ->
+      invalid_edn_export ("{" ^ key ^ " false}") [ key; ":graph-options" ];
+      List.iter
+        (fun value ->
+          invalid_edn_export
+            ("{:export-type :graph-human :graph-options {" ^ key ^ " " ^ value
+           ^ "}}")
+            [ "[:graph-options " ^ key ^ "]"; "boolean" ])
+        [ "nil"; "1"; "\"false\"" ])
+    [
+      ":include-timestamps?";
+      ":exclude-built-in-pages?";
+      ":exclude-files?";
+      ":catch-validation-errors?";
+    ];
+  List.iter
+    (fun value ->
+      invalid_edn_export
+        ("{:export-type :graph-human :graph-options {:exclude-namespaces "
+       ^ value ^ "}}")
+        [ "[:graph-options :exclude-namespaces]"; "set" ])
+    [ "nil"; "[:schema]"; "#{1}"; "#{nil}"; "\"schema\"" ];
+  List.iter
+    (fun key ->
+      invalid_edn_export
+        ("{:export-type :graph-human :graph-options {" ^ key ^ " true}}")
+        [ "[:graph-options " ^ key ^ "]"; "Allowed keys" ])
+    [ ":include-uuid?"; ":shallow-copy?"; ":include-children?" ];
+  let partial_exports =
+    [
+      (":graph", "");
+      (":graph-ontology", "");
+      (":block", ":block-id 42");
+      (":page", ":page-id 42");
+      (":selected-nodes", ":node-ids []");
+      (":view-nodes", ":rows []");
+    ]
+  in
+  List.iter
+    (fun (kind, selectors) ->
+      List.iter
+        (fun key ->
+          invalid_edn_export
+            ("{:export-type " ^ kind ^ " " ^ selectors ^ " :graph-options {"
+           ^ key ^ " false}}")
+            [ "[:graph-options " ^ key ^ "]"; ":graph-human"; kind ])
+        [
+          ":include-timestamps?";
+          ":exclude-built-in-pages?";
+          ":exclude-files?";
+          ":exclude-namespaces";
+        ])
+    partial_exports;
+  List.iter
+    (fun options ->
+      test ("CLI parity EDN export accepts " ^ options) (fun () ->
+          ignore (expect_ok "valid export" (build_edn_export options))))
+    ([
+       "{}";
+       "{:graph-options {}}";
+       "{:export-type :graph-human :graph-options {:include-timestamps? false \
+        :exclude-files? false :exclude-built-in-pages? false \
+        :catch-validation-errors? false :exclude-namespaces #{:schema \
+        \"user\"}}}";
+       "{:export-type :block :block-id [:block/uuid #uuid \
+        \"13071000-0000-4000-8000-000000000001\"]}";
+       "{:export-type :page :page-id (:block/name \"home\")}";
+       "{:export-type :page :page-id [\"unique-attribute\" {:arbitrary [nil \
+        true]}]}";
+       "{:export-type :page :page-id :logseq.class/Page}";
+       "{:export-type :selected-nodes :node-ids (42 :logseq.class/Page \
+        [:block/name \"home\"])}";
+       "{:export-type :selected-nodes :node-ids #{}}";
+       "{:export-type :view-nodes :rows [#uuid \
+        \"13071000-0000-4000-8000-000000000001\" [:block/name \"home\"]] \
+        :group-by? false}";
+       "{:export-type :view-nodes :rows {nil [42] {:arbitrary-key true} []} \
+        :group-by? true}";
+       "{:export-type :view-nodes :rows [[{:arbitrary-key true} #{42}] [nil \
+        []]] :group-by? true}";
+       "{:export-type :view-nodes :rows {} :group-by? true}";
+     ]
+    @ List.map
+        (fun (kind, selectors) ->
+          "{:export-type " ^ kind ^ " " ^ selectors
+          ^ " :graph-options {:catch-validation-errors? false}}")
+        partial_exports);
+  test "CLI parity EDN export diagnostics have stable key ordering" (fun () ->
+      let message options =
+        match build_edn_export options with
+        | Error err -> err.Error.message
+        | Ok _ ->
+            fail_test "expected invalid export";
+            ""
+      in
+      let first =
+        message "{:z true :a true :graph-options {:z true :a true}}"
+      in
+      expect_named_contains "top-level first key" first ":a";
+      expect_named_contains "top-level second key" first ":z";
+      expect_named_contains "nested first key" first "[:graph-options :a]";
+      expect_named_contains "nested second key" first "[:graph-options :z]";
+      expect_equal "same diagnostics regardless of insertion order" first
+        (message "{:graph-options {:a true :z true} :a true :z true}"));
+  List.iter
+    (fun mode ->
+      test ("CLI parity EDN export rejection protects files in " ^ mode)
+        (fun () ->
+          let root = temp_dir "logseq-edn-validation-" in
+          let file = Node.Path.join [| root; "export.edn" |] in
+          let run () =
+            run_cli_lifecycle
+              [|
+                "--root-dir";
+                root;
+                "--graph";
+                "missing";
+                "--output";
+                mode;
+                "graph";
+                "export";
+                "--type";
+                "edn";
+                "--file";
+                file;
+                "--edn-options";
+                "{:export-type :graph-human :include-timestamps? true}";
+              |]
+          in
+          let missing = run () in
+          expect_int "nonzero exit" 1 missing.exit_code;
+          expect_named_contains "invalid options"
+            (stdout_text "error" missing)
+            "invalid-options";
+          expect_bool "no output created" false (Node.Fs.existsSync file);
+          write_file file "existing export\n";
+          let existing = run () in
+          expect_int "nonzero exit" 1 existing.exit_code;
+          expect_equal "existing output untouched" "existing export\n"
+            (read_file file);
+          expect_bool "worker never creates graph" false
+            (Node.Fs.existsSync
+               (Node.Path.join [| root; "graphs"; "missing" |]));
+          remove_tree root))
+    [ "human"; "json"; "edn" ];
+
+  test_promise "CLI parity EDN export rejects before any worker RPC" (fun () ->
+      let calls = ref 0 in
+      let server =
+        invoke_server (fun _ ->
+            incr calls;
+            "null")
+      in
+      with_server server (fun base_url ->
+          let root = temp_dir "logseq-edn-no-rpc-" in
+          let* result =
+            run_cli_p
+              ~env:[| ("LOGSEQ_CLI_BASE_URL", base_url) |]
+              [|
+                "--root-dir";
+                root;
+                "--graph";
+                "demo";
+                "--output";
+                "json";
+                "graph";
+                "export";
+                "--type";
+                "edn";
+                "--file";
+                Node.Path.join [| root; "export.edn" |];
+                "--edn-options";
+                "{:export-type :graph-human :graph-options \
+                 {:catch-validation-errors? true :typo true}}";
+              |]
+          in
+          remove_tree root;
+          expect_int "no worker RPC" 0 !calls;
+          expect_int "failure exit" 1 result.code;
+          expect_named_contains "invalid options" result.stdout
+            "invalid-options";
+          Js.Promise.resolve pass));
 
   test_promise "CLI parity graph validate result reports ok and error states"
     (fun () ->
@@ -4529,14 +5944,13 @@ let () =
             match invalid.Cli_result.error with
             | Some err ->
                 expect_equal "validation error code" "graph-validation-failed"
-                  (keyword_text err.Error.code);
+                  (Error.code_to_string err.Error.code);
                 expect_named_contains "validation error count" err.message
                   "Found 1 entity with errors:"
             | None -> fail_test "expected graph validation error")
       in
       let* () =
-        run_validate "[\"^ \",\"~:errors\",null,\"~:datom-count\",10]"
-          (fun valid ->
+        run_validate "[\"^ \",\"~:errors\",null,\"~:datoms\",10]" (fun valid ->
             expect_bool "valid graph status" false (Cli_result.is_error valid);
             let data =
               expect_some "validation data" (Cli_result.data_value valid)
@@ -4545,6 +5959,93 @@ let () =
               (Option.is_some (Edn_util.get data "result")))
       in
       Js.Promise.resolve pass);
+
+  test_promise
+    "CLI parity graph validate error includes structured errors context"
+    (fun () ->
+      let server =
+        invoke_server (fun body ->
+            if Js.String.includes ~search:"thread-api/validate-db" body then
+              "[\"^ \",\"~:errors\",[[\"^ \",\"~:entity\",[\"^ \
+               \",\"~:db/id\",1],\"^0\",[\"^ \",\"~:foo\",[\"bad\"]]]]]"
+            else "null")
+      in
+      with_server server (fun base_url ->
+          let repo = Cli_primitive.create_repo "demo" in
+          let action =
+            Graph.Graph_validate
+              { graph = Cli_config.repo_to_graph repo; repo; fix = false }
+          in
+          let cfg =
+            {
+              (config ~repo:"demo" ()) with
+              Cli_config.base_url = Some base_url;
+            }
+          in
+          let* result =
+            effect_to_promise
+              (execute_with_output Graph.execute action cfg Output.Mode.Json)
+          in
+          expect_bool "invalid graph status" true (Cli_result.is_error result);
+          (match result.Cli_result.error with
+          | None -> fail_test "expected graph validation error"
+          | Some err -> (
+              expect_equal "validation error code" "graph-validation-failed"
+                (Error.code_to_string err.Error.code);
+              expect_named_contains "validation error message still has EDN"
+                err.message "Found 1 entity with errors:";
+              match err.Error.context with
+              | None ->
+                  fail_test
+                    "graph_validate_result Error.make should include \
+                     structured context, not only message"
+              | Some context -> (
+                  match
+                    Option.bind (Edn_util.get context "errors") Edn_util.as_seq
+                  with
+                  | Some errors ->
+                      expect_int "structured entity errors" 1
+                        (Vec.length errors)
+                  | None ->
+                      fail_test
+                        "validation context should carry :errors sequence")));
+          let json_output = Format_types.to_json result in
+          let root =
+            match Js.Json.decodeObject (parse_json json_output) with
+            | Some object_ -> object_
+            | None ->
+                fail_test ("expected json object: " ^ json_output);
+                Js.Dict.empty ()
+          in
+          expect_none "json data key" (Js.Dict.get root "data");
+          let error =
+            match
+              Option.bind (Js.Dict.get root "error") Js.Json.decodeObject
+            with
+            | Some object_ -> object_
+            | None ->
+                fail_test ("expected error object: " ^ json_output);
+                Js.Dict.empty ()
+          in
+          (match
+             Option.bind (Js.Dict.get error "errors") Js.Json.decodeArray
+           with
+          | Some errors ->
+              expect_int "json error.errors" 1 (Array.length errors)
+          | None ->
+              fail_test
+                "json error should include structured errors, not only message");
+          let edn_output = Format_types.to_edn result in
+          let edn_value = Melange_edn_melange.of_edn_string edn_output in
+          (match
+             Option.bind (Edn_util.get edn_value "error") (fun error ->
+                 Option.bind (Edn_util.get error "errors") Edn_util.as_seq)
+           with
+          | Some errors -> expect_int "edn error.errors" 1 (Vec.length errors)
+          | None ->
+              fail_test
+                "edn error should include structured errors, not only message");
+          Js.Promise.resolve pass));
 
   test_promise "CLI parity graph info queries kv rows with thread api q"
     (fun () ->
@@ -4663,10 +6164,10 @@ let () =
     "CLI parity graph backup create invokes worker and writes metadata"
     (fun () ->
       let root = temp_dir "logseq-cli-backup-create-" in
-      let invoke_calls = ref [] in
+      let invoke_calls = ref Vec.empty in
       let server =
         invoke_server (fun body ->
-            invoke_calls := body :: !invoke_calls;
+            invoke_calls := Vec.push_front !invoke_calls body;
             if Js.String.includes ~search:"thread-api/backup-db-sqlite" body
             then (
               let tmp_path = invoke_arg_string body 1 in
@@ -4704,9 +6205,9 @@ let () =
           let db_path = Node.Path.join [| backup_dir; "db.sqlite" |] in
           let metadata_path = Node.Path.join [| backup_dir; "metadata.edn" |] in
           expect_bool "backup create ok" false (Cli_result.is_error result);
-          expect_int "backup invoke count" 1 (List.length !invoke_calls);
+          expect_int "backup invoke count" 1 (Vec.length !invoke_calls);
           expect_equal "backup method repo" "logseq_db_demo"
-            (invoke_arg_string (List.hd !invoke_calls) 0);
+            (invoke_arg_string (Vec.peek_front !invoke_calls) 0);
           expect_equal "final sqlite payload" "sqlite-copy" (read_file db_path);
           let data =
             expect_some "backup create data" (Cli_result.data_value result)
@@ -4807,10 +6308,10 @@ let () =
       mkdir_p (Filename.dirname other_backup);
       write_file demo_backup "demo";
       write_file other_backup "other";
-      let calls = ref [] in
+      let calls = ref Vec.empty in
       let server =
         invoke_server (fun body ->
-            calls := body :: !calls;
+            calls := Vec.push_front !calls body;
             if Js.String.includes ~search:"thread-api/import-db-binary" body
             then "[\"^ \",\"~:ok\",true]"
             else "null")
@@ -4837,10 +6338,10 @@ let () =
                       Edn_util.get data "backups"))
                  Edn_util.as_seq)
           in
-          expect_int "only current graph backups" 1 (List.length backups);
+          expect_int "only current graph backups" 1 (Vec.length backups);
           expect_equal "backup name" "demo-nightly"
             (expect_some "backup name"
-               (Edn_util.get_string (List.hd backups) "name"));
+               (Edn_util.get_string (Vec.peek_front backups) "name"));
           let* missing_restore =
             effect_to_promise
               (execute_with_output Graph.execute
@@ -4860,7 +6361,7 @@ let () =
           (match missing_restore.Cli_result.error with
           | Some err ->
               expect_equal "missing restore code" "backup-not-found"
-                (keyword_text err.Error.code)
+                (Error.code_to_string err.Error.code)
           | None -> fail_test "expected missing restore error");
           let* restore_result =
             effect_to_promise
@@ -4878,7 +6379,7 @@ let () =
           in
           expect_bool "restore ok" false (Cli_result.is_error restore_result);
           expect_bool "restore invokes import" true
-            (List.exists
+            (Vec.exists
                (fun body ->
                  Js.String.includes ~search:"thread-api/import-db-binary" body)
                !calls);
@@ -4913,18 +6414,82 @@ let () =
       let import_sqlite = Node.Path.join [| root; "import.sqlite" |] in
       write_file import_edn "{:page \"Import Page\"}";
       write_file import_sqlite "sqlite";
-      let calls = ref [] in
+      let calls = ref Vec.empty in
       let server =
         invoke_server (fun body ->
-            calls := body :: !calls;
+            calls := Vec.push_front !calls body;
             if Js.String.includes ~search:"thread-api/backup-db-sqlite" body
             then (
               let path = invoke_arg_string body 1 in
               mkdir_p (Filename.dirname path);
               write_file path "sqlite-copy";
               "[\"^ \",\"~:ok\",true]")
-            else if Js.String.includes ~search:"thread-api/export-edn" body then
-              "[\"^ \",\"~:exported\",true]"
+            else if Js.String.includes ~search:"thread-api/export-edn" body then (
+              let args =
+                expect_some "export args" (Edn_util.as_seq (invoke_args body))
+              in
+              let options = Vec.nth args 1 in
+              let export_type =
+                expect_some "export type"
+                  (Option.bind
+                     (Edn_util.get options "export-type")
+                     Edn_util.as_keyword)
+              in
+              (match export_type with
+              | "block" ->
+                  expect_int64 "top-level block id" 41L
+                    (expect_some "top-level block id"
+                       (Edn_util.get_int64 options "block-id"));
+                  expect_none "block graph options"
+                    (Edn_util.get options "graph-options")
+              | "page" ->
+                  expect_int64 "top-level page id" 40L
+                    (expect_some "top-level page id"
+                       (Edn_util.get_int64 options "page-id"));
+                  expect_none "page graph options"
+                    (Edn_util.get options "graph-options")
+              | "view-nodes" ->
+                  let rows =
+                    expect_some "top-level view rows"
+                      (Option.bind
+                         (Edn_util.get options "rows")
+                         Edn_util.as_seq)
+                  in
+                  expect_int64 "first view row" 42L
+                    (expect_some "first view row"
+                       (Edn_util.as_int64 (Vec.nth rows 0)));
+                  expect_bool "top-level group-by" false
+                    (expect_some "top-level group-by"
+                       (Edn_util.get_bool options "group-by?"));
+                  expect_none "view-nodes graph options"
+                    (Edn_util.get options "graph-options")
+              | "selected-nodes" ->
+                  let node_ids =
+                    expect_some "selected-nodes top-level node ids"
+                      (Option.bind
+                         (Edn_util.get options "node-ids")
+                         Edn_util.as_seq)
+                  in
+                  expect_int64 "selected-nodes first id" 42L
+                    (expect_some "selected-nodes first id"
+                       (Edn_util.as_int64 (Vec.nth node_ids 0)));
+                  expect_none "selected-nodes graph options"
+                    (Edn_util.get options "graph-options")
+              | "graph-human" ->
+                  let graph_options =
+                    expect_some "graph-human graph options"
+                      (Edn_util.get options "graph-options")
+                  in
+                  expect_bool "nested graph-human timestamps" true
+                    (expect_some "nested graph-human timestamps"
+                       (Edn_util.get_bool graph_options "include-timestamps?"));
+                  expect_none "graph-human top-level timestamps"
+                    (Edn_util.get options "include-timestamps?")
+              | "graph" ->
+                  expect_none "default graph options"
+                    (Edn_util.get options "graph-options")
+              | value -> fail_test ("unexpected export type: " ^ value));
+              "[\"^ \",\"~:exported\",true]")
             else if Js.String.includes ~search:"thread-api/import-edn" body then
               "[\"^ \",\"~:ok\",true]"
             else if
@@ -4941,19 +6506,20 @@ let () =
               Cli_config.base_url = Some base_url;
             }
           in
-          let edn_opts =
+          let make_edn_opts ?(pretty_print = false) edn_options =
             {
               Graph.export_type = Graph.Edn;
               file = Some edn_export;
-              edn_options =
-                Some
-                  (edn_of_string
-                     "{:export-type :graph :include-timestamps? true}");
-              pretty_print = true;
+              edn_options = Option.map edn_of_string edn_options;
+              pretty_print;
               include_timestamps = false;
               exclude_built_in_pages = false;
-              exclude_namespaces = [];
+              exclude_namespaces = Vec.empty;
             }
+          in
+          let edn_opts =
+            make_edn_opts ~pretty_print:true
+              (Some "{:export-type :selected-nodes :node-ids [42]}")
           in
           let sqlite_opts =
             {
@@ -4963,7 +6529,7 @@ let () =
               pretty_print = false;
               include_timestamps = false;
               exclude_built_in_pages = false;
-              exclude_namespaces = [];
+              exclude_namespaces = Vec.empty;
             }
           in
           let* edn_result =
@@ -4977,6 +6543,38 @@ let () =
             ":exported true";
           expect_named_contains "pretty export writes multiline edn"
             (read_file edn_export) "\n";
+          let export_with options =
+            effect_to_promise
+              (execute_with_output Graph.execute
+                 (Graph.Graph_export
+                    { graph; repo; opts = make_edn_opts options })
+                 cfg Output.Mode.Edn)
+          in
+          let* block_result =
+            export_with (Some "{:export-type :block :block-id 41}")
+          in
+          expect_bool "block export ok" false (Cli_result.is_error block_result);
+          let* page_result =
+            export_with (Some "{:export-type :page :page-id 40}")
+          in
+          expect_bool "page export ok" false (Cli_result.is_error page_result);
+          let* view_result =
+            export_with
+              (Some "{:export-type :view-nodes :rows [42] :group-by? false}")
+          in
+          expect_bool "view-nodes export ok" false
+            (Cli_result.is_error view_result);
+          let* graph_human_result =
+            export_with
+              (Some
+                 "{:export-type :graph-human :graph-options \
+                  {:include-timestamps? true}}")
+          in
+          expect_bool "graph-human export ok" false
+            (Cli_result.is_error graph_human_result);
+          let* default_graph_result = export_with (Some "{}") in
+          expect_bool "default graph export ok" false
+            (Cli_result.is_error default_graph_result);
           let* sqlite_result =
             effect_to_promise
               (execute_with_output Graph.execute
@@ -4985,7 +6583,7 @@ let () =
           in
           expect_bool "sqlite export ok" false
             (Cli_result.is_error sqlite_result);
-          let sqlite_path = invoke_arg_string (List.hd !calls) 1 in
+          let sqlite_path = invoke_arg_string (Vec.peek_front !calls) 1 in
           expect_named_contains "default sqlite export path" sqlite_path
             (Node.Path.join [| root; "graphs"; "demo"; "export"; "demo_" |]);
           expect_bool "default sqlite export suffix" true
@@ -5026,7 +6624,7 @@ let () =
           in
           expect_bool "sqlite import ok" false
             (Cli_result.is_error import_sqlite_result);
-          let joined = String.concat "\n" !calls in
+          let joined = Vec.string_concat "\n" !calls in
           expect_named_contains "export edn invoked" joined
             "thread-api/export-edn";
           expect_named_contains "sqlite export invoked" joined
@@ -5047,7 +6645,7 @@ let () =
       write_file sqlite_path "sqlite";
       let output =
         run_cli_lifecycle
-          [
+          [|
             "--root-dir";
             root;
             "--graph";
@@ -5058,7 +6656,7 @@ let () =
             "sqlite";
             "--input";
             sqlite_path;
-          ]
+          |]
       in
       expect_int "existing sqlite import exit" 1 output.exit_code;
       expect_named_contains "existing sqlite import code"
@@ -5067,18 +6665,28 @@ let () =
       remove_tree root);
 
   test "CLI parity errors are printed to stdout with non-zero exit" (fun () ->
-      let result = spawn_cli [ "list"; "page"; "--limit"; "nope" ] in
+      let result = spawn_cli [| "list"; "page"; "--limit"; "nope" |] in
       ignore (expect_exit_non_zero "bad list limit" result);
       expect_named_contains "error code" result##stdout "invalid-options";
       expect_named_contains "error message" result##stdout "Expected integer");
 
   test "CLI parity main version output includes build metadata" (fun () ->
-      let output = run_cli_lifecycle [ "--version" ] in
+      let output = run_cli_lifecycle [| "--version" |] in
       expect_int "version exit" 0 output.exit_code;
       let stdout = stdout_text "version stdout" output in
       expect_named_contains "version build time" stdout "Build time: ";
       expect_named_contains "version revision" stdout "Revision: ";
-      expect_bool "profile disabled" true (output.stderr = []));
+      expect_bool "profile disabled" true (Vec.is_empty output.stderr));
+
+  test "CLI parity main uses a later duplicate option with a value" (fun () ->
+      let output =
+        run_cli_lifecycle [| "--output"; "--output"; "json"; "--version" |]
+      in
+      expect_int "duplicate output version exit" 0 output.exit_code;
+      let stdout = stdout_text "duplicate output version stdout" output in
+      expect_valid_json "duplicate output version json" stdout;
+      expect_named_contains "duplicate output version status" stdout
+        "\"status\":\"ok\"");
 
   test "CLI parity version action output includes build metadata" (fun () ->
       let result =
@@ -5091,13 +6699,13 @@ let () =
       expect_named_contains "version action revision" output "Revision: ");
 
   test "CLI parity main structured help respects output modes" (fun () ->
-      let json_output = run_cli_lifecycle [ "--output"; "json"; "--help" ] in
+      let json_output = run_cli_lifecycle [| "--output"; "json"; "--help" |] in
       expect_int "json help exit" 0 json_output.exit_code;
       let json_stdout = stdout_text "json help stdout" json_output in
       expect_valid_json "json help output" json_stdout;
       expect_named_contains "json help status" json_stdout "\"status\":\"ok\"";
       expect_named_contains "json help message" json_stdout "Usage: logseq";
-      let edn_output = run_cli_lifecycle [ "--output"; "edn"; "--help" ] in
+      let edn_output = run_cli_lifecycle [| "--output"; "edn"; "--help" |] in
       expect_int "edn help exit" 0 edn_output.exit_code;
       let edn_stdout = stdout_text "edn help stdout" edn_output in
       expect_valid_edn "edn help output" edn_stdout;
@@ -5105,14 +6713,14 @@ let () =
       expect_named_contains "edn help message" edn_stdout "Usage: logseq");
 
   test "CLI parity main structured parse errors respect output modes" (fun () ->
-      let json_output = run_cli_lifecycle [ "--output"; "json"; "wat" ] in
+      let json_output = run_cli_lifecycle [| "--output"; "json"; "wat" |] in
       expect_int "json parse exit" 1 json_output.exit_code;
       let json_stdout = stdout_text "json parse stdout" json_output in
       expect_valid_json "json parse error output" json_stdout;
       expect_named_contains "json parse error status" json_stdout
         "\"status\":\"error\"";
       expect_named_contains "json parse error message" json_stdout "\"message\"";
-      let edn_output = run_cli_lifecycle [ "--output"; "edn"; "wat" ] in
+      let edn_output = run_cli_lifecycle [| "--output"; "edn"; "wat" |] in
       expect_int "edn parse exit" 1 edn_output.exit_code;
       let edn_stdout = stdout_text "edn parse stdout" edn_output in
       expect_valid_edn "edn parse error output" edn_stdout;
@@ -5120,11 +6728,11 @@ let () =
       expect_named_contains "edn parse error message" edn_stdout ":message");
 
   test "CLI parity main profile lines are emitted for version" (fun () ->
-      let output = run_cli_lifecycle [ "--profile"; "--version" ] in
+      let output = run_cli_lifecycle [| "--profile"; "--version" |] in
       expect_int "profile version exit" 0 output.exit_code;
       let stdout = stdout_text "profile version stdout" output in
       expect_named_contains "profile version build time" stdout "Build time: ";
-      let profile = String.concat "\n" output.stderr in
+      let profile = Vec.string_concat "\n" output.stderr in
       expect_named_contains "profile version headline" profile
         "command=version status=ok";
       expect_named_contains "profile version stages" profile "stages";
@@ -5133,13 +6741,13 @@ let () =
       expect_named_contains "profile version total stage" profile "cli.total");
 
   test "CLI parity main profile lines are disabled by default" (fun () ->
-      let output = run_cli_lifecycle [ "--help" ] in
+      let output = run_cli_lifecycle [| "--help" |] in
       expect_int "help exit" 0 output.exit_code;
-      expect_bool "no profile lines" true (output.stderr = []));
+      expect_bool "no profile lines" true (Vec.is_empty output.stderr));
 
   test "CLI parity command help includes primary and secondary command groups"
     (fun () ->
-      let output = run_cli [ "--help" ] in
+      let output = run_cli [| "--help" |] in
       expect_named_contains "graph command" output "graph list";
       expect_named_contains "upsert command" output "upsert block";
       expect_named_contains "sync command" output "sync upload";
@@ -5148,37 +6756,37 @@ let () =
 
   test "CLI parity group help surfaces subcommands without option suffix"
     (fun () ->
-      let list_help = run_cli [ "list" ] in
+      let list_help = run_cli [| "list" |] in
       expect_named_contains "list usage" list_help
         "Usage: logseq list <subcommand> [options]";
       expect_named_contains "list page command" list_help "list page";
       expect_named_contains "list asset command" list_help "list asset";
       expect_named_not_contains "list command options suffix" list_help
         "list page [options]";
-      let backup_help = run_cli [ "graph"; "backup" ] in
+      let backup_help = run_cli [| "graph"; "backup" |] in
       expect_named_contains "backup usage" backup_help
         "Usage: logseq graph backup <subcommand> [options]";
       expect_named_contains "backup list command" backup_help
         "graph backup list";
       expect_named_contains "backup restore command" backup_help
         "graph backup restore";
-      let query_help = run_cli [ "query"; "-h" ] in
+      let query_help = run_cli [| "query"; "-h" |] in
       expect_named_contains "query option" query_help "--query";
       expect_named_contains "query name" query_help "--name";
       expect_named_contains "query inputs" query_help "--inputs");
 
   test "CLI parity command help includes registry examples" (fun () ->
-      let remove_help = run_cli [ "remove"; "block"; "--help" ] in
+      let remove_help = run_cli [| "remove"; "block"; "--help" |] in
       expect_named_contains "remove block usage" remove_help
         "Usage: logseq remove block";
       expect_named_contains "remove block options" remove_help
         "Command options:";
       expect_named_contains "remove block examples" remove_help "Examples:";
-      let upsert_help = run_cli [ "upsert"; "block"; "--help" ] in
+      let upsert_help = run_cli [| "upsert"; "block"; "--help" |] in
       expect_named_contains "upsert block usage" upsert_help
         "Usage: logseq upsert block";
       expect_named_contains "upsert block examples" upsert_help "Examples:";
-      let example_help = run_cli [ "example"; "upsert"; "--help" ] in
+      let example_help = run_cli [| "example"; "upsert"; "--help" |] in
       expect_named_contains "example upsert usage" example_help
         "Usage: logseq example upsert";
       expect_named_not_contains "example upsert group has no examples"
@@ -5187,7 +6795,7 @@ let () =
   test
     "CLI parity structured example output keeps selector matched commands and \
      message" (fun () ->
-      let result = spawn_cli [ "--output"; "json"; "example"; "upsert" ] in
+      let result = spawn_cli [| "--output"; "json"; "example"; "upsert" |] in
       ignore (expect_exit_zero "example upsert json" result);
       expect_named_contains "selector" result##stdout "\"selector\":\"upsert\"";
       expect_named_contains "matched command" result##stdout "upsert block";
@@ -5208,7 +6816,7 @@ let () =
                 stdin_id = None;
               }));
       let result =
-        spawn_cli [ "--graph"; "demo"; "show"; "--id"; "1"; "--page"; "Home" ]
+        spawn_cli [| "--graph"; "demo"; "show"; "--id"; "1"; "--page"; "Home" |]
       in
       ignore (expect_exit_non_zero "show ambiguous cli" result);
       expect_named_contains "show ambiguous message" result##stdout
@@ -5217,7 +6825,7 @@ let () =
   test "CLI parity completion command parses shell argument and validation"
     (fun () ->
       let positional =
-        expect_parse_ok "completion positional" [ "completion"; "zsh" ]
+        expect_parse_ok "completion positional" [| "completion"; "zsh" |]
       in
       (match positional.command with
       | Cli_request.Completion
@@ -5225,7 +6833,8 @@ let () =
           pass
       | _ -> fail_test "expected zsh completion request");
       let option =
-        expect_parse_ok "completion option" [ "completion"; "--shell"; "bash" ]
+        expect_parse_ok "completion option"
+          [| "completion"; "--shell"; "bash" |]
       in
       (match option.command with
       | Cli_request.Completion
@@ -5233,9 +6842,70 @@ let () =
           pass
       | _ -> fail_test "expected bash completion request");
       expect_parse_error_code "completion missing shell" ":invalid-options"
-        [ "completion" ];
+        [| "completion" |];
       expect_parse_error_code "completion unsupported shell" ":invalid-options"
-        [ "completion"; "fish" ]);
+        [| "completion"; "fish" |]);
+
+  test
+    "CLI parity path-specific short aliases resolve to command specific \
+     meanings" (fun () ->
+      let validate =
+        expect_parse_ok "graph validate -f" [| "graph"; "validate"; "-f" |]
+      in
+      (match validate.command with
+      | Cli_request.Graph (Graph.Parsed_validate { fix }) ->
+          expect_bool "validate -f is fix" true fix
+      | _ -> fail_test "expected graph validate");
+      let export =
+        expect_parse_ok "graph export -f"
+          [| "graph"; "export"; "-t"; "edn"; "-f"; "/tmp/export.edn" |]
+      in
+      (match export.command with
+      | Cli_request.Graph (Graph.Parsed_export opts) ->
+          expect_equal "export -f is file" "/tmp/export.edn"
+            (expect_some "export file" opts.file)
+      | _ -> fail_test "expected graph export");
+      let export_eq =
+        expect_parse_ok "graph export -f= form"
+          [| "graph"; "export"; "-t"; "edn"; "-f=/tmp/export.edn" |]
+      in
+      (match export_eq.command with
+      | Cli_request.Graph (Graph.Parsed_export opts) ->
+          expect_equal "export -f= is file" "/tmp/export.edn"
+            (expect_some "export file eq" opts.file)
+      | _ -> fail_test "expected graph export");
+      let page = expect_parse_ok "list page -e" [| "list"; "page"; "-e" |] in
+      (match page.command with
+      | Cli_request.List (List_command.Parsed_page opts) ->
+          expect_bool "list page -e is expand" true opts.expand
+      | _ -> fail_test "expected list page");
+      let remove_page =
+        expect_parse_ok "remove page -f"
+          [| "remove"; "page"; "--page"; "Home"; "-f" |]
+      in
+      (match remove_page.command with
+      | Cli_request.Remove (Remove.Parsed_page opts) ->
+          expect_bool "remove page -f is force" true opts.force
+      | _ -> fail_test "expected remove page");
+      let remove_page_force_eq_false =
+        expect_parse_ok "remove page --force=false"
+          [| "remove"; "page"; "--page"; "Home"; "--force=false" |]
+      in
+      (match remove_page_force_eq_false.command with
+      | Cli_request.Remove (Remove.Parsed_page opts) ->
+          expect_bool "remove page --force=false is not force" false opts.force
+      | _ -> fail_test "expected remove page");
+      let remove_page_force_space_false =
+        expect_parse_ok "remove page --force false"
+          [| "remove"; "page"; "--page"; "Home"; "--force"; "false" |]
+      in
+      (match remove_page_force_space_false.command with
+      | Cli_request.Remove (Remove.Parsed_page opts) ->
+          expect_bool "remove page --force false is not force" false opts.force
+      | _ -> fail_test "expected remove page");
+      expect_parse_error_code "graph validate rejects --fields"
+        ":invalid-options"
+        [| "graph"; "validate"; "--fields"; "id" |]);
 
   test "CLI parity completion generation includes top nested and value cases"
     (fun () ->
@@ -5245,8 +6915,25 @@ let () =
       expect_named_contains "zsh graph group" zsh "_logseq_graph()";
       expect_named_contains "zsh nested backup" zsh "_logseq_graph_backup()";
       expect_named_contains "zsh graph completions" zsh "_logseq_graphs";
+      expect_named_contains "zsh graph compadd" zsh "compadd -a graphs";
+      expect_named_contains "zsh graph short alias" zsh
+        "'(-g --graph)'{-g=,--graph=}'[Graph name]:graph:{_logseq_graphs}'";
       expect_named_contains "zsh output choices" zsh
-        "--output=[Output format]:value:(human json edn)";
+        "'(-o --output)'{-o=,--output=}'[Output format]:mode:(human json edn)'";
+      expect_named_contains "zsh nested leaf function" zsh
+        "_logseq_graph_list()";
+      expect_named_contains "zsh show id option" zsh "'--id=[Entity id]::id:'";
+      expect_named_contains "zsh show level option" zsh
+        "'--level=[Tree depth]:n:'";
+      expect_named_contains "zsh query group dispatcher keeps own options" zsh
+        "'--query=[Datascript query]:edn:'";
+      expect_named_contains "zsh comma separated fields completion" zsh
+        "'--fields=[Comma-separated fields to include]:fields:{_values -s , \
+         fields id title ident uuid created-at updated-at}'";
+      expect_named_contains "zsh export file short alias" zsh
+        "'(-f --file)'{-f=,--file=}'[Output file]:path:_files'";
+      expect_named_contains "zsh list expand short alias" zsh
+        "'(-e --expand)'{-e,--expand}'[Expand page data]'";
       let bash = Completion.generate Cli_primitive.Bash registry in
       expect_named_contains "bash header" bash
         "# Auto-generated by `logseq completion bash`";
@@ -5282,13 +6969,10 @@ let () =
       expect_named_contains "zsh top dispatcher" zsh "_logseq()";
       expect_named_contains "zsh graph helper" zsh "_logseq_graphs";
       expect_named_contains "zsh global output option" zsh
-        "--output=[Output format]:value:(human json edn)";
-      expect_named_not_contains "zsh graph export edn options removed" zsh
-        "--edn-options";
-      expect_named_not_contains "zsh graph create sync option removed" zsh
-        "--enable-sync";
-      expect_named_not_contains "zsh search content option removed" zsh
-        "--content";
+        "'(-o --output)'{-o=,--output=}'[Output format]:mode:(human json edn)'";
+      expect_named_contains "zsh graph export edn options" zsh "--edn-options";
+      expect_named_contains "zsh graph create sync option" zsh "--enable-sync";
+      expect_named_contains "zsh search content option" zsh "--content";
       expect_named_not_contains "zsh content short alias removed" zsh "-c[";
       expect_named_not_contains "zsh command boolean negation removed" zsh
         "--no-include-built-in";
@@ -5321,9 +7005,27 @@ let () =
     (fun () ->
       let registry = (Cli.make_app_context ()).Cli.registry in
       let has_name name (option : Command_registry.option_meta) =
-        List.mem name option.names
+        Vec.mem name option.names
       in
-      let option_by_name name options = List.find_opt (has_name name) options in
+      let option_by_name name options = Vec.find_opt (has_name name) options in
+      let assert_timestamp_headers_last
+          (command : Command_registry.command_meta) =
+        let headers = command.human_table_headers_order in
+        if Vec.mem "created-at" headers || Vec.mem "updated-at" headers then
+          let reversed = Vec.rev headers in
+          if
+            Vec.length reversed >= 2
+            && Vec.nth reversed 0 = "updated-at"
+            && Vec.nth reversed 1 = "created-at"
+          then pass
+          else
+            fail_test
+              (Printf.sprintf
+                 "%s: expected created-at,updated-at suffix, got %s"
+                 (Vec.string_concat " " command.path)
+                 (Vec.string_concat "," headers))
+      in
+      Vec.iter assert_timestamp_headers_last registry.commands;
       let output_option =
         expect_some "global output option"
           (option_by_name "--output" Command_registry.global_options)
@@ -5332,8 +7034,9 @@ let () =
         (has_name "-o" output_option);
       expect_equal "global output default" "human"
         (expect_some "output default" output_option.default);
-      expect_bool "global output choices" true
-        (output_option.choices = [ "human"; "json"; "edn" ]);
+      expect_string_vec "global output choices"
+        [| "human"; "json"; "edn" |]
+        output_option.choices;
       let graph_option =
         expect_some "global graph option"
           (option_by_name "--graph" Command_registry.global_options)
@@ -5347,16 +7050,19 @@ let () =
         (profile_option.arity = Command_registry.Flag);
       let completion =
         expect_some "completion command"
-          (Command_registry.find_by_path [ "completion" ] registry)
+          (Command_registry.find_by_path (Vec.singleton "completion") registry)
       in
       expect_bool "completion shell choices" true
-        (List.exists
+        (Vec.exists
            (fun (option : Command_registry.option_meta) ->
-             option.names = [ "--shell" ] && option.choices = [ "zsh"; "bash" ])
+             Vec.to_array option.names = [| "--shell" |]
+             && Vec.to_array option.choices = [| "zsh"; "bash" |])
            completion.Command_registry.options);
       let graph_create =
         expect_some "graph create"
-          (Command_registry.find_by_path [ "graph"; "create" ] registry)
+          (Command_registry.find_by_path
+             (Vec.of_array [| "graph"; "create" |])
+             registry)
       in
       expect_bool "graph create enable sync" true
         (Option.is_some (option_by_name "--enable-sync" graph_create.options));
@@ -5364,14 +7070,16 @@ let () =
         (Option.is_some (option_by_name "--e2ee-password" graph_create.options));
       let graph_export =
         expect_some "graph export"
-          (Command_registry.find_by_path [ "graph"; "export" ] registry)
+          (Command_registry.find_by_path
+             (Vec.of_array [| "graph"; "export" |])
+             registry)
       in
       let export_type =
         expect_some "export type option"
           (option_by_name "--type" graph_export.options)
       in
-      expect_bool "export type choices" true
-        (export_type.choices = [ "edn"; "sqlite" ]);
+      expect_string_vec "export type choices" [| "edn"; "sqlite" |]
+        export_type.choices;
       expect_bool "export edn options" true
         (Option.is_some (option_by_name "--edn-options" graph_export.options));
       expect_bool "export edn options alias" true
@@ -5391,7 +7099,9 @@ let () =
            (option_by_name "--exclude-namespaces" graph_export.options));
       let graph_import =
         expect_some "graph import"
-          (Command_registry.find_by_path [ "graph"; "import" ] registry)
+          (Command_registry.find_by_path
+             (Vec.of_array [| "graph"; "import" |])
+             registry)
       in
       let import_input =
         expect_some "import input option"
@@ -5400,94 +7110,121 @@ let () =
       expect_bool "import input required" true import_input.required;
       let list_page =
         expect_some "list page"
-          (Command_registry.find_by_path [ "list"; "page" ] registry)
+          (Command_registry.find_by_path
+             (Vec.of_array [| "list"; "page" |])
+             registry)
       in
       let page_sort =
         expect_some "page sort option"
           (option_by_name "--sort" list_page.options)
       in
-      expect_bool "page sort has title" true
-        (List.mem "title" page_sort.choices);
+      expect_bool "page sort has title" true (Vec.mem "title" page_sort.choices);
       let page_order =
         expect_some "page order option"
           (option_by_name "--order" list_page.options)
       in
-      expect_bool "page order choices" true
-        (page_order.choices = [ "asc"; "desc" ]);
+      expect_string_vec "page order choices" [| "asc"; "desc" |]
+        page_order.choices;
       let list_tag =
         expect_some "list tag"
-          (Command_registry.find_by_path [ "list"; "tag" ] registry)
+          (Command_registry.find_by_path
+             (Vec.of_array [| "list"; "tag" |])
+             registry)
       in
       let tag_fields =
         expect_some "tag fields option"
           (option_by_name "--fields" list_tag.options)
       in
       expect_bool "tag fields include title" true
-        (List.mem "title" tag_fields.choices);
+        (Vec.mem "title" tag_fields.choices);
       expect_bool "tag fields include uuid" true
-        (List.mem "uuid" tag_fields.choices);
+        (Vec.mem "uuid" tag_fields.choices);
+      let list_task =
+        expect_some "list task"
+          (Command_registry.find_by_path
+             (Vec.of_array [| "list"; "task" |])
+             registry)
+      in
+      expect_equal "list task human header order"
+        "id,title,status,priority,scheduled,deadline,created-at,updated-at"
+        (Vec.string_concat "," list_task.human_table_headers_order);
       let show =
         expect_some "show command"
-          (Command_registry.find_by_path [ "show" ] registry)
+          (Command_registry.find_by_path (Vec.singleton "show") registry)
       in
       expect_bool "show page option" true
         (Option.is_some (option_by_name "--page" show.options));
       let upsert_block =
         expect_some "upsert block"
-          (Command_registry.find_by_path [ "upsert"; "block" ] registry)
+          (Command_registry.find_by_path
+             (Vec.of_array [| "upsert"; "block" |])
+             registry)
       in
       let block_pos =
         expect_some "block pos option"
           (option_by_name "--pos" upsert_block.options)
       in
-      expect_bool "block pos choices" true
-        (block_pos.choices = [ "first-child"; "last-child"; "sibling" ]);
+      expect_string_vec "block pos choices"
+        [| "first-child"; "last-child"; "sibling" |]
+        block_pos.choices;
       let task =
         expect_some "upsert task"
-          (Command_registry.find_by_path [ "upsert"; "task" ] registry)
+          (Command_registry.find_by_path
+             (Vec.of_array [| "upsert"; "task" |])
+             registry)
       in
       expect_bool "task status option" true
-        (List.exists
+        (Vec.exists
            (fun (option : Command_registry.option_meta) ->
-             option.names = [ "--status" ])
+             Vec.to_array option.names = [| "--status" |])
            task.options);
       expect_bool "task clear status option" true
-        (List.exists
+        (Vec.exists
            (fun (option : Command_registry.option_meta) ->
-             option.names = [ "--no-status" ])
+             Vec.to_array option.names = [| "--no-status" |])
            task.options);
       let property =
         expect_some "upsert property"
-          (Command_registry.find_by_path [ "upsert"; "property" ] registry)
+          (Command_registry.find_by_path
+             (Vec.of_array [| "upsert"; "property" |])
+             registry)
       in
       expect_bool "property type choices" true
-        (List.exists
+        (Vec.exists
            (fun (option : Command_registry.option_meta) ->
-             option.names = [ "--type" ]
-             && List.mem "default" option.choices
-             && List.mem "checkbox" option.choices)
+             Vec.to_array option.names = [| "--type" |]
+             && Vec.mem "default" option.choices
+             && Vec.mem "checkbox" option.choices)
            property.options);
       let query =
         expect_some "query command"
-          (Command_registry.find_by_path [ "query" ] registry)
+          (Command_registry.find_by_path (Vec.singleton "query") registry)
       in
       let query_list =
         expect_some "query list command"
-          (Command_registry.find_by_path [ "query"; "list" ] registry)
+          (Command_registry.find_by_path
+             (Vec.of_array [| "query"; "list" |])
+             registry)
       in
-      expect_bool "query examples metadata" true (query.examples <> []);
+      expect_bool "query examples metadata" true
+        (not (Vec.is_empty query.examples));
       expect_bool "query name option" true
         (Option.is_some (option_by_name "--name" query.options));
-      expect_bool "query list examples metadata" true (query_list.examples <> []);
+      expect_bool "query list examples metadata" true
+        (not (Vec.is_empty query_list.examples));
       let search_block =
         expect_some "search block"
-          (Command_registry.find_by_path [ "search"; "block" ] registry)
+          (Command_registry.find_by_path
+             (Vec.of_array [| "search"; "block" |])
+             registry)
       in
       let search_content =
         expect_some "search content option"
           (option_by_name "--content" search_block.options)
       in
-      expect_equal "search content doc" "Content search text" search_content.doc);
+      expect_equal "search content doc" "Content search text" search_content.doc;
+      expect_equal "search block human header order" "id,ident,title"
+        (Vec.string_concat "," search_block.human_table_headers_order));
 
   test "CLI parity command registry help renders command and option details"
     (fun () ->
@@ -5498,7 +7235,9 @@ let () =
       expect_named_contains "skill show command" top_help "skill show";
       expect_named_contains "completion command" top_help "completion";
       let upsert_help =
-        Command_registry.render_help ~group:[ "upsert"; "task" ] registry
+        Command_registry.render_help
+          ~group:(Vec.of_array [| "upsert"; "task" |])
+          registry
       in
       expect_named_contains "task usage" upsert_help
         "Usage: logseq upsert task [options]";
@@ -5535,18 +7274,18 @@ let () =
         Skill.installed_skill_targets ~cwd:"/tmp/work"
           ~home_dir:(Some "/Users/demo")
       in
-      expect_int "two targets" 2 (List.length targets);
+      expect_int "two targets" 2 (Vec.length targets);
       expect_equal "local target" "/tmp/work/.agents/skills/logseq-cli/SKILL.md"
-        (List.nth targets 0).Skill.path;
+        (Vec.nth targets 0).Skill.path;
       expect_equal "global target"
         "/Users/demo/.agents/skills/logseq-cli/SKILL.md"
-        (List.nth targets 1).path;
+        (Vec.nth targets 1).path;
       let local_only =
         Skill.installed_skill_targets ~cwd:"/tmp/work" ~home_dir:None
       in
-      expect_int "local only" 1 (List.length local_only);
+      expect_int "local only" 1 (Vec.length local_only);
       expect_equal "local only scope" "local"
-        (keyword_text (List.hd local_only).scope));
+        (keyword_text (Vec.peek_front local_only).scope));
 
   test "CLI parity skill show and install read source and preserve neighbors"
     (fun () ->
@@ -5603,34 +7342,37 @@ let () =
     (fun () ->
       let registry =
         Command_registry.make
-          [
-            {
-              Command_registry.id = Command_id.Graph_list;
-              path = [ "graph"; "list" ];
-              doc = "List graphs";
-              long_doc = None;
-              examples = [ "custom graph list example" ];
-              options = [];
-              category = Command_registry.Graph_management;
-              requires_graph = false;
-              requires_auth = false;
-              write_command = false;
-            };
-          ]
+          (Vec.of_array
+             [|
+               {
+                 Command_registry.id = Command_id.Graph_list;
+                 path = Vec.of_array [| "graph"; "list" |];
+                 doc = "List graphs";
+                 long_doc = None;
+                 examples = Vec.singleton "custom graph list example";
+                 options = Vec.empty;
+                 category = Command_registry.Graph_management;
+                 requires_graph = false;
+                 requires_auth = false;
+                 write_command = false;
+                 human_table_headers_order = Vec.empty;
+               };
+             |])
       in
       let action =
         expect_ok "registry graph examples"
-          (Example.resolve_selector registry [ "graph" ])
+          (Example.resolve_selector registry (Vec.singleton "graph"))
       in
       expect_equal "registry example" "custom graph list example"
-        (List.hd action.examples);
+        (Vec.peek_front action.examples);
       let defaults =
         expect_ok "default examples"
-          (Example.resolve_selector Command_registry.empty [ "graph"; "list" ])
+          (Example.resolve_selector Command_registry.empty
+             (Vec.of_array [| "graph"; "list" |]))
       in
       expect_equal "default selector" "graph list" defaults.selector;
       expect_named_contains "default graph list example"
-        (List.hd defaults.examples)
+        (Vec.peek_front defaults.examples)
         "logseq graph list");
 
   test "CLI parity config update writes sanitized patch and removes null fields"
@@ -5715,46 +7457,18 @@ let () =
       expect_reason "missing uuid" "missing-stable-uuid"
         (agent_task_entity ~uuid:None ());
       expect_reason "missing task tag" "missing-task-tag"
-        (agent_task_entity ~tags:[] ());
+        (agent_task_entity ~tags:[||] ());
       expect_reason "done status" "not-todo"
         (agent_task_entity ~status:(Some "done") ());
       expect_reason "assignee mismatch" "assignee-mismatch"
-        (agent_task_entity ~assignees:[ "other-host" ] ());
+        (agent_task_entity ~assignees:[| "other-host" |] ());
       expect_reason "already routed" "already-routed"
         (agent_task_entity ~session_id:"codex-1" ()));
-
-  test "CLI parity agent prompt template validates required and unknown vars"
-    (fun () ->
-      let template body =
-        {
-          Agent.kind = Agent.Task;
-          body;
-          required_vars = [ "graph"; "task-block-tree" ];
-          allowed_vars = [ "graph"; "agent-name"; "task-block-tree" ];
-        }
-      in
-      ignore
-        (expect_ok "valid template"
-           (Agent.validate_prompt_template
-              (template "{{graph}}\n{{task-block-tree}}\n{{agent-name}}")));
-      expect_error_code "blank template" ":missing-template-code-block"
-        (Agent.validate_prompt_template (template "   "));
-      expect_error_code "unknown var" ":unknown-template-vars"
-        (Agent.validate_prompt_template
-           (template "{{graph}}\n{{task-block-tree}}\n{{other}}"));
-      expect_error_code "missing var" ":missing-template-vars"
-        (Agent.validate_prompt_template (template "{{graph}}"));
-      let documented_template =
-        template "{{graph}}\n{{task-block-tree}}\n'{{documented-only}}'"
-      in
-      ignore
-        (expect_ok "quoted docs var ignored"
-           (Agent.validate_prompt_template documented_template)));
 
   test "CLI parity parse covers additional command option surfaces" (fun () ->
       let list_node =
         expect_parse_ok "list node"
-          [
+          [|
             "list";
             "node";
             "--tags";
@@ -5763,18 +7477,18 @@ let () =
             "owner,status";
             "--sort";
             "updated-at";
-          ]
+          |]
       in
       (match list_node.command with
       | Cli_request.List (List_command.Parsed_node opts) ->
-          expect_int "node tags" 2 (List.length opts.tags);
-          expect_int "node properties" 2 (List.length opts.properties);
+          expect_int "node tags" 2 (Vec.length opts.tags);
+          expect_int "node properties" 2 (Vec.length opts.properties);
           expect_equal "node sort" "updated-at"
             (expect_some "node sort" opts.common.sort)
       | _ -> fail_test "expected list node");
       let query_run =
         expect_parse_ok "query run"
-          [
+          [|
             "query";
             "--query";
             "[:find ?e :in $ ?title :where [?e :block/title ?title]]";
@@ -5784,7 +7498,7 @@ let () =
             "demo";
             "--output";
             "json";
-          ]
+          |]
       in
       (match query_run.command with
       | Cli_request.Query
@@ -5798,13 +7512,13 @@ let () =
           | Some (Output.Mode.Packed Output.Mode.Json) -> pass
           | _ -> fail_test "expected json output mode")
       | _ -> fail_test "expected query run");
-      let query_list = expect_parse_ok "query list" [ "query"; "list" ] in
+      let query_list = expect_parse_ok "query list" [| "query"; "list" |] in
       (match query_list.command with
       | Cli_request.Query Query.Parsed_list -> pass
       | _ -> fail_test "expected query list");
       let task =
         expect_parse_ok "upsert task"
-          [
+          [|
             "upsert";
             "task";
             "--page";
@@ -5816,7 +7530,7 @@ let () =
             "--priority";
             "high";
             "--no-deadline";
-          ]
+          |]
       in
       (match task.command with
       | Cli_request.Upsert (Upsert.Parsed_task opts) ->
@@ -5828,7 +7542,7 @@ let () =
       | _ -> fail_test "expected upsert task");
       let property =
         expect_parse_ok "upsert property"
-          [
+          [|
             "upsert";
             "property";
             "--name";
@@ -5841,7 +7555,7 @@ let () =
             "false";
             "--public";
             "true";
-          ]
+          |]
       in
       (match property.command with
       | Cli_request.Upsert (Upsert.Parsed_property opts) ->
@@ -5854,7 +7568,7 @@ let () =
       | _ -> fail_test "expected upsert property");
       let tag =
         expect_parse_ok "upsert tag schema properties"
-          [
+          [|
             "upsert";
             "tag";
             "--name";
@@ -5863,7 +7577,7 @@ let () =
             "[\"status\"]";
             "--remove-properties";
             "[:user.property/owner]";
-          ]
+          |]
       in
       (match tag.command with
       | Cli_request.Upsert (Upsert.Parsed_tag opts) ->
@@ -5875,7 +7589,7 @@ let () =
       | _ -> fail_test "expected upsert tag");
       let sync_download =
         expect_parse_ok "sync download"
-          [ "sync"; "download"; "--progress"; "--e2ee-password"; "secret" ]
+          [| "sync"; "download"; "--progress"; "--e2ee-password"; "secret" |]
       in
       (match sync_download.command with
       | Cli_request.Sync (Sync.Parsed_download opts) ->
@@ -5885,13 +7599,13 @@ let () =
       | _ -> fail_test "expected sync download");
       let sync_asset =
         expect_parse_ok "sync asset"
-          [
+          [|
             "sync";
             "asset";
             "download";
             "--uuid";
             "00000000-0000-4000-8000-000000000001";
-          ]
+          |]
       in
       (match sync_asset.command with
       | Cli_request.Sync (Sync.Parsed_asset_download opts) ->
@@ -5900,14 +7614,14 @@ let () =
       | _ -> fail_test "expected sync asset download");
       let grant =
         expect_parse_ok "sync grant"
-          [
+          [|
             "sync";
             "grant-access";
             "--graph-id";
             "00000000-0000-4000-8000-000000000001";
             "--email";
             "user@example.com";
-          ]
+          |]
       in
       (match grant.command with
       | Cli_request.Sync (Sync.Parsed_grant_access opts) ->
@@ -5918,7 +7632,7 @@ let () =
       | _ -> fail_test "expected sync grant access");
       let graph_create =
         expect_parse_ok "graph create sync"
-          [ "graph"; "create"; "--enable-sync"; "--e2ee-password"; "secret" ]
+          [| "graph"; "create"; "--enable-sync"; "--e2ee-password"; "secret" |]
       in
       (match graph_create.command with
       | Cli_request.Graph (Graph.Parsed_create opts) ->
@@ -5927,9 +7641,9 @@ let () =
             (expect_some "graph password" opts.e2ee_password)
       | _ -> fail_test "expected graph create");
       expect_parse_error_code "unknown agent subcommand" ":unknown-command"
-        [ "agent"; "bridge"; "list" ];
+        [| "agent"; "bridge"; "list" |];
       expect_parse_error_code "unknown option" ":invalid-options"
-        [ "server"; "cleanup"; "--graph"; "demo"; "--unknown"; "x" ]);
+        [| "server"; "cleanup"; "--graph"; "demo"; "--unknown"; "x" |]);
 
   test "CLI parity transport reads and writes edn sqlite and db files"
     (fun () ->
@@ -5939,8 +7653,8 @@ let () =
       let edn_bytes_path = Node.Path.join [| root; "bytes.edn" |] in
       let sqlite_path = Node.Path.join [| root; "graph.sqlite" |] in
       let db_path = Node.Path.join [| root; "graph.db" |] in
-      let title = unicode_text [ 0x4e2d; 0x6587; 0x6807; 0x9898 ] in
-      let imported_title = unicode_text [ 0x5bfc; 0x5165; 0x4e2d; 0x6587 ] in
+      let title = unicode_text [| 0x4e2d; 0x6587; 0x6807; 0x9898 |] in
+      let imported_title = unicode_text [| 0x5bfc; 0x5165; 0x4e2d; 0x6587 |] in
       try
         ignore
           (expect_ok "write edn"
@@ -6004,7 +7718,7 @@ let () =
           (Bytes.to_string
              (expect_some "sqlite bytes" (Edn_util.as_bytes sqlite_value)));
         expect_named_contains "read sqlite uses transit bytes tag"
-          (Melange_edn.to_edn_string sqlite_value)
+          (Melange_edn_melange.to_edn_string sqlite_value)
           "#transit/bytes";
         ignore
           (expect_ok "write db"
@@ -6022,7 +7736,7 @@ let () =
           (Bytes.to_string
              (expect_some "db bytes" (Edn_util.as_bytes db_value)));
         expect_named_contains "read db uses transit bytes tag"
-          (Melange_edn.to_edn_string db_value)
+          (Melange_edn_melange.to_edn_string db_value)
           "#transit/bytes";
         expect_error_code "bad write format" ":unsupported-output-format"
           (effect_result "bad write format"
@@ -6055,17 +7769,17 @@ let () =
               expect_some "invoke args" (Edn_util.as_seq (invoke_args body))
             in
             let query =
-              expect_some "invoke query" (Edn_util.as_seq (List.nth args 1))
+              expect_some "invoke query" (Edn_util.as_seq (Vec.nth args 1))
             in
             expect_int64 "invoke large int" large_int
               (expect_some "invoke large int value"
-                 (Edn_util.as_int64 (List.nth query 5)));
-            (match List.nth query 6 with
-            | Melange_edn.Any (Melange_edn.Bigint value) ->
+                 (Edn_util.as_int64 (Vec.nth query 5)));
+            (match Vec.nth query 6 with
+            | Melange_edn_melange.Any (Melange_edn_melange.Bigint value) ->
                 expect_equal "invoke bigint" "900719925474099312345" value
             | _ -> fail_test "invoke bigint: expected Bigint");
-            (match List.nth query 7 with
-            | Melange_edn.Any (Melange_edn.Decimal value) ->
+            (match Vec.nth query 7 with
+            | Melange_edn_melange.Any (Melange_edn_melange.Decimal value) ->
                 expect_equal "invoke decimal" "1234567890.123456789" value
             | _ -> fail_test "invoke decimal: expected Decimal");
             "\"ok\"")
@@ -6097,9 +7811,9 @@ let () =
                         Edn_util.keyword "created-at";
                         Edn_util.int64 large_int;
                         Edn_util.any
-                          (Melange_edn.bigint "900719925474099312345");
+                          (Melange_edn_melange.bigint "900719925474099312345");
                         Edn_util.any
-                          (Melange_edn.decimal "1234567890.123456789");
+                          (Melange_edn_melange.decimal "1234567890.123456789");
                       ]))
           in
           expect_equal "decoded invoke result" "ok"
@@ -6116,11 +7830,11 @@ let () =
               expect_some "invoke args" (Edn_util.as_seq (invoke_args body))
             in
             let query =
-              expect_some "invoke query" (Edn_util.as_seq (List.nth args 1))
+              expect_some "invoke query" (Edn_util.as_seq (Vec.nth args 1))
             in
             expect_equal "string stays string" "~$?title"
               (expect_some "string value"
-                 (Edn_util.as_string (List.nth query 1)));
+                 (Edn_util.as_string (Vec.nth query 1)));
             "\"ok\"")
       in
       with_server server (fun base_url ->
@@ -6163,14 +7877,20 @@ let () =
             effect_to_promise
               (Transport.thread_api_q invoke_config
                  ~repo:(Cli_primitive.create_repo "logseq_db_alpha")
-                 ~query:(Edn_util.vector_t [ Edn_util.keyword "find" ]))
+                 ~query:
+                   (Edn_util.vector_t_vec
+                      (Vec.singleton (Edn_util.keyword "find"))))
           in
           match Edn_util.as_seq result with
-          | Some [ key; nested ] -> (
+          | Some values when Vec.length values = 2 -> (
+              let key = Vec.nth values 0 in
+              let nested = Vec.nth values 1 in
               expect_equal "decoded key" "block/uuid"
                 (expect_some "keyword" (Edn_util.as_keyword key));
               match Edn_util.as_seq nested with
-              | Some [ nested_key; value ] ->
+              | Some nested_values when Vec.length nested_values = 2 ->
+                  let nested_key = Vec.nth nested_values 0 in
+                  let value = Vec.nth nested_values 1 in
                   expect_equal "decoded nested key" "block/uuid"
                     (expect_some "nested keyword"
                        (Edn_util.as_keyword nested_key));
@@ -6183,7 +7903,7 @@ let () =
   test_promise
     "CLI parity transport connect-events decodes rtc-log and closes \
      subscription" (fun () ->
-      let received = ref [] in
+      let received = ref Vec.empty in
       let closed = ref false in
       let server =
         create_server (fun[@u] req res ->
@@ -6214,17 +7934,17 @@ let () =
             effect_to_promise
               (Transport.connect_events invoke_config (fun event_type payload ->
                    received :=
-                     (event_type, Melange_edn.to_edn_string payload)
-                     :: !received;
+                     Vec.push_front !received
+                       (event_type, Melange_edn_melange.to_edn_string payload);
                    Cli_effect.pure ()))
           in
           let* () = sleep_ms 50 in
           let* () = effect_to_promise (subscription.Transport.close ()) in
           let* () = sleep_ms 50 in
           let event_type, payload =
-            match List.rev !received with
-            | event :: _ -> event
-            | [] ->
+            match Vec.peek_back_opt !received with
+            | Some event -> event
+            | None ->
                 fail_test "received event: expected Some value";
                 assert false
           in
@@ -6234,16 +7954,42 @@ let () =
           expect_bool "subscription closed" true !closed;
           Js.Promise.resolve pass));
 
-  test "CLI parity server lock paths use canonical graph directory names"
+  test_promise
+    "CLI parity server start rejects a spawn without process identity"
     (fun () ->
-      expect_equal "plain lock path"
-        "/tmp/logseq-root/graphs/demo/db-worker.lock"
-        (Server_runtime.lock_path ~root_dir:"/tmp/logseq-root"
-           (Cli_primitive.create_repo "logseq_db_demo"));
-      expect_equal "encoded lock path"
-        "/tmp/logseq-root/graphs/foo~2Fbar/db-worker.lock"
-        (Server_runtime.lock_path ~root_dir:"/tmp/logseq-root"
-           (Cli_primitive.create_repo "logseq_db_foo/bar")));
+      let root = temp_dir "logseq-cli-server-orphan-command-" in
+      let worker_script = Node.Path.join [| root; "db-worker-node.js" |] in
+      let graphs_dir = Node.Path.join [| root; "graphs" |] in
+      let graph_dir = Node.Path.join [| graphs_dir; "demo" |] in
+      try
+        mkdir_p graph_dir;
+        write_file worker_script "console.log('db-worker');\n";
+        start_spawn_capture ();
+        set_env "LOGSEQ_DB_WORKER_NODE_SCRIPT" worker_script;
+        let config = config ~root_dir:root ~repo:"demo" () in
+        effect_to_promise
+          (Server_runtime.start_server config
+             (Cli_primitive.create_repo "logseq_db_demo")
+             ~create_empty_db:false)
+        |> Js.Promise.then_ (fun result ->
+            let calls = spawn_capture_calls () in
+            stop_spawn_capture ();
+            unset_env "LOGSEQ_DB_WORKER_NODE_SCRIPT";
+            remove_tree root;
+            match result with
+            | Ok _ -> fail_promise "expected orphan timeout"
+            | Error err ->
+                expect_equal "orphan error code" "server-start-failed"
+                  (Error.code_to_string err.Error.code);
+                expect_named_contains "spawn error" err.Error.message
+                  "Worker failed to spawn";
+                expect_named_contains "spawn was attempted" calls worker_script;
+                Js.Promise.resolve pass)
+      with exn ->
+        stop_spawn_capture ();
+        unset_env "LOGSEQ_DB_WORKER_NODE_SCRIPT";
+        remove_tree root;
+        fail_promise (Printexc.to_string exn));
 
   test "CLI parity server command build keeps cleanup repo-free contract"
     (fun () ->
@@ -6305,93 +8051,127 @@ let () =
       | Error err -> fail_test ("server restart: " ^ err.Error.message));
       pass);
 
-  test
-    "CLI parity server graph item listing ignores non-graphs and marks old dir \
-     conflicts" (fun () ->
-      let root = temp_dir "logseq-cli-parity-graph-items-" in
+  test "CLI parity graph list discovers directories through the command path"
+    (fun () ->
+      let root = temp_dir "logseq-cli-graph-list-discovery-" in
       let graphs = Node.Path.join [| root; "graphs" |] in
       try
-        List.iter
+        Vec.iter
           (fun dir -> mkdir_p (Node.Path.join [| graphs; dir |]))
-          [
-            "alpha";
-            "backup";
-            "foo~2G";
-            "Unlinked graphs";
-            "logseq_local_1";
-            "old++name";
-            "old~2Fname";
-            "yy y";
-            "yy~20y";
-            "yy%20y";
-            "bad%ZZname";
-          ];
-        let items =
-          Server_runtime.list_graph_items (config ~root_dir:root ())
+          (Vec.of_array
+             [|
+               "yy%20y";
+               "old~2Fname";
+               "colon~3Aname";
+               "percent~25name";
+               "plus~2Bname";
+               "tilde~7Ename";
+               "~E4~B8~AD~E6~96~87";
+               "alpha";
+               " alpha ";
+               " padded-only ";
+               "   ";
+               "~20encoded-leading";
+               "encoded-trailing~20";
+               "old++name";
+               "c+3A+name";
+               "yy y";
+               "bad%ZZname";
+               "logseq_local_1";
+               "backup";
+               "Unlinked graphs";
+               "file-version-test";
+               "logseq_db_hidden";
+               "logseq_db_old++name";
+               "yy~20y";
+               "lower~2fname";
+               "mix%20~2Fname";
+               "foo~2G";
+             |]);
+        write_file (Node.Path.join [| graphs; "ordinary-file" |]) "";
+        let expected =
+          edn_of_string
+            (Ustring.to_string
+               (Ustring.of_string
+                  {|{:graphs ["alpha" "colon:name" "logseq_local_1" "old/name"
+                          "percent%name" "plus+name" "tilde~name" "yy y" "中文"]
+                 :graph-items
+                 [{:kind :canonical :graph-name "alpha" :graph-dir "alpha"}
+                  {:kind :canonical :graph-name "colon:name" :graph-dir "colon~3Aname"}
+                  {:kind :canonical :graph-name "logseq_local_1" :graph-dir "logseq_local_1"}
+                  {:kind :canonical :graph-name "old/name" :graph-dir "old~2Fname"}
+                  {:kind :canonical :graph-name "percent%name" :graph-dir "percent~25name"}
+                  {:kind :canonical :graph-name "plus+name" :graph-dir "plus~2Bname"}
+                  {:kind :canonical :graph-name "tilde~name" :graph-dir "tilde~7Ename"}
+                  {:kind :canonical :graph-name "yy y" :graph-dir "yy y"}
+                  {:kind :canonical :graph-name "中文" :graph-dir "~E4~B8~AD~E6~96~87"}]}|}))
         in
-        let canonical =
-          List.filter
-            (fun item -> item.Graph_types.kind = Graph_types.Canonical)
-            items
+        expect_graph_list_output root expected;
+        remove_tree root
+      with exn ->
+        remove_tree root;
+        fail_test (Printexc.to_string exn));
+
+  test "CLI parity padded graph arguments use the canonical directory"
+    (fun () ->
+      let root = temp_dir "logseq-cli-trim-graph-" in
+      let graphs = Node.Path.join [| root; "graphs" |] in
+      let padded = Node.Path.join [| graphs; " alpha " |] in
+      let run args =
+        run_cli_lifecycle
+          (Array.append [| "--root-dir"; root; "--output"; "json" |] args)
+      in
+      try
+        mkdir_p padded;
+        write_file (Node.Path.join [| padded; "sentinel" |]) "untouched";
+        expect_graph_list_output root
+          (edn_of_string "{:graphs [] :graph-items []}");
+        let created = run [| "graph"; "create"; "--graph"; " \talpha\n " |] in
+        expect_int "create trimmed graph" 0 created.exit_code;
+        expect_graph_list_output root
+          (edn_of_string
+             {|{:graphs ["alpha"] :graph-items [{:kind :canonical :graph-name "alpha" :graph-dir "alpha"}]}|});
+        let input = Node.Path.join [| root; "unused.sqlite" |] in
+        write_file input "";
+        let imported =
+          run
+            [|
+              "graph";
+              "import";
+              "--graph";
+              " alpha ";
+              "--type";
+              "sqlite";
+              "--input";
+              input;
+            |]
         in
-        expect_bool "has alpha canonical" true
-          (List.exists
-             (fun item ->
-               Option.equal String.equal
-                 (Option.map Cli_primitive.string_of_graph
-                    item.Graph_types.graph_name)
-                 (Some "alpha")
-               && item.Graph_types.graph_dir = Some "alpha")
-             canonical);
-        expect_bool "ignores backup" false
-          (List.exists
-             (fun item -> item.Graph_types.graph_dir = Some "backup")
-             items);
-        let old_item =
-          expect_some "old format item"
-            (List.find_opt
-               (fun item -> item.Graph_types.legacy_dir = Some "old++name")
-               items)
+        expect_int "import rejects existing trimmed graph" 1 imported.exit_code;
+        expect_named_contains "existing graph error"
+          (stdout_text "import" imported)
+          "graph-exists";
+        let padded_argument =
+          unicode_text [| 0x00a0 |] ^ "alpha" ^ unicode_text [| 0x3000 |]
         in
-        expect_bool "old item kind" true
-          (old_item.Graph_types.kind = Graph_types.Legacy);
-        expect_equal "old graph name" "old/name"
-          (Cli_primitive.string_of_graph
-             (expect_some "old graph name" old_item.Graph_types.graph_name));
-        expect_equal "old target dir" "old~2Fname"
-          (expect_some "target dir" old_item.Graph_types.target_graph_dir);
-        expect_bool "old conflict" true old_item.Graph_types.conflict;
-        let percent_encoded_old_dirs =
-          items
-          |> List.filter (fun item ->
-              match item.Graph_types.legacy_dir with
-              | Some ("yy~20y" | "yy%20y") -> true
-              | _ -> false)
-        in
-        expect_int "percent encoded old dir count" 1
-          (List.length percent_encoded_old_dirs);
-        List.iter
-          (fun item ->
-            expect_bool "percent encoded item kind" true
-              (item.Graph_types.kind = Graph_types.Legacy);
-            expect_equal "percent encoded graph name" "yy y"
-              (Cli_primitive.string_of_graph
-                 (expect_some "percent encoded graph name"
-                    item.Graph_types.graph_name));
-            expect_equal "percent encoded target dir" "yy y"
-              (expect_some "percent encoded target"
-                 item.Graph_types.target_graph_dir);
-            expect_bool "percent encoded conflict" true
-              item.Graph_types.conflict)
-          percent_encoded_old_dirs;
-        let undecodable =
-          expect_some "undecodable item"
-            (List.find_opt
-               (fun item -> item.Graph_types.legacy_dir = Some "bad%ZZname")
-               items)
-        in
-        expect_bool "undecodable kind" true
-          (undecodable.Graph_types.kind = Graph_types.Legacy_undecodable);
+        let removed = run [| "graph"; "remove"; "--graph"; padded_argument |] in
+        expect_int "remove trimmed graph" 0 removed.exit_code;
+        expect_graph_list_output root
+          (edn_of_string "{:graphs [] :graph-items []}");
+        expect_equal "padded directory remains untouched" "untouched"
+          (read_file (Node.Path.join [| padded; "sentinel" |]));
+        remove_tree root
+      with exn ->
+        remove_tree root;
+        fail_test (Printexc.to_string exn));
+
+  test "CLI parity graph list accepts missing and empty graph directories"
+    (fun () ->
+      let root = temp_dir "logseq-cli-graph-list-empty-" in
+      try
+        let expected = edn_of_string "{:graphs [] :graph-items []}" in
+        expect_graph_list_output root expected;
+        mkdir_p (Node.Path.join [| root; "graphs" |]);
+        expect_graph_list_output root expected;
         remove_tree root
       with exn ->
         remove_tree root;
@@ -6410,47 +8190,36 @@ let () =
         (Format_types.format_result (message Output.Mode.Edn)
            (config ~output_format:(Output.Mode.Packed Output.Mode.Edn) ())));
 
-  test "CLI parity format graph list marks current graph and old graph dirs"
-    (fun () ->
-      let graph_list_data =
+  test "CLI parity default human tables keep discovered header order" (fun () ->
+      let value =
         Edn_util.map
           [
-            ( Edn_util.keyword "graphs",
-              Edn_util.vector
-                [
-                  Edn_util.string "alpha";
-                  Edn_util.string "old/name";
-                  Edn_util.string "mystery";
-                ] );
-            ( Edn_util.keyword "graph-items",
+            ( Edn_util.keyword "items",
               Edn_util.vector
                 [
                   Edn_util.map
                     [
-                      (Edn_util.keyword "kind", Edn_util.keyword "canonical");
-                      (Edn_util.keyword "graph-name", Edn_util.string "alpha");
-                      (Edn_util.keyword "graph-dir", Edn_util.string "alpha");
-                    ];
-                  Edn_util.map
-                    [
-                      (Edn_util.keyword "kind", Edn_util.keyword "legacy");
-                      ( Edn_util.keyword "legacy-dir",
-                        Edn_util.string "old++name" );
-                      ( Edn_util.keyword "legacy-graph-name",
-                        Edn_util.string "old/name" );
-                      ( Edn_util.keyword "target-graph-dir",
-                        Edn_util.string "old~2Fname" );
-                      (Edn_util.keyword "conflict?", Edn_util.bool false);
-                    ];
-                  Edn_util.map
-                    [
-                      ( Edn_util.keyword "kind",
-                        Edn_util.keyword "legacy-undecodable" );
-                      (Edn_util.keyword "legacy-dir", Edn_util.string "mystery");
-                      (Edn_util.keyword "reason", Edn_util.keyword "undecodable");
+                      ( Edn_util.keyword "block/updated-at",
+                        Edn_util.int64 90000L );
+                      (Edn_util.keyword "block/title", Edn_util.string "Alpha");
+                      ( Edn_util.keyword "block/created-at",
+                        Edn_util.int64 40000L );
                     ];
                 ] );
           ]
+      in
+      let output =
+        Format_types.format_result
+          (Cli_result.ok Output.Mode.Human (Cli_result.Raw value))
+          (config ())
+      in
+      expect_equal "default table header order" "updated-at,title,created-at"
+        (headers_from output |> Vec.of_array |> Vec.string_concat ","));
+
+  test "CLI parity format graph list marks the current graph and shows count"
+    (fun () ->
+      let graph_list_data =
+        edn_of_string {|{:graphs ["alpha" "old/name" "mystery"]}|}
       in
       let output =
         Format_types.format_result
@@ -6459,10 +8228,7 @@ let () =
           (config ~graph:"old/name" ~root_dir:"/tmp/logseq-root" ())
       in
       expect_named_contains "current graph marker" output "* old/name";
-      expect_named_not_contains "old graph marker" output "old/name [legacy]";
-      expect_named_not_contains "old graph warning" output
-        "legacy graph directories detected";
-      expect_named_not_contains "rename guidance" output "old++name");
+      expect_named_contains "graph count" output "Count: 3");
 
   test "CLI parity format list and search table outputs keep count footer"
     (fun () ->
@@ -6486,13 +8252,24 @@ let () =
       in
       let list_output =
         Format_types.format_result
+          ~human_table_headers_order:
+            (Vec.of_array
+               [| "id"; "ident"; "title"; "uuid"; "created-at"; "updated-at" |])
           (Cli_result.ok ~command:Command_id.List_page Output.Mode.Human
              (Cli_result.Raw list_value))
           (config ())
       in
-      expect_named_contains "list id header" list_output "db/id";
+      expect_named_contains "list id header" list_output "id";
       expect_named_contains "list title" list_output "Alpha";
       expect_named_contains "list count" list_output "Count: 1";
+      let empty_order_output =
+        Format_types.format_result ~human_table_headers_order:Vec.empty
+          (Cli_result.ok ~command:Command_id.List_page Output.Mode.Human
+             (Cli_result.Raw list_value))
+          (config ())
+      in
+      expect_equal "empty header order does not infer columns" "Count: 1"
+        (String.trim empty_order_output);
       let search_value =
         Edn_util.map
           [
@@ -6516,6 +8293,7 @@ let () =
       in
       let search_output =
         Format_types.format_result
+          ~human_table_headers_order:(Vec.of_array [| "id"; "ident"; "title" |])
           (Cli_result.ok ~command:Command_id.Search_block Output.Mode.Human
              (Cli_result.Raw search_value))
           (config ())
@@ -6526,129 +8304,181 @@ let () =
 
   test "CLI parity format list variants use current generic table contracts"
     (fun () ->
-      let row fields = Edn_util.map fields in
+      let row fields = Edn_util.map_vec (Vec.of_array fields) in
       let items values =
-        Edn_util.map [ (Edn_util.keyword "items", Edn_util.vector values) ]
+        Edn_util.map_vec
+          (Vec.singleton
+             ( Edn_util.keyword "items",
+               Edn_util.vector_vec (Vec.of_array values) ))
       in
       let human command value =
         Format_types.format_result
+          ~human_table_headers_order:
+            (let registry = (Cli.make_app_context ()).Cli.registry in
+             let meta =
+               expect_some "command metadata"
+                 (Command_registry.find_by_path
+                    (Command_id.to_path command)
+                    registry)
+             in
+             meta.human_table_headers_order)
           (Cli_result.ok ~command Output.Mode.Human (Cli_result.Raw value))
           (config ())
       in
       let tag_output =
         human Command_id.List_tag
           (items
-             [
+             [|
                row
-                 [
+                 [|
                    (Edn_util.keyword "block/title", Edn_util.string "Tag");
                    (Edn_util.keyword "db/id", Edn_util.int64 42L);
                    ( Edn_util.keyword "db/ident",
                      Edn_util.keyword "logseq.class/Tag" );
-                 ];
-             ])
+                 |];
+             |])
       in
-      expect_named_contains "tag id header" tag_output "db/id";
-      expect_named_contains "tag title header" tag_output "block/title";
+      expect_named_contains "tag id header" tag_output "id";
+      expect_named_contains "tag title header" tag_output "title";
       expect_named_contains "tag ident value" tag_output "logseq.class/Tag";
       let property_output =
         human Command_id.List_property
           (items
-             [
+             [|
                row
-                 [
+                 [|
                    (Edn_util.keyword "block/title", Edn_util.string "Prop");
                    (Edn_util.keyword "db/id", Edn_util.int64 99L);
                    ( Edn_util.keyword "logseq.property/type",
                      Edn_util.keyword "node" );
                    ( Edn_util.keyword "db/cardinality",
                      Edn_util.keyword "db.cardinality/many" );
-                 ];
+                 |];
                row
-                 [
+                 [|
                    (Edn_util.keyword "block/title", Edn_util.string "Untyped");
                    (Edn_util.keyword "db/id", Edn_util.int64 100L);
-                 ];
-             ])
+                 |];
+             |])
       in
-      expect_named_contains "property type header" property_output
-        "logseq.property/type";
+      expect_named_contains "property type header" property_output "type";
       expect_named_contains "property cardinality header" property_output
-        "db/cardinality";
+        "cardinality";
       expect_named_contains "property cardinality value" property_output
         "db.cardinality/many";
       let task_output =
         human Command_id.List_task
           (items
-             [
+             [|
                row
-                 [
+                 [|
                    (Edn_util.keyword "db/id", Edn_util.int64 12L);
                    (Edn_util.keyword "block/title", Edn_util.string "Alpha task");
                    ( Edn_util.keyword "logseq.property/status",
                      Edn_util.keyword "logseq.property/status.todo" );
                    ( Edn_util.keyword "logseq.property/priority",
                      Edn_util.keyword "logseq.property/priority.high" );
-                 ];
-             ])
+                 |];
+             |])
       in
-      expect_named_contains "task status column" task_output
-        "logseq.property/status";
-      expect_named_contains "task priority column" task_output
-        "logseq.property/priority";
+      expect_named_contains "task status column" task_output "status";
+      expect_named_contains "task priority column" task_output "priority";
+      let unordered_task_output =
+        Format_types.format_result
+          ~human_table_headers_order:
+            (Vec.of_array
+               [|
+                 "id";
+                 "title";
+                 "status";
+                 "priority";
+                 "scheduled";
+                 "deadline";
+                 "updated-at";
+                 "created-at";
+               |])
+          (Cli_result.ok ~command:Command_id.List_task Output.Mode.Human
+             (Cli_result.Raw
+                (items
+                   [|
+                     row
+                       [|
+                         ( Edn_util.keyword "logseq.property/priority",
+                           Edn_util.keyword "logseq.property/priority.high" );
+                         (Edn_util.keyword "block/title", Edn_util.string "Ship");
+                         ( Edn_util.keyword "logseq.property/status",
+                           Edn_util.keyword "logseq.property/status.todo" );
+                         ( Edn_util.keyword "block/created-at",
+                           Edn_util.int64 40000L );
+                         ( Edn_util.keyword "block/updated-at",
+                           Edn_util.int64 90000L );
+                         (Edn_util.keyword "db/id", Edn_util.int64 12L);
+                         (Edn_util.keyword "block/uuid", Edn_util.string "u1");
+                       |];
+                   |])))
+          (config ())
+      in
+      expect_equal "ordered task headers"
+        "id,title,status,priority,updated-at,created-at"
+        (headers_from unordered_task_output
+        |> Vec.of_array |> Vec.string_concat ",");
       let node_output =
         human Command_id.List_node
           (items
-             [
+             [|
                row
-                 [
+                 [|
                    (Edn_util.keyword "db/id", Edn_util.int64 1L);
                    (Edn_util.keyword "block/title", Edn_util.string "Node Page");
                    (Edn_util.keyword "node/type", Edn_util.string "page");
                    ( Edn_util.keyword "block/uuid",
                      Edn_util.uuid "11111111-1111-1111-1111-111111111111" );
-                 ];
-             ])
+                 |];
+             |])
       in
-      expect_named_contains "node type column" node_output "node/type";
-      expect_named_contains "node uuid column" node_output "block/uuid";
+      expect_named_contains "node type column" node_output "type";
+      expect_named_not_contains "node uuid column" node_output "uuid";
       let asset_output =
         human Command_id.List_asset
           (items
-             [
+             [|
                row
-                 [
+                 [|
                    (Edn_util.keyword "db/id", Edn_util.int64 3L);
                    (Edn_util.keyword "block/title", Edn_util.string "Asset Node");
                    ( Edn_util.keyword "logseq.property.asset/type",
                      Edn_util.string "md" );
                    ( Edn_util.keyword "logseq.property.asset/size",
                      Edn_util.int64 2552L );
-                 ];
-             ])
+                 |];
+             |])
       in
-      expect_named_contains "asset type column" asset_output
-        "logseq.property.asset/type";
-      expect_named_contains "asset size column" asset_output
-        "logseq.property.asset/size";
+      expect_named_contains "asset type column" asset_output "type";
+      expect_named_contains "asset size column" asset_output "size";
       expect_named_contains "asset raw size" asset_output "2552");
 
   test "CLI parity format list title truncation keeps current display contracts"
     (fun () ->
       let ellipsis = decode_uri_component "%E2%80%A6" in
       let item title =
-        Edn_util.map
-          [
-            (Edn_util.keyword "db/id", Edn_util.int64 1L);
-            (Edn_util.keyword "block/title", Edn_util.string title);
-          ]
+        Edn_util.map_vec
+          (Vec.of_array
+             [|
+               (Edn_util.keyword "db/id", Edn_util.int64 1L);
+               (Edn_util.keyword "block/title", Edn_util.string title);
+             |])
       in
       let value title =
-        Edn_util.map
-          [ (Edn_util.keyword "items", Edn_util.vector [ item title ]) ]
+        Edn_util.map_vec
+          (Vec.singleton
+             ( Edn_util.keyword "items",
+               Edn_util.vector_vec (Vec.singleton (item title)) ))
       in
       let truncated =
         Format_types.format_result
+          ~human_table_headers_order:
+            (Vec.of_array
+               [| "id"; "ident"; "title"; "uuid"; "created-at"; "updated-at" |])
           (Cli_result.ok ~command:Command_id.List_page Output.Mode.Human
              (Cli_result.Raw (value "ABCDEFGH")))
           (config ~list_title_max_display_width:6 ())
@@ -6659,38 +8489,91 @@ let () =
         "ABCDEFGH";
       let multiline =
         Format_types.format_result
+          ~human_table_headers_order:
+            (Vec.of_array
+               [| "id"; "ident"; "title"; "uuid"; "created-at"; "updated-at" |])
           (Cli_result.ok ~command:Command_id.List_page Output.Mode.Human
              (Cli_result.Raw (value "Line 1\nLine 2\nLine 3\nLine 4\nLine 5")))
           (config ())
       in
       expect_named_contains "multiline line one" multiline "Line 1";
-      expect_named_contains "multiline line two" multiline "Line 2";
+      expect_named_not_contains "multiline line two" multiline "Line 2";
       ignore ellipsis;
-      expect_named_contains "multiline line three" multiline "Line 3";
-      expect_named_contains "multiline line four" multiline "Line 4";
-      expect_named_contains "multiline line five" multiline "Line 5");
+      expect_named_not_contains "multiline line three" multiline "Line 3";
+      expect_named_not_contains "multiline line four" multiline "Line 4";
+      expect_named_not_contains "multiline line five" multiline "Line 5");
+
+  test "CLI parity list task aligns status after accented latin titles"
+    (fun () ->
+      let accented_title =
+        decode_uri_component
+          "Diese%20Vorteile%20k%C3%B6nnten%20besonders%20f%C3%BCr%20eine"
+      in
+      let item id title =
+        Edn_util.map
+          [
+            (Edn_util.keyword "db/id", Edn_util.int64 id);
+            (Edn_util.keyword "block/title", Edn_util.string title);
+            ( Edn_util.keyword "logseq.property/status",
+              Edn_util.keyword "logseq.property/status.todo" );
+          ]
+      in
+      let value =
+        Edn_util.map_vec
+          (Vec.singleton
+             ( Edn_util.keyword "items",
+               Edn_util.vector_vec
+                 (Vec.of_array [| item 1L "yyy"; item 2L accented_title |]) ))
+      in
+      let output =
+        Format_types.format_result
+          ~human_table_headers_order:
+            (Vec.of_array [| "id"; "title"; "status" |])
+          (Cli_result.ok ~command:Command_id.List_task Output.Mode.Human
+             (Cli_result.Raw value))
+          (config ())
+      in
+      let status_column line token =
+        match Js.String.indexOf ~search:token line with
+        | -1 ->
+            fail_test ("missing " ^ token ^ " in line:\n" ^ line ^ "\n" ^ output);
+            0
+        | index -> display_width (String.sub line 0 index)
+      in
+      let lines = Vec.of_array (string_split (string_trim_end output) "\n") in
+      if Vec.length lines = 4 then (
+        let header = Vec.nth lines 0 in
+        let short_row = Vec.nth lines 1 in
+        let accented_row = Vec.nth lines 2 in
+        let expected = status_column header "status" in
+        expect_int "short task status column" expected
+          (status_column short_row "status.todo");
+        expect_int "accented task status column" expected
+          (status_column accented_row "status.todo"))
+      else fail_test ("unexpected list task output:\n" ^ output));
 
   test "CLI parity format upsert summaries use current generic tables"
     (fun () ->
       let raw_ids ids =
+        let ids = Vec.of_array ids in
         Cli_result.Raw
           (Edn_util.map
              [
                ( Edn_util.keyword "result",
-                 Edn_util.vector (List.map Edn_util.int64 ids) );
+                 Edn_util.vector_vec (Vec.map Edn_util.int64 ids) );
              ])
       in
       let upsert_block =
         Format_types.format_result
           (Cli_result.ok ~command:Command_id.Upsert_block Output.Mode.Human
-             (raw_ids [ 201L; 202L ]))
+             (raw_ids [| 201L; 202L |]))
           (config ())
       in
       expect_equal "upsert block table" "Value\n201\n202\nCount: 2" upsert_block;
       let upsert_page =
         Format_types.format_result
           (Cli_result.ok ~command:Command_id.Upsert_page Output.Mode.Human
-             (raw_ids [ 123L ]))
+             (raw_ids [| 123L |]))
           (config ())
       in
       expect_equal "upsert page table" "Value\n123\nCount: 1" upsert_page);
@@ -6699,11 +8582,12 @@ let () =
     (fun () ->
       let success_data =
         Cli_result.Raw
-          (Edn_util.map
-             [
-               ( Edn_util.keyword "result",
-                 Edn_util.map [ (Edn_util.keyword "ok", Edn_util.bool true) ] );
-             ])
+          (Edn_util.map_vec
+             (Vec.singleton
+                ( Edn_util.keyword "result",
+                  Edn_util.map_vec
+                    (Vec.singleton (Edn_util.keyword "ok", Edn_util.bool true))
+                )))
       in
       let page_output =
         Format_types.format_result
@@ -6829,8 +8713,10 @@ let () =
         Format_types.format_result
           (Cli_result.ok ~command:Command_id.Server_list Output.Mode.Human
              (Cli_result.Raw
-                (Edn_util.map
-                   [ (Edn_util.keyword "servers", Edn_util.vector [ server ]) ])))
+                (Edn_util.map_vec
+                   (Vec.singleton
+                      ( Edn_util.keyword "servers",
+                        Edn_util.vector_vec (Vec.singleton server) )))))
           (config ())
       in
       expect_named_contains "server repo header" list_output "repo";
@@ -6840,13 +8726,16 @@ let () =
         Format_types.format_result
           (Cli_result.ok ~command:Command_id.Server_cleanup Output.Mode.Human
              (Cli_result.Raw
-                (Edn_util.map
-                   [
-                     (Edn_util.keyword "cli-revision", Edn_util.string "cli-rev");
-                     (Edn_util.keyword "checked", Edn_util.int64 4321L);
-                     (Edn_util.keyword "mismatched", Edn_util.int64 3210L);
-                     (Edn_util.keyword "killed", Edn_util.vector [ server ]);
-                   ])))
+                (Edn_util.map_vec
+                   (Vec.of_array
+                      [|
+                        ( Edn_util.keyword "cli-revision",
+                          Edn_util.string "cli-rev" );
+                        (Edn_util.keyword "checked", Edn_util.int64 4321L);
+                        (Edn_util.keyword "mismatched", Edn_util.int64 3210L);
+                        ( Edn_util.keyword "killed",
+                          Edn_util.vector_vec (Vec.singleton server) );
+                      |]))))
           (config ())
       in
       expect_named_contains "cleanup checked row" cleanup_output "checked";
@@ -6875,8 +8764,7 @@ let () =
       let validation_error =
         Format_types.format_result
           (Cli_result.error ~command:Command_id.Graph_validate Output.Mode.Human
-             (Error.make
-                (Edn_util.keyword_t "graph-validation-failed")
+             (Error.make Error.Graph_validation_failed
                 "Found 1 entity with errors:\n({:entity {:db/id 1}})\n"))
           (config ())
       in
@@ -6936,7 +8824,7 @@ let () =
                   "Logseq restarted db-worker-node, but the replacement still \
                    reports a different revision. Check the installed Logseq \
                    build and retry"
-                (Edn_util.keyword_t "server-revision-mismatch-after-restart")
+                Error.Server_revision_mismatch_after_restart
                 "db-worker-node revision still does not match after restart"))
           (config ())
       in

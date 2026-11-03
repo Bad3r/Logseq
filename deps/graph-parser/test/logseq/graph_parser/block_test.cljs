@@ -2,6 +2,7 @@
   (:require [cljs.test :refer [deftest are testing is]]
             [datascript.core :as d]
             [logseq.common.uuid :as common-uuid]
+            [logseq.db.test.helper :as db-test]
             [logseq.graph-parser.block :as gp-block]
             [logseq.graph-parser.mldoc :as gp-mldoc]))
 
@@ -14,6 +15,21 @@
         [k v mldoc-ast]))
     properties)
    user-config))
+
+(deftest with-parent-and-order-normalizes-irregular-outdent
+  (let [blocks (mapv (fn [id level]
+                       {:block/uuid id
+                        :block/level level})
+                     [:a :b :c :d :e]
+                     [1 3 5 2 3])
+        result (mapv #(select-keys % [:block/uuid :block/parent :block/level])
+                     (gp-block/with-parent-and-order :page blocks))]
+    (is (= [{:block/uuid :a :block/parent :page :block/level 1}
+            {:block/uuid :b :block/parent [:block/uuid :a] :block/level 2}
+            {:block/uuid :c :block/parent [:block/uuid :b] :block/level 3}
+            {:block/uuid :d :block/parent [:block/uuid :a] :block/level 2}
+            {:block/uuid :e :block/parent [:block/uuid :a] :block/level 2}]
+           result))))
 
 (deftest test-fix-duplicate-id
   (are [x y]
@@ -111,12 +127,53 @@
   (testing "slash-formatted journals do not keep namespace metadata"
     (let [journal (gp-block/page-name->map "2026/05/18" nil false "yyyy/MM/dd")]
       (is (= 20260518 (:block/journal-day journal)))
+      (is (= "2026/05/18" (:block/title journal)))
+      (is (= "may 18th, 2026" (:block/name journal)))
       (is (= (common-uuid/gen-uuid :journal-page-uuid 20260518)
              (:block/uuid journal)))
       (is (nil? (:block/namespace journal)))))
   (testing "non-journal slash pages keep namespace metadata"
     (is (= {:block/name "project"}
            (:block/namespace (gp-block/page-name->map "project/child" nil false "yyyy/MM/dd"))))))
+
+(deftest existing-journal-reference-reuses-stored-identity-test
+  (testing "a legacy journal name is not rewritten while parsing a reference"
+    (let [conn (db-test/create-conn-with-blocks
+                {:pages-and-blocks [{:page {:build/journal 20260727}}]})
+          journal (db-test/find-journal-by-journal-day @conn 20260727)
+          journal-uuid (:block/uuid journal)]
+      (d/transact! conn [[:db/add :logseq.class/Journal
+                          :logseq.property.journal/title-format "yyyy-MM-dd"]
+                         {:db/id (:db/id journal)
+                          :block/title "2026-07-27"
+                          :block/name "2026-07-27"}])
+      (let [reference (gp-block/page-name->map "2026-07-27" @conn false "yyyy-MM-dd")]
+        (is (= {:block/uuid journal-uuid
+                :block/title "2026-07-27"
+                :block/name "2026-07-27"
+                :block/journal-day 20260727}
+               (select-keys reference
+                            [:block/uuid :block/title :block/name :block/journal-day]))))))
+
+  (testing "an existing journal is found by day after the configured format changes"
+    (let [conn (db-test/create-conn-with-blocks
+                {:pages-and-blocks [{:page {:build/journal 20260727}}]})
+          journal (db-test/find-journal-by-journal-day @conn 20260727)
+          journal-uuid (:block/uuid journal)]
+      (d/transact! conn [[:db/add :logseq.class/Journal
+                          :logseq.property.journal/title-format "yyyy-MM-dd"]
+                         {:db/id (:db/id journal)
+                          :block/title "2026-07-27"
+                          :block/name "2026-07-27"}])
+      (d/transact! conn [[:db/add :logseq.class/Journal
+                          :logseq.property.journal/title-format "dd/MM/yyyy"]])
+      (let [reference (gp-block/page-name->map "27/07/2026" @conn false "dd/MM/yyyy")]
+        (is (= {:block/uuid journal-uuid
+                :block/title "2026-07-27"
+                :block/name "2026-07-27"
+                :block/journal-day 20260727}
+               (select-keys reference
+                            [:block/uuid :block/title :block/name :block/journal-day])))))))
 
 (defn find-block-for-content
   [db content]
@@ -127,3 +184,21 @@
             content)
        (map first)
        first))
+
+(defn- first-heading-link
+  [content]
+  (->> (gp-mldoc/->edn content (gp-mldoc/default-config :markdown))
+       ffirst
+       second
+       :title
+       first))
+
+(deftest get-page-reference-file-link-formatted-labels
+  (testing "File-link labels yield a plain page-ref string"
+    (are [content page-ref]
+         (= page-ref
+            (gp-block/get-page-reference (first-heading-link content) :markdown))
+      "- [k](a.md)" "k"
+      "- [~~k~~](a.md)" "k"
+      "- [**k**](a.md)" "k"
+      "- [*k*](a.md)" "k")))

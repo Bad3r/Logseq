@@ -400,17 +400,60 @@
                        {:db/ident ident :block/order order}))))]
     (into new-properties-tx existing-property-orders-tx)))
 
-(defn- build-class-extends [{:build/keys [class-parent class-extends]} class-db-ids]
-  (when-let [class-extends' (if class-parent
-                              (do (println "Warning: :build/class-parent is deprecated and will be removed soon.")
-                                  [class-parent])
-                              class-extends)]
+(defn- effective-class-extends
+  [{:build/keys [class-parent class-extends]}]
+  (if class-parent [class-parent] class-extends))
+
+(defn- build-class-extends [class-config class-db-ids]
+  (when (:build/class-parent class-config)
+    (println "Warning: :build/class-parent is deprecated and will be removed soon."))
+  (when-let [class-extends' (effective-class-extends class-config)]
     (mapv (fn [c]
             (or (class-db-ids c)
                 (if (db-malli-schema/class? c)
                   c
                   (throw (ex-info (str "No :db/id for " c) {})))))
           class-extends')))
+
+(defn- validate-class-extends-acyclic!
+  [classes all-idents]
+  (when (some (fn [[_ class-config]]
+                (seq (effective-class-extends class-config)))
+              classes)
+    (let [class-idents (set (map #(get-ident all-idents %) (keys classes)))
+          edges (->> classes
+                     (mapcat (fn [[class-name class-config]]
+                               (let [class-ident (get-ident all-idents class-name)]
+                                 (keep (fn [parent]
+                                         (let [parent-ident (get-ident all-idents parent)]
+                                           (when (contains? class-idents parent-ident)
+                                             [class-ident parent-ident])))
+                                       (effective-class-extends class-config))))))
+          [outgoing incoming-counts]
+          (reduce (fn [[outgoing counts] [class-ident parent-ident]]
+                    [(update outgoing class-ident (fnil conj []) parent-ident)
+                     (update counts parent-ident inc)])
+                  [{} (zipmap class-idents (repeat 0))]
+                  edges)
+          initial-queue (into [] (filter #(zero? (incoming-counts %))) class-idents)]
+      (loop [queue initial-queue
+             queue-index 0
+             remaining-incoming incoming-counts]
+        (if (< queue-index (count queue))
+          (let [class-ident (nth queue queue-index)
+                [next-incoming unlocked]
+                (reduce (fn [[counts unlocked-idents] parent-ident]
+                          (let [next-count (dec (counts parent-ident))]
+                            [(assoc counts parent-ident next-count)
+                             (cond-> unlocked-idents
+                               (zero? next-count) (conj parent-ident))]))
+                        [remaining-incoming []]
+                        (get outgoing class-ident))]
+            (recur (into queue unlocked)
+                   (inc queue-index)
+                   next-incoming))
+          (when-not (= queue-index (count class-idents))
+            (throw (ex-info "Cycle detected in :build/class-extends" {}))))))))
 
 (defn- build-classes-tx [classes properties-config uuid-maps all-idents {:keys [build-existing-tx?] :as options}]
   (let [classes' (if build-existing-tx?
@@ -425,10 +468,14 @@
                     (mapcat
                      (fn [[class-name {:build/keys [class-properties] :as class-m}]]
                        (let [db-ident (get-ident all-idents class-name)
+                             ;; User tags use a random ident suffix. Name the page from the
+                             ;; human title when present, matching in-app tag creation and
+                             ;; build-new-property. Ident-only classes still fall back to the ident name.
+                             title (or (:block/title class-m) (name class-name))
                              new-block
                              (sqlite-util/build-new-class
-                              {:block/name (common-util/page-name-sanity-lc (name class-name))
-                               :block/title (name class-name)
+                              {:block/name (common-util/page-name-sanity-lc title)
+                               :block/title title
                                :block/uuid (or (:block/uuid class-m)
                                                (common-uuid/gen-uuid :db-ident-block-uuid db-ident))
                                :db/ident db-ident
@@ -860,6 +907,7 @@
         page-uuids (create-page-uuids pages-and-blocks')
         {:keys [classes properties]} (if auto-create-ontology? (auto-create-ontology options) options)
         all-idents (create-all-idents properties classes options)
+        _ (validate-class-extends-acyclic! classes all-idents)
         properties-tx (build-properties-tx properties classes page-uuids all-idents options)
         classes-tx (build-classes-tx classes properties page-uuids all-idents options)
         class-ident->id (->> classes-tx (map (juxt :db/ident :db/id)) (into {}))

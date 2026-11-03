@@ -7,6 +7,14 @@ logseq.db.frontend.rules/rules
 ;; API
 logseq.db.frontend.rules/rules-dependencies
 ;; API
+logseq.db.frontend.query-dsl/pre-transform
+;; API
+logseq.db.frontend.query-dsl/simplify-query
+;; API
+logseq.db.frontend.query-dsl/get-timestamp-property
+;; API
+logseq.db.frontend.query-dsl/custom-readers
+;; API
 logseq.db.frontend.inputs/resolve-input
 ;; API
 logseq.db.frontend.class/build-new-class
@@ -14,6 +22,8 @@ logseq.db.frontend.class/build-new-class
 logseq.db.frontend.class/logseq-class?
 ;; API
 logseq.db.frontend.class/disallowed-inline-tags
+;; Used outside deps/db by frontend worker flashcard and query-dsl handlers.
+logseq.db.frontend.class/card-class-ids
 ;; API
 logseq.db.frontend.db-ident/ensure-unique-db-ident
 ;; API

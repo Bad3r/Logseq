@@ -26,17 +26,17 @@ type schema = {
   public : bool option;
 }
 
-type assignment = { key : key; value : Melange_edn.any }
+type assignment = { key : key; value : Melange_edn_melange.any }
 
 type update_plan = {
-  update_tags : Selector.tag list;
-  remove_tags : Selector.tag list;
-  update_properties : assignment list;
-  remove_properties : key list;
+  update_tags : Selector.tag Rrbvec.t;
+  remove_tags : Selector.tag Rrbvec.t;
+  update_properties : assignment Rrbvec.t;
+  remove_properties : key Rrbvec.t;
 }
 
 val empty_update_plan : update_plan
-val parse_key : Melange_edn.any -> key option
+val parse_key : Melange_edn_melange.any -> key option
 val kind_of_string : string -> kind option
 val string_of_kind : kind -> string
 val cardinality_of_string : string -> cardinality option

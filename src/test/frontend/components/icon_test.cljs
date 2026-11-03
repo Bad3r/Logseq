@@ -2,29 +2,63 @@
   (:require [cljs.test :refer [deftest is testing]]
             [frontend.components.icon :as icon]))
 
-(deftest normalize-tabs
-  (testing "limits tabs and default tab selection"
-    (let [{:keys [tabs default-tab has-icon-tab?]}
-          (#'icon/normalize-tabs [[:emoji "Emojis"]] nil)]
-      (is (= [[:emoji "Emojis"]] tabs))
-      (is (= :emoji default-tab))
-      (is (false? has-icon-tab?)))))
+(deftest icon-search-keeps-horizontal-arrows-inside-picker
+  (doseq [key ["ArrowLeft" "ArrowRight"]]
+    (testing key
+      (let [event (js/Event. "keydown" #js {:bubbles true :cancelable true})]
+        (set! (.-key event) key)
+        (#'icon/icon-search-keydown event)
+        (is (.-cancelBubble event)
+            "Horizontal arrows must not reach editor navigation")
+        (is (not (.-defaultPrevented event))
+            "Search input caret movement must retain its native behavior"))))
+  (doseq [key ["Escape" "Enter" "Tab" "a"]]
+    (testing key
+      (let [event (js/Event. "keydown" #js {:bubbles true :cancelable true})]
+        (set! (.-key event) key)
+        (#'icon/icon-search-keydown event)
+        (is (not (.-cancelBubble event)))
+        (is (not (.-defaultPrevented event)))))))
 
-(deftest emoji-sections
-  (testing "includes frequently used before emojis when enabled"
-    (let [used [{:id "star" :type :emoji}
-                {:id "alert-circle" :type :tabler-icon}]
-          emojis [{:id "a"} {:id "b"}]
-          sections (#'icon/emoji-sections emojis used true)]
-      (is (= ["Frequently used" "Emojis (2)"]
-             (map :title sections)))
-      (is (= [{:id "star" :type :emoji}]
-             (-> sections first :items))))))
-
-(deftest emoji-sections-layout
-  (testing "frequently used uses non-virtual list while emojis remain virtual"
-    (let [used [{:id "star" :type :emoji}]
-          emojis [{:id "a"}]
-          sections (#'icon/emoji-sections emojis used true)]
-      (is (false? (-> sections first :virtual-list?)))
-      (is (true? (-> sections second :virtual-list?))))))
+(deftest node-icon-precedence-matches-sidebar-and-command-results-test
+  (let [own-icon {:type :emoji :id "sparkles"}
+        tag-icon {:type :tabler-icon :id "rocket" :color "#ff0000"}
+        tag {:db/id 2
+             :db/ident :user.class/project
+             :logseq.property/icon tag-icon}
+        page-tag {:db/id 3 :db/ident :logseq.class/Page}
+        class-tag {:db/id 4 :db/ident :logseq.class/Tag}
+        property-tag {:db/id 5 :db/ident :logseq.class/Property}
+        tagged-page {:db/id 1
+                     :block/name "tagged-page"
+                     :block/tags [tag page-tag]}]
+    (testing "the node's own icon wins"
+      (is (= own-icon
+             (icon/get-node-icon (assoc tagged-page :logseq.property/icon own-icon)
+                                 {}))))
+    (testing "an inherited tag icon wins over generic block and page fallbacks"
+      (is (= tag-icon
+             (icon/get-node-icon {:db/id 1 :block/tags [tag]} {})))
+      (is (= tag-icon
+             (icon/get-node-icon tagged-page {})))
+      (is (some? (icon/get-node-icon-cp tagged-page {:not-text-or-page? true}))))
+    (testing "a PDF asset icon wins over an inherited tag icon"
+      (is (= "book"
+             (icon/get-node-icon {:db/id 1
+                                  :block/tags [tag]
+                                  :logseq.property.asset/type "pdf"}
+                                 {}))))
+    (testing "page, class, and property fallbacks stay deterministic"
+      (is (= "file"
+             (icon/get-node-icon {:db/id 1
+                                  :block/name "page"
+                                  :block/tags [page-tag]}
+                                 {})))
+      (is (= "hash"
+             (icon/get-node-icon {:db/id 1
+                                  :block/tags [tag class-tag]}
+                                 {})))
+      (is (= "letter-p"
+             (icon/get-node-icon {:db/id 1
+                                  :block/tags [tag property-tag]}
+                                 {}))))))

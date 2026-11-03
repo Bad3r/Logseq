@@ -2,6 +2,7 @@
   "Shared helpers for db-based API calls."
   (:require [clojure.string :as string]
             [datascript.core :as d]
+            [logseq.api.db-based.util :as api-util]
             [logseq.common.util :as common-util]
             [logseq.common.util.date-time :as date-time-util]
             [logseq.db :as ldb]
@@ -65,29 +66,33 @@
         block-eids (mapv :e datoms)
         block-ents (map #(d/entity db %) block-eids)
         blocks (map #(assoc % :block/title (db-content/recur-replace-uuid-in-block-title %)) block-ents)]
-    (->> (otree/blocks->vec-tree db blocks page-id)
-         (map #(update % :block/uuid str)))))
+    (otree/blocks->vec-tree db blocks page-id)))
 
-(defn ^:api remove-hidden-properties
-  "Given an entity map, remove properties that shouldn't be returned in api calls"
-  [m]
-  (->> (remove (fn [[k _v]]
-                 (or (= "block.temp" (namespace k))
-                     (contains? #{:block/tx-id} k))) m)
-       (into {})))
+(def remove-hidden-properties api-util/remove-hidden-properties)
+
+(defn- sanitize-page-block
+  "Apply API cleanup to a page-tree node and every descendant.
+  Keep :block/children so GetPage / get-page-data can return the full outline."
+  [block]
+  (let [children (:block/children block)]
+    (cond-> (-> block
+                remove-hidden-properties
+                ;; :block/page is an untranslated entity; empty children are omitted
+                ;; so leaf blocks keep the previous top-level field set
+                (dissoc :block/page :block/children)
+                (update :block/uuid str))
+      (seq children)
+      (assoc :block/children (mapv sanitize-page-block children)))))
 
 (defn get-page-data
-  "Get page data for GetPage tool including the page's entity and its blocks"
+  "Get page data for GetPage tool including the page's entity and its blocks
+  as a nested tree under :block/children."
   [db page-name-or-uuid]
   (when-let [page (ldb/get-page db page-name-or-uuid)]
     {:entity (-> (remove-hidden-properties page)
                  (dissoc :block/tags :block/refs)
                  (update :block/uuid str))
-     :blocks (map #(-> %
-                       remove-hidden-properties
-                       ;; remove unused and untranslated attrs
-                       (dissoc :block/children :block/page))
-                  (get-page-blocks db (:db/id page)))}))
+     :blocks (mapv sanitize-page-block (get-page-blocks db (:db/id page)))}))
 
 (defn list-pages
   "Main fn for ListPages tool"
@@ -116,13 +121,22 @@
     (get-in op [:data :tags])
     (assoc :build/tags (mapv #(get-ident class-idents %) (get-in op [:data :tags])))))
 
+(defn- ops->new-page-ids
+  "Local :id's of pages added in the same call"
+  [operations]
+  (->> operations
+       (filter #(and (= "page" (:entityType %)) (= "add" (:operation %))))
+       (keep :id)
+       set))
+
 (defn- ops->existing-pages-and-blocks
   "Converts block operations for existing pages and prepares them for :pages-and-blocks"
   [db operations idents]
-  (let [new-blocks-for-existing-pages
+  (let [new-page-ids (ops->new-page-ids operations)
+        new-blocks-for-existing-pages
         (->> (filter #(and (= "block" (:entityType %))
                            (= "add" (:operation %))
-                           (common-util/uuid-string? (get-in % [:data :page-id]))) operations)
+                           (not (contains? new-page-ids (get-in % [:data :page-id])))) operations)
              (map (fn [op] (assoc op ::page-id (uuid (get-in op [:data :page-id]))))))
         edit-blocks
         (->> (filter #(and (= "block" (:entityType %)) (= "edit" (:operation %))) operations)
@@ -305,6 +319,22 @@
 (def ^:private Upsert-nodes-operations-schema
   [:sequential upsert-nodes-operation-schema])
 
+(defn- assert-add-block-page-ids!
+  "page-id must be the :id of a page added in the same call or the uuid of an
+   existing page. A page name is not resolved and would otherwise be silently dropped."
+  [db operations]
+  (let [new-page-ids (ops->new-page-ids operations)]
+    (doseq [op (filter #(and (= "block" (:entityType %)) (= "add" (:operation %))) operations)]
+      (let [page-id (get-in op [:data :page-id])]
+        (when-not (contains? new-page-ids page-id)
+          (when-not (common-util/uuid-string? page-id)
+            (throw (ex-info (str "Block page-id " (pr-str page-id)
+                                 " must be a page uuid or the id of a page added in the same call")
+                            {:page-id page-id})))
+          (when-not (entity-util/page? (d/entity db [:block/uuid (uuid page-id)]))
+            (throw (ex-info (str "Block page-id " (pr-str page-id) " is not an existing page")
+                            {:page-id page-id}))))))))
+
 (defn- validate-import-edn
   "Validates everything as coming from add operations, failing fast on first invalid
   node. Will need to adjust add operation assumption when supporting editing pages"
@@ -330,19 +360,6 @@
                            " " (pr-str (:title (ex-data e))) " is invalid: " (ex-message e))
                       (ex-data e))))))
 
-(defn ^:api summarize-upsert-operations [operations {:keys [dry-run]}]
-  (let [counts (reduce (fn [acc op]
-                         (let [entity-type (keyword (:entityType op))
-                               operation-type (keyword (:operation op))]
-                           (update-in acc [operation-type entity-type] (fnil inc 0))))
-                       {}
-                       operations)]
-    (str (if dry-run "Dry run: " "")
-         (when (counts :add)
-           (str "Added: " (pr-str (counts :add)) "."))
-         (when (counts :edit)
-           (str " Edited: " (pr-str (counts :edit)) ".")))))
-
 (defn ^:api build-upsert-nodes-edn
   "Given llm generated operations, builds the import EDN, validates it and returns it. It fails
    fast on anything invalid"
@@ -361,6 +378,7 @@
         _ (when-let [errors (m/explain Upsert-nodes-operations-schema operations)]
             (throw (ex-info (str "Tool arguments are invalid:\n" (me/humanize errors))
                             {:errors errors})))
+        _ (assert-add-block-page-ids! db operations)
         idents (operations->idents db operations)
         pages-and-blocks (ops->pages-and-blocks db operations idents)
         classes (ops->classes operations idents)

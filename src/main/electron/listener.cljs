@@ -7,13 +7,13 @@
             [electron.ipc :as ipc]
             [electron.locale :as electron-locale]
             [frontend.context.i18n :as i18n]
-            [frontend.db :as db]
             [frontend.db.async :as db-async]
             [frontend.handler.notification :as notification]
             [frontend.handler.route :as route-handler]
             [frontend.handler.search :as search-handler]
             [frontend.handler.ui :as ui-handler]
             [frontend.handler.user :as user]
+            [frontend.persist-db :as persist-db]
             [frontend.state :as state]
             [frontend.ui :as ui]
             [promesa.core :as p]))
@@ -26,6 +26,11 @@
 
 (defn ^:large-vars/cleanup-todo listen-to-electron!
   []
+  (safe-api-call "graph-lifecycle"
+                 (fn [data]
+                   (let [{:keys [repo phase generation]} (bean/->clj data)]
+                     (persist-db/<invalidate-remote-repo! repo phase generation))))
+
   (safe-api-call "notification"
                  (fn [data]
                    (let [{:keys [type payload i18n-key i18n-args]} (bean/->clj data)
@@ -66,8 +71,9 @@
                    (let [{:keys [page-name block-id]} (bean/->clj data)]
                      (cond
                        page-name
-                       (when (db/get-page page-name)
-                         (route-handler/redirect-to-page! page-name {:block-id block-id}))
+                       (p/let [page (db-async/<get-block (state/get-current-repo) page-name {:children? false})]
+                         (when page
+                           (route-handler/redirect-to-page! page-name {:block-id block-id})))
 
                        block-id
                        (p/let [block (db-async/<get-block (state/get-current-repo) block-id {:children? false})]

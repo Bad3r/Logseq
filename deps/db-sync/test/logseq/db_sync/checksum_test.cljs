@@ -210,6 +210,33 @@
       (is (not= before-checksum full))
       (is (= full incremental)))))
 
+(deftest incremental-checksum-matches-recompute-when-ineligible-referenced-entity-is-retracted-test
+  (testing "incremental checksum tracks children when normalized tx data retracts a referenced non-checksum-eligible entity"
+    (let [parent-uuid (random-uuid)
+          child-uuid (random-uuid)
+          page-uuid (random-uuid)
+          db-before (-> (d/empty-db db-schema/schema)
+                        (d/db-with [{:db/id 1
+                                     :block/uuid page-uuid
+                                     :block/name "page-a"
+                                     :block/title "Page A"}
+                                    {:db/id 2
+                                     :block/uuid parent-uuid
+                                     :block/title "Orphan parent"}
+                                    {:db/id 3
+                                     :block/uuid child-uuid
+                                     :block/title "Child"
+                                     :block/parent 2
+                                     :block/page 1}]))
+          before-checksum (checksum/recompute-checksum db-before)
+          tx-report* (d/with db-before [[:db/retractEntity [:block/uuid parent-uuid]]])
+          tx-report (assoc tx-report*
+                           :tx-data [[:db/retractEntity [:block/uuid parent-uuid]]])
+          full (checksum/recompute-checksum (:db-after tx-report))
+          incremental (checksum/update-checksum before-checksum tx-report)]
+      (is (not= before-checksum full))
+      (is (= full incremental)))))
+
 (deftest incremental-checksum-matches-recompute-when-block-is-readded-test
   (testing "incremental checksum remains equal to recompute when a block is deleted and re-added with the same UUID"
     (let [db0 (sample-db)
@@ -223,6 +250,51 @@
                                               :block/title "Child"
                                               :block/parent [:block/uuid parent-uuid]
                                               :block/page [:block/uuid page-uuid]}]))))
+
+(deftest incremental-checksum-matches-recompute-when-block-is-readded-with-uuid-tempid-test
+  (testing "server rebase txs can delete and recreate the same block using a UUID string tempid"
+    (let [db0 (sample-db)
+          checksum0 (checksum/recompute-checksum db0)
+          block-uuid (random-uuid)
+          block-tempid (str block-uuid)
+          page-uuid (:block/uuid (d/entity db0 1))
+          parent-uuid (:block/uuid (d/entity db0 3))
+          tx-data [[:db/add block-tempid :block/uuid block-uuid 536871536]
+                   [:db/add block-tempid :block/title "undo redo block" 536871536]
+                   [:db/add block-tempid :block/parent [:block/uuid parent-uuid] 536871536]
+                   [:db/add block-tempid :block/order "a0" 536871536]
+                   [:db/add block-tempid :block/page [:block/uuid page-uuid] 536871536]]
+          {:keys [db checksum]} (assert-incremental=full! db0 checksum0 tx-data)
+          {:keys [db checksum]} (assert-incremental=full! db checksum [[:db/retractEntity [:block/uuid block-uuid]]])]
+      (assert-incremental=full!
+       db
+       checksum
+       [[:db/add block-tempid :block/uuid block-uuid 536871538]
+        [:db/add block-tempid :block/title "undo redo block" 536871538]
+        [:db/add block-tempid :block/parent [:block/uuid parent-uuid] 536871538]
+        [:db/add block-tempid :block/order "a0" 536871538]
+        [:db/add block-tempid :block/page [:block/uuid page-uuid] 536871538]]))))
+
+(deftest incremental-checksum-matches-recompute-with-normalized-vector-tx-data-test
+  (testing "incremental checksum tracks normalized tx vectors persisted in server tx_log"
+    (let [db-before (sample-db)
+          checksum-before (checksum/recompute-checksum db-before)
+          block-uuid (random-uuid)
+          block-tempid (str block-uuid)
+          parent-uuid (:block/uuid (d/entity db-before 3))
+          page-uuid (:block/uuid (d/entity db-before 1))
+          normalized-tx-data [[:db/add block-tempid :block/uuid block-uuid 536871538]
+                              [:db/add block-tempid :block/title "normalized block" 536871538]
+                              [:db/add block-tempid :block/parent [:block/uuid parent-uuid] 536871538]
+                              [:db/add block-tempid :block/order "a0" 536871538]
+                              [:db/add block-tempid :block/page [:block/uuid page-uuid] 536871538]]
+          tx-report (d/with db-before normalized-tx-data)
+          full (checksum/recompute-checksum (:db-after tx-report))
+          incremental (checksum/update-checksum
+                       checksum-before
+                       (assoc tx-report :tx-data normalized-tx-data))]
+      (is (not= checksum-before full))
+      (is (= full incremental)))))
 
 (deftest incremental-checksum-matches-recompute-when-delete-tree-undo-and-delete-again-test
   (testing "incremental checksum matches recompute across delete-tree, undo-all, then delete-tree-again"
@@ -455,6 +527,18 @@
           incremental (checksum/update-checksum checksum-before tx-report)]
       (is (= full incremental)))))
 
+(deftest incremental-checksum-matches-recompute-for-entity-with-two-block-uuids-test
+  (testing "an edit of an entity whose stored datoms hold 2 :block/uuid values (init-db does not check cardinality) keeps the incremental checksum equal to the recompute, which counts the entity once per uuid datom"
+    (let [db (d/init-db (map (fn [[e a v]] (d/datom e a v))
+                             [[1 :block/uuid (random-uuid)] [1 :block/name "page-a"]
+                              [2 :block/uuid (random-uuid)] [2 :block/uuid (random-uuid)]
+                              [2 :block/title "Block"] [2 :block/page 1]])
+                        db-schema/schema)
+          tx-report (d/with db [[:db/add 2 :block/title "Block edited"]])
+          checksum-before (checksum/recompute-checksum (:db-before tx-report))]
+      (is (= (checksum/recompute-checksum (:db-after tx-report))
+             (checksum/update-checksum checksum-before tx-report))))))
+
 (deftest checksum-ignores-non-page-non-block-entities-test
   (testing "entities with uuid but without page semantics do not affect checksum"
     (let [db0 (sample-db)
@@ -473,3 +557,26 @@
       (is (= checksum0 incremental1))
       (is (= checksum0 full2))
       (is (= full2 incremental2)))))
+
+(deftest derived-import-attributes-do-not-rescan-entities
+  (let [db (sample-db)
+        checksum-before (checksum/recompute-checksum db)
+        tx [[:db/add 3 :block/tx-id 100]
+            [:db/add 3 :block/refs 2]
+            [:db/add 4 :block/tx-id 100]]
+        report (d/with db tx)
+        entity-fn d/entity]
+    (doseq [tx-data [(:tx-data report) tx]]
+      (let [entity-reads (atom 0)
+            actual (with-redefs [d/entity (fn [db eid]
+                                            (when (int? eid) (swap! entity-reads inc))
+                                            (entity-fn db eid))]
+                     (checksum/update-checksum checksum-before (assoc report :tx-data tx-data)))]
+        (is (= checksum-before actual))
+        (is (zero? @entity-reads)
+            "Derived import attributes cannot change the checksum or require entity scans")))
+    (is (= (checksum/recompute-checksum (:db-after report))
+           (checksum/update-checksum nil report))
+        "An invalid initial checksum is still repaired")
+    (assert-incremental=full! db checksum-before
+                              (conj tx [:db/add 3 :block/title "Changed title"]))))

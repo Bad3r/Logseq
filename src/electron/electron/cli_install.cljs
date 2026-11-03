@@ -18,18 +18,28 @@
       user-bin)))
 
 (defn- render-unix-cli-launcher
-  [exe-path cli-path]
+  [exe-path bootstrap]
   (str "#!/usr/bin/env sh\n"
        "# " CLI_LAUNCHER_MARKER "\n"
        "set -eu\n"
-       "ELECTRON_RUN_AS_NODE=1 exec \"" exe-path "\" \"" cli-path "\" \"$@\"\n"))
+       "ELECTRON_RUN_AS_NODE=1 exec '" (string/replace exe-path "'" "'\\''")
+       "' -e '" (string/replace bootstrap "'" "'\\''") "' -- \"$@\"\n"))
 
 (defn- render-win-cli-launcher
-  [exe-path cli-path]
+  [exe-path bootstrap]
   (str "@echo off\r\n"
        "REM " CLI_LAUNCHER_MARKER "\r\n"
-       "set ELECTRON_RUN_AS_NODE=1\r\n"
-       "\"" exe-path "\" \"" cli-path "\" %*\r\n"))
+       "setlocal DisableDelayedExpansion\r\n"
+       "set \"ELECTRON_RUN_AS_NODE=1\"\r\n"
+       "\"" (string/replace exe-path "%" "%%") "\" -e \"" bootstrap "\" -- %*\r\n"))
+
+(defn- cli-bootstrap
+  [packaged? cli-path]
+  (let [cli-expression (if packaged?
+                         "require('node:path').join(process.resourcesPath,'app.asar','js','logseq-cli.js')"
+                         (str "Buffer.from('" (.toString (.from js/Buffer cli-path "utf8") "base64")
+                              "','base64').toString('utf8')"))]
+    (str "const cli=" cli-expression ";process.argv.splice(1,0,cli);require(cli);")))
 
 (defn- launcher-exe-path
   [{:keys [windows? exe-path appimage-path]}]
@@ -57,14 +67,9 @@
   (or (some-> error .-message)
       (str error)))
 
-(defn- default-defer!
-  [f]
-  (js/setTimeout f 0)
-  nil)
-
 (defn install-cli-launcher!
-  [{:keys [windows? cli-path cli-dir cli-dir! path-join exists? show-message-box!
-           show-error-box! defer! t log-info! log-warn!]
+  [{:keys [windows? packaged? cli-path cli-dir cli-dir! path-join exists?
+           show-error-box! t log-info! log-warn!]
     :as deps}]
   (try
     (let [cli-dir (if cli-dir! (cli-dir!) cli-dir)]
@@ -81,17 +86,14 @@
         :else
         (let [target-path (path-join cli-dir (if windows? "logseq.cmd" "logseq"))
               exe-path (launcher-exe-path deps)
+              bootstrap (cli-bootstrap packaged? cli-path)
               content (if windows?
-                        (render-win-cli-launcher exe-path cli-path)
-                        (render-unix-cli-launcher exe-path cli-path))
-              display-dir (if windows? cli-dir "~/.local/bin")]
+                        (render-win-cli-launcher exe-path bootstrap)
+                        (render-unix-cli-launcher exe-path bootstrap))]
           (when (write-cli-launcher! (assoc deps
                                             :target-path target-path
                                             :content content))
-            (log-info! :cli/install (str "Installed launcher at " target-path))
-            ((or defer! default-defer!)
-             #(show-message-box! {:title "Logseq"
-                                  :message (t :electron/cli-installed display-dir)}))))))
+            (log-info! :cli/install (str "Installed launcher at " target-path))))))
     (catch :default error
       (let [message (error-message error)]
         (log-warn! :cli/install "Failed to install logseq launcher" error)

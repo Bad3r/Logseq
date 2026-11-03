@@ -1,5 +1,9 @@
 type block_opts = { id_raw : string option; uuid : Cli_primitive.uuid option }
-type page_opts = { id : Cli_primitive.db_id option; page : string option }
+type page_opts = {
+  id : Cli_primitive.db_id option;
+  page : string option;
+  force : bool;
+}
 
 type named_entity_opts = {
   id : Cli_primitive.db_id option;
@@ -17,7 +21,7 @@ type action =
       repo : Cli_primitive.repo;
       graph : Cli_primitive.graph;
       id : Cli_primitive.db_id option;
-      ids : Cli_primitive.db_id list;
+      ids : Cli_primitive.db_id Rrbvec.t;
       multi_id : bool;
       uuid : Cli_primitive.uuid option;
     }
@@ -26,6 +30,7 @@ type action =
       graph : Cli_primitive.graph;
       id : Cli_primitive.db_id option;
       page : string option;
+      force : bool;
     }
   | Remove_tag of {
       repo : Cli_primitive.repo;

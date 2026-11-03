@@ -1,7 +1,7 @@
 (ns frontend.util.url
   "Util fns related to protocol url"
   (:require [clojure.string :as string]
-            [frontend.db.conn :as db-conn]))
+            [frontend.util.repo :as repo-util]))
 
 ;; Keep same as electron/electron.core
 (def LSP_SCHEME "logseq")
@@ -12,8 +12,8 @@
 
 (defn get-local-repo-identifier
   [repo]
-  (let [repo-name (db-conn/get-repo-name repo)]
-    (db-conn/get-short-repo-name repo-name)))
+  (let [repo-name (repo-util/get-repo-name repo)]
+    (repo-util/get-short-repo-name repo-name)))
 
 (defn get-repo-id-url
   "Get Logseq protocol URL, w/o param (v0.1).
@@ -57,9 +57,13 @@
   [s]
   (string/replace s #"/+$" ""))
 
+(defn- present-url-part?
+  [v]
+  (and (string? v) (not (string/blank? v))))
+
 (defn- required-url-part!
   [k v]
-  (when-not (and (string? v) (not (string/blank? v)))
+  (when-not (present-url-part? v)
     (throw (js/Error. (str "Missing " (name k)))))
   v)
 
@@ -76,6 +80,22 @@
   (str (strip-trailing-slash (required-url-part! :app-base-url app-base-url))
        "/block/" (encode-param (required-url-part! :block-id block-id))
        "?graph-id=" (encode-param (required-url-part! :graph-id graph-id))))
+
+(defn entity-url-for-copy
+  "URL to put on the clipboard for a page or block.
+
+  Prefer the canonical web URL when `graph-id` is known. Local-only graphs have
+  no shareable web identity, so fall back to a desktop `logseq://` URL. Returns
+  nil when neither identity is available."
+  [app-base-url graph-id repo entity-id kind]
+  (cond
+    (present-url-part? graph-id)
+    (case kind
+      :page (get-logseq-web-page-url app-base-url graph-id entity-id)
+      :block (get-logseq-web-block-url app-base-url graph-id entity-id))
+
+    (present-url-part? repo)
+    (get-logseq-graph-uuid-url nil repo entity-id)))
 
 (defn- route-from-path-parts
   [path-parts]

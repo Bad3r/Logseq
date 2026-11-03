@@ -12,7 +12,7 @@ type server = {
   root_dir : Cli_primitive.path option;
   owner_source : Cli_primitive.owner_source;
   owned : bool;
-  raw : Melange_edn.any option;
+  raw : Melange_edn_melange.any option;
 }
 
 type start_result = {
@@ -22,7 +22,7 @@ type start_result = {
 }
 
 type stop_result = { repo : Cli_primitive.repo }
-type revision_mismatch = { cli_revision : string; servers : server list }
+type revision_mismatch = { cli_revision : string; servers : server Rrbvec.t }
 
 type cleanup_result = {
   cli_revision : string;
@@ -30,16 +30,12 @@ type cleanup_result = {
   mismatched : int;
   eligible : int;
   skipped_owner : int;
-  killed : server list;
-  failed : (server * Error.t) list;
+  killed : server Rrbvec.t;
+  failed : (server * Error.t) Rrbvec.t;
 }
 
 val resolve_root_dir : Cli_config.t -> Cli_primitive.path
 val graphs_dir : Cli_config.t -> Cli_primitive.path
-
-val lock_path :
-  root_dir:Cli_primitive.path -> Cli_primitive.repo -> Cli_primitive.path
-
 val db_worker_runtime_script_path : unit -> Cli_primitive.path
 
 val ensure_server :
@@ -64,9 +60,18 @@ val restart_server :
   Cli_primitive.repo ->
   start_result Error.build_result Cli_effect.t
 
-val list_servers : Cli_config.t -> server list Cli_effect.t
-val list_graph_items : Cli_config.t -> Graph_types.graph_item list
-val list_graphs : Cli_config.t -> Cli_primitive.graph list
+val delete_graph :
+  Cli_config.t ->
+  Cli_primitive.repo ->
+  on_removed:(unit -> unit Error.build_result Cli_effect.t) ->
+  bool Error.build_result Cli_effect.t
+
+val create_graph :
+  Cli_config.t -> Cli_primitive.repo -> string Error.build_result Cli_effect.t
+
+val list_servers : Cli_config.t -> server Rrbvec.t Cli_effect.t
+val list_graph_items : Cli_config.t -> Graph_types.graph_item Rrbvec.t
+val list_graphs : Cli_config.t -> Cli_primitive.graph Rrbvec.t
 
 val cleanup_revision_mismatched_servers :
   Cli_config.t ->

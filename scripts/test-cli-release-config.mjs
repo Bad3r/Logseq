@@ -95,7 +95,7 @@ const buildWorkflow = readText(".github/workflows/build.yml");
 assert.match(buildWorkflow, /pnpm cli:release/, "db graph workflow should build release CLI");
 assertNotContains(buildWorkflow, "clojure -M:cljs release logseq-cli", "db graph workflow");
 assert.match(buildWorkflow, /pnpm db-worker-node:release:bundle/, "db graph workflow should build release db-worker-node runtime");
-assert.match(buildWorkflow, /pnpm --dir dist\/cli-package install --prod/, "db graph workflow should install prepared CLI package dependencies");
+assert.match(buildWorkflow, /pnpm --dir dist\/cli-package install --prod --ignore-workspace/, "db graph workflow should install prepared CLI package dependencies");
 assert.match(buildWorkflow, /libsecret-1-0/, "db graph workflow should install keytar's Linux runtime dependency");
 assert.match(buildWorkflow, /pnpm --dir dist\/cli-package pack --pack-destination \.\.\//, "db graph workflow should verify the prepared CLI package with pnpm pack");
 assertNotContains(buildWorkflow, "create_graph_with_schema_org.cljs ./cli-root/graphs/schema-graph --subset", "db graph workflow");
@@ -108,7 +108,7 @@ assertNotContains(buildWorkflow, "pnpm db-worker-node:compile:bundle", "db graph
 const desktopReleaseWorkflow = readText(".github/workflows/build-desktop-release.yml");
 assert.match(
   desktopReleaseWorkflow,
-  /OCAML_VERSION: '5\.4\.0'/,
+  /OCAML_VERSION: '5\.1\.1'/,
   "desktop release workflow should define the OCaml version used by cli/",
 );
 assert.match(
@@ -123,7 +123,7 @@ assert.match(
 );
 assert.match(
   desktopReleaseWorkflow,
-  /pnpm --dir cli install --frozen-lockfile/,
+  /pnpm --dir cli install --frozen-lockfile --ignore-workspace/,
   "desktop release workflow should install cli/ pnpm deps",
 );
 assert.match(
@@ -145,10 +145,72 @@ assertNotContains(
 const shadowCljs = readText("shadow-cljs.edn");
 assertNotContains(shadowCljs, ":logseq-cli", "shadow-cljs.edn");
 
+const legacyCljsCliPaths = [
+  "src/main/logseq/cli/command",
+  "src/main/logseq/cli/auth.cljs",
+  "src/main/logseq/cli/commands.cljs",
+  "src/main/logseq/cli/completion_generator.cljs",
+  "src/main/logseq/cli/config.cljs",
+  "src/main/logseq/cli/format.cljs",
+  "src/main/logseq/cli/humanize.cljs",
+  "src/main/logseq/cli/main.cljs",
+  "src/main/logseq/cli/output_mode.cljs",
+  "src/main/logseq/cli/tree_text.cljs",
+  "src/main/logseq/cli/uuid_refs.cljs",
+  "src/test/logseq/cli/command",
+  "src/test/logseq/cli/auth_test.cljs",
+  "src/test/logseq/cli/commands_test.cljs",
+  "src/test/logseq/cli/completion_generator_test.cljs",
+  "src/test/logseq/cli/config_test.cljs",
+  "src/test/logseq/cli/format_test.cljs",
+  "src/test/logseq/cli/main_test.cljs",
+  "src/test/logseq/cli/output_mode_test.cljs",
+  "src/test/logseq/cli/uuid_refs_test.cljs",
+];
+assert.deepEqual(
+  legacyCljsCliPaths.filter((relativePath) =>
+    fs.existsSync(path.join(repoRoot, relativePath)),
+  ),
+  [],
+  "legacy CLJS CLI sources and tests should be removed",
+);
+
+const carveIgnore = readText(".carve/ignore");
+assertNotContains(carveIgnore, "logseq.cli.main/main", ".carve/ignore");
+
+assertFilesDoNotMatch(
+  [
+    "src/test/logseq/cli/server_test.cljs",
+    "src/test/frontend/worker/db_worker_node_test.cljs",
+  ],
+  /logseq\.cli\.config|cli-config\/server-list-path/,
+  "retained db-worker-node runtime tests",
+);
+
+const cliDocs = readText("docs/cli/logseq-cli.md");
+assertNotContains(cliDocs, "logseq.cli.command.query", "CLI docs");
+assert.match(
+  cliDocs,
+  /cli\/lib\/query\.ml/,
+  "CLI docs should point to the shipped query implementation",
+);
+
 assertCliReleaseCommand(rootPackage.scripts?.["cli:release"], "cli:release");
 for (const [scriptName, command] of Object.entries(rootPackage.scripts ?? {})) {
   assertRootScriptDoesNotBuildShadowCli(scriptName, command);
 }
+
+const gulpfile = readText("gulpfile.js");
+assert.match(
+  gulpfile,
+  /pnpm cli:release/,
+  "Electron maker preparation should stage the CLI runtime",
+);
+assert.ok(
+  gulpfile.indexOf("pnpm cli:release") <
+    gulpfile.indexOf("pnpm desktop:prepare-runtime-js"),
+  "Electron maker preparation should stage the CLI before preparing desktop runtime scripts",
+);
 
 const stageScriptPath = path.join(repoRoot, "scripts", "stage-cli-runtime.mjs");
 assert.equal(
@@ -364,6 +426,11 @@ assert.match(
   prepareDesktopRuntimeScript,
   /cli[\\/]_build[\\/]default[\\/]dist[\\/]logseq-cli\.js/,
   "desktop runtime preparation should compare the staged CLI against the cli/ bundle",
+);
+assert.match(
+  prepareDesktopRuntimeScript,
+  /fs\.chmod\(to, stats\.mode \| 0o200\)/,
+  "desktop runtime preparation should overwrite read-only staged runtime files",
 );
 assertNotContains(
   prepareDesktopRuntimeScript,

@@ -4,13 +4,8 @@
   when use together with dynamic var."
   (:require [cljs.core.match :refer [match]]
             [clojure.string :as string]
-            [datascript.core :as d]
-            [frontend.handler.export.util :as export-util :refer-macros [removev concatv mapcatv]]
-            [logseq.common.export.file :as common-file]
+            [frontend.handler.export.util :as export-util :refer-macros [concatv mapcatv]]
             [logseq.common.util :as common-util]
-            [logseq.db :as ldb]
-            [logseq.graph-parser.mldoc :as gp-mldoc]
-            [logseq.outliner.tree :as otree]
             [malli.core :as m]
             [malli.util :as mu]))
 
@@ -51,85 +46,28 @@
     :keep-only-level<=N :all
     :newline-after-block false}})
 
-;; Global vars that are not explicitly passed in all fns
-;; These vars must be bound in order to use most fns in this namespace
-(def ^:dynamic *current-db* nil)
-;; Config used by logseq.common.export.file fns
-(def ^:dynamic *content-config* nil)
+(def ^:dynamic *block-ast-resolver* nil)
+(def ^:dynamic *block-children-ast-resolver* nil)
+(def ^:dynamic *page-ast-resolver* nil)
 
-;;; internal utils
-(defn- remove-collapsed-descendants
-  [tree]
-  (mapv
-   (fn [node]
-     (let [children (:block/children node)]
-       (cond
-         (and (:block/collapsed? node) (seq children))
-         (dissoc node :block/children)
-
-         (seq children)
-         (assoc node :block/children (remove-collapsed-descendants children))
-
-         :else
-         node)))
-   tree))
-
-(defn ^:api get-blocks-contents
-  [root-block-uuid & {:keys [init-level open-blocks-only? include-properties?]
-                      :or {init-level 1}}]
-  (let [block (d/entity *current-db* [:block/uuid root-block-uuid])
-        link (:block/link block)
-        block' (or link block)
-        root-id (:block/uuid block')
-        blocks (ldb/get-block-and-children *current-db* root-id)
-        tree (otree/blocks->vec-tree *current-db* blocks root-id {:link link})
-        tree (if open-blocks-only?
-               (remove-collapsed-descendants tree)
-               tree)]
-    (common-file/tree->file-content *current-db* tree
-                                    {:init-level init-level
-                                     :include-properties? include-properties?
-                                     :link link}
-                                    *content-config*)))
+(defn- required-resolver
+  [resolver var-name]
+  (assert resolver (str var-name " must be bound before replacing block or page embeds."))
+  resolver)
 
 (declare remove-block-ast-pos Properties-block-ast?)
 
 (defn- block-uuid->ast
   [block-uuid]
-  (let [block (into {} (d/entity *current-db* [:block/uuid block-uuid]))
-        content (common-file/tree->file-content *current-db* [block] {:init-level 1} *content-config*)
-        format :markdown]
-    (when content
-      (removev Properties-block-ast?
-               (mapv remove-block-ast-pos
-                     (gp-mldoc/->db-edn content format))))))
+  ((required-resolver *block-ast-resolver* "*block-ast-resolver*") block-uuid))
 
 (defn- block-uuid->ast-with-children
   [block-uuid]
-  (let [content (get-blocks-contents block-uuid)
-        format :markdown]
-    (when content
-      (removev Properties-block-ast?
-               (mapv remove-block-ast-pos
-                     (gp-mldoc/->db-edn content format))))))
-
-(defn ^:api get-page-content
-  [page-uuid & {:keys [open-blocks-only? include-properties?]}]
-  (common-file/block->content *current-db*
-                              page-uuid
-                              {:open-blocks-only? open-blocks-only?
-                               :include-properties? include-properties?}
-                              *content-config*))
+  ((required-resolver *block-children-ast-resolver* "*block-children-ast-resolver*") block-uuid))
 
 (defn- page-name->ast
   [page-name]
-  (let [page (ldb/get-page *current-db* page-name)]
-    (when-let [content (get-page-content (:block/uuid page))]
-      (when content
-        (let [format :markdown]
-          (removev Properties-block-ast?
-                   (mapv remove-block-ast-pos
-                         (gp-mldoc/->db-edn content format))))))))
+  ((required-resolver *page-ast-resolver* "*page-ast-resolver*") page-name))
 
 (defn- update-level-in-block-ast-coll
   [block-ast-coll origin-level]
@@ -204,40 +142,40 @@
                  "Link"
                  (:full_text ast-content)
                  "Plain"
-                 ast-content)))
+                 ast-content
+                 ;; `#x^^h^^{{x}}`: the parser takes the macro into the tag
+                 "Macro"
+                 (let [{:keys [name arguments]} ast-content]
+                   (str "{{" name (when (seq arguments) (str "(" (string/join "," arguments) ")")) "}}"))
+                 ;; any other inline the parser puts in a tag: dropped, not a
+                 ;; failed export of the whole page
+                 nil)))
            inline-coll)))
 
 ;;; utils (ends)
 
 ;;; replace block-ref, block-embed, page-embed
 
+(defn- replace-block-reference-inline
+  "The inlines that replace inline: the referenced block's title for a block
+  ref, or inline itself. A ref to a block that does not exist (or has no
+  title) stays as written, `((uuid))`, so its text is not lost."
+  [inline]
+  (match [inline]
+    [["Link" {:url ["Block_ref" block-uuid]}]]
+    (if-let [title-inline-coll (some-> (block-uuid->ast (uuid block-uuid)) first second :title seq vec)]
+      (do (set! *state* (assoc-in *state* [:replace-ref-embed :block-ref-replaced?] true))
+          title-inline-coll)
+      [["Plain" (str "((" block-uuid "))")]])
+    :else [inline]))
+
 (defn- replace-block-reference-in-heading
   [{:keys [title] :as ast-content}]
-  (let [inline-coll  title
-        inline-coll*
-        (mapcatv
-         #(match [%]
-            [["Link" {:url ["Block_ref" block-uuid]}]]
-            (let [[[_ {title-inline-coll :title}]]
-                  (block-uuid->ast (uuid block-uuid))]
-              (set! *state* (assoc-in *state* [:replace-ref-embed :block-ref-replaced?] true))
-              title-inline-coll)
-
-            :else [%])
-         inline-coll)]
-    (assoc ast-content :title inline-coll*)))
+  (assoc ast-content :title (mapcatv replace-block-reference-inline title)))
 
 (defn- replace-block-reference-in-paragraph
   [inline-coll]
-  (mapcatv
-   #(match [%]
-      [["Link" {:url ["Block_ref" block-uuid]}]]
-      (let [[[_ {title-inline-coll :title}]]
-            (block-uuid->ast (uuid block-uuid))]
-        (set! *state* (assoc-in *state* [:replace-ref-embed :block-ref-replaced?] true))
-        title-inline-coll)
-      :else [%])
-   inline-coll))
+  (mapcatv replace-block-reference-inline inline-coll))
 
 (declare replace-block-references)
 
@@ -257,35 +195,13 @@
 (defn- replace-block-reference-in-table
   [{:keys [header groups] :as table}]
   (let [header*
-        (mapv
-         (fn [col]
-           (mapcatv
-            #(match [%]
-               [["Link" {:url ["Block_ref" block-uuid]}]]
-               (let [[[_ {title-inline-coll :title}]]
-                     (block-uuid->ast (uuid block-uuid))]
-                 (set! *state* (assoc-in *state* [:replace-ref-embed :block-ref-replaced?] true))
-                 title-inline-coll)
-               :else [%])
-            col))
-         header)
+        (mapv (fn [col] (mapcatv replace-block-reference-inline col)) header)
         groups*
         (mapv
          (fn [group]
            (mapv
             (fn [row]
-              (mapv
-               (fn [col]
-                 (mapcatv
-                  #(match [%]
-                     [["Link" {:url ["Block_ref" block-uuid]}]]
-                     (let [[[_ {title-inline-coll :title}]]
-                           (block-uuid->ast (uuid block-uuid))]
-                       (set! *state* (assoc-in *state* [:replace-ref-embed :block-ref-replaced?] true))
-                       title-inline-coll)
-                     :else [%])
-                  col))
-               row))
+              (mapv (fn [col] (mapcatv replace-block-reference-inline col)) row))
             group))
          groups)]
     (assoc table :header header* :groups groups*)))

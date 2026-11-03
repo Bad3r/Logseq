@@ -4,6 +4,7 @@
    [electron.ipc :as ipc]
   [frontend.context.i18n :refer [t]]
    [frontend.handler.notification :as notification]
+   [frontend.rfx :as rfx]
    [frontend.state :as state]
    [frontend.ui :as ui]
    [frontend.util :as util]
@@ -13,15 +14,25 @@
    [promesa.core :as p]
    [io.factorhouse.hsx.core :as hsx]))
 
+(defn add-token
+  "Adds an empty token row. Tokens stay a vector so rows can be edited by index,
+  also when no token was saved yet (tokens is nil)."
+  [tokens]
+  (conj (vec tokens) {}))
+
+(defn update-token
+  [tokens idx k v]
+  (assoc-in (vec tokens) [idx k] v))
+
 (hsx/defc panel-of-tokens
   [close-panel]
-  (let [server-state (state/use-sub :electron/server)
-        [tokens set-tokens!] (hooks/use-state (get-in @state/state [:electron/server :tokens]))
+  (let [server-state (rfx/use-sub [:electron/server])
+        [tokens set-tokens!] (hooks/use-state (:tokens server-state))
         changed? (not= tokens (:tokens server-state))]
     [:div.cp__server-tokens-panel.pt-6
      [:h2.text-3xl.-translate-y-4 (t :server.token/title)]
      ;; items
-     (let [update-value! (fn [idx k v] (set-tokens! #(assoc-in % [idx k] v)))]
+     (let [update-value! (fn [idx k v] (set-tokens! #(update-token % idx k v)))]
        (for [[idx {:keys [value name]}] (medley/indexed tokens)]
          [:div.item.py-2.flex.space-x-2.items-center
           {:key idx}
@@ -51,7 +62,7 @@
 
      [:p.flex.justify-end.pt-6.space-x-3
       (ui/button (t :server.token/add-new)
-                 :on-click #(set-tokens! (conj tokens {}))
+                 :on-click #(set-tokens! (add-token tokens))
                  :variant :outline)
       (ui/button (t :ui/save)
                  :on-click (fn [] (-> (ipc/ipc :server/set-config {:tokens tokens})
@@ -62,8 +73,8 @@
 
 (hsx/defc panel-of-configs
   [close-panel]
-  (let [server-state (state/use-sub :electron/server)
-        [configs set-configs!] (hooks/use-state (:electron/server @state/state))
+  (let [server-state (rfx/use-sub [:electron/server])
+        [configs set-configs!] (hooks/use-state server-state)
         {:keys [host port autostart]} configs
         hp-changed?  (or (not= host (:host server-state))
                          (not= (util/safe-parse-int (or port 0))

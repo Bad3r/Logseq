@@ -16,7 +16,11 @@ module Human_output : sig
   type t
 
   val create :
-    ?headers:string list -> ?footer:string -> rows:string list list -> unit -> t
+    ?headers:string Rrbvec.t ->
+    ?footer:string ->
+    rows:string Rrbvec.t Rrbvec.t ->
+    unit ->
+    t
 
   val to_string : t -> string
   (** format as table.
@@ -27,5 +31,5 @@ end
 
 type _ t =
   | Human : Human_output.t -> human t
-  | Edn : Melange_edn.any -> edn t
-  | Json : Melange_edn.any -> json t
+  | Edn : Melange_edn_melange.any -> edn t
+  | Json : Melange_edn_melange.any -> json t

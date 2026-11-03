@@ -194,6 +194,46 @@
     :math  :math
     nil))
 
+(defn with-breadcrumb-ref-titles
+  "Hydrates :block/refs titles from a breadcrumb ref-titles payload.
+   Ref-titles also covers [[uuid]] targets that appear inside titles but not
+   in :block/refs (e.g. nested in a page-ref name); those are appended as
+   shallow refs so uuid refs can be resolved for display."
+  [entity ref-titles]
+  (if (seq ref-titles)
+    (let [refs (:block/refs entity)
+          known (into #{} (keep :block/uuid) refs)
+          title-refs (into []
+                           (comp
+                            (filter (fn [[ref-uuid title]]
+                                      (and (uuid? ref-uuid)
+                                           (string? title)
+                                           (not (contains? known ref-uuid)))))
+                            (map (fn [[ref-uuid title]]
+                                   {:block/uuid ref-uuid
+                                    :block/title title})))
+                           ref-titles)]
+      (assoc entity
+             :block/refs
+             (into (mapv (fn [ref]
+                           (if-let [ref-uuid (:block/uuid ref)]
+                             (if (contains? ref-titles ref-uuid)
+                               (assoc ref :block/title (get ref-titles ref-uuid))
+                               ref)
+                             ref))
+                         (or refs []))
+                   title-refs)))
+    entity))
+
+(defn resource-ancestors
+  "Ancestor entity maps from a breadcrumb resource payload.
+   Prefers inline :ancestors so the first paint does not wait for use-block."
+  [breadcrumb-data]
+  (if (contains? breadcrumb-data :ancestors)
+    (:ancestors breadcrumb-data)
+    (mapv (fn [ancestor-uuid] {:block/uuid ancestor-uuid})
+          (:ancestor-uuids breadcrumb-data))))
+
 (defn block->breadcrumb-segment
   "Converts a page or block entity map to a breadcrumb segment map.
 
@@ -220,10 +260,13 @@
           title-line (when-not page?
                        (breadcrumb-label-line raw-title block-type))
           text (if page?
-                 (or (:block/title entity) (:block/name entity))
+                 (or (resolve-uuid-refs entity (:block/title entity))
+                     (:block/name entity))
                  (normalize-typed-breadcrumb-text entity raw-title block-type))
           full-text (if page?
-                      (or (:block/title entity) (:block/name entity) "")
+                      (or (resolve-uuid-refs entity (:block/title entity))
+                          (:block/name entity)
+                          "")
                       (or text ""))
           icon (:logseq.property/icon entity)]
       {:db/id (:db/id entity)
@@ -244,6 +287,14 @@
        (map #(or (:text %) (:full-text %)))
        (remove string/blank?)
        (string/join " / ")))
+
+(defn navigated-between-parents?
+  [initial-block navigating-block navigating-block-entity]
+  (boolean
+   (and navigating-block
+        navigating-block-entity
+        (not= (:block/parent-id initial-block)
+              (:block/parent-id navigating-block-entity)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Variant options
@@ -268,11 +319,24 @@
 ;; Visibility algorithm
 ;; ---------------------------------------------------------------------------
 
+(defn- distinct-entities
+  [segments]
+  (:segments
+   (reduce (fn [{:keys [seen] :as result} segment]
+             (let [identity (or (:block/uuid segment) (:db/id segment))]
+               (if (and identity (contains? seen identity))
+                 result
+                 (-> result
+                     (update :segments conj segment)
+                     (cond-> identity (update :seen conj identity))))))
+           {:seen #{} :segments []}
+           segments)))
+
 (defn build-breadcrumb-view
   "Applies the visibility budget to a sequence of segments.
 
-   `segments` are ordered from root (page) to nearest parent — the same
-   order returned by db/get-block-parents (root first).
+   `segments` are ordered from root (page) to nearest parent, with the root
+   segment first.
 
    Options:
      :show-page?     - include the page segment (default true)
@@ -286,7 +350,8 @@
       :overflow?       bool}       ; true when any segments are hidden"
   [segments {:keys [show-page? max-visible nearest-count]
              :or {show-page? true max-visible 4 nearest-count 2}}]
-  (let [segs (if show-page? (vec segments) (vec (rest segments)))
+  (let [segments (distinct-entities segments)
+        segs (if show-page? segments (vec (rest segments)))
         total (count segs)]
     (cond
       (zero? total)

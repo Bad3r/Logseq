@@ -403,7 +403,7 @@
           }
         }
 
-        .ui__toggle {
+        .ui__switch {
           margin-left: 5px;
         }
       }
@@ -541,6 +541,17 @@
               flex-direction: column;
               width: 100%;
               margin-top: -3px;
+            }
+          }
+        }
+
+        &.as-button {
+          > .form-control {
+            flex-direction: column;
+            align-items: flex-start;
+
+            > .ui__button {
+              width: 100%;
             }
           }
         }

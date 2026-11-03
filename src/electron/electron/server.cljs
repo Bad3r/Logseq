@@ -145,12 +145,11 @@
   (let [api-fn (fn api-fn [meth args]
                  (if-let [meth' (resolve-real-api-method meth)]
                    (invoke-logseq-api! meth' args)
-                   #js {:error (str "No method found for " (pr-str meth))}))
-        mcp-server (desktop-mcp-server/create-mcp-api-server api-fn)]
+                   #js {:error (str "No method found for " (pr-str meth))}))]
     (logger/debug "[server] MCP routes initialized")
     (.post server "/mcp"
-           #(desktop-mcp-server/handle-post-request mcp-server {:port (get-port)
-                                                                :host (get-host)} %1 %2))
+           #(desktop-mcp-server/handle-post-request api-fn {:port (get-port)
+                                                            :host (get-host)} %1 %2))
     (.get server "/mcp" desktop-mcp-server/handle-get-request)
     (.delete server "/mcp" desktop-mcp-server/handle-delete-request)))
 
@@ -162,7 +161,11 @@
                                    :requestTimeout        (* 1000 42)
                                    :forceCloseConnections true})
               ;; middlewares
-              _     (.register s FastifyCORS #js {:origin "*"})
+              ;; Browser MCP clients must read mcp-session-id from the initialize
+              ;; response and send it back on every later request, and a browser
+              ;; only exposes response headers that CORS lists explicitly.
+              _     (.register s FastifyCORS #js {:origin "*"
+                                                :exposedHeaders #js ["mcp-session-id"]})
               ;; hooks & routes
               _     (doto s
                       (.addHook "preHandler" api-pre-handler!)

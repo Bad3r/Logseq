@@ -1,11 +1,17 @@
 (ns frontend.worker.search-test
-  (:require [cljs.test :refer [deftest is testing]]
+  (:require ["path" :as node-path]
+            [cljs.test :refer [async deftest is testing]]
             [clojure.string :as string]
             [datascript.core :as d]
+            [frontend.test.node-helper :as node-helper]
+            [frontend.worker.handler.block-breadcrumb :as block-breadcrumb]
+            [frontend.worker.platform.node :as platform-node]
             [frontend.worker.search :as search]
             [frontend.worker.search-benchmark :as search-benchmark]
             [logseq.db :as ldb]
-            [logseq.db.test.helper :as db-test]))
+            [logseq.db.test.helper :as db-test]
+            [logseq.outliner.page :as outliner-page]
+            [promesa.core :as p]))
 
 (defn- sql-placeholder-count
   [sql]
@@ -192,6 +198,36 @@
   (testing "entities on recycled pages are hidden"
     (is (true? (#'search/hidden-entity? {:block/page {:logseq.property/deleted-at 1}})))))
 
+(deftest search-indexes-hide-by-default-properties
+  (let [conn (db-test/create-conn-with-blocks
+              {:properties {:keywords {:logseq.property/type :default
+                                       :logseq.property/hide? true}
+                            :author {:logseq.property/type :default}}
+               :pages-and-blocks [{:page {:block/title "Hidden page"
+                                          :build/properties {:logseq.property/hide? true}}}]})
+        keywords (d/entity @conn :user.property/keywords)
+        author (d/entity @conn :user.property/author)
+        private-property (d/entity @conn :logseq.property/type)
+        hidden-page (db-test/find-page-by-title @conn "Hidden page")
+        indexed-titles (->> (search/get-all-blocks @conn)
+                            (map :block/title)
+                            set)
+        combined (search/combine-results
+                  @conn
+                  [{:id (str (:block/uuid keywords))
+                    :title "keywords"
+                    :keyword-score 1.0}])]
+    (is (true? (:logseq.property/hide? keywords)))
+    (is (false? (#'search/hidden-entity? keywords)))
+    (is (false? (#'search/hidden-entity? author)))
+    (is (true? (#'search/hidden-entity? private-property)))
+    (is (true? (#'search/hidden-entity? hidden-page)))
+    (is (contains? indexed-titles "keywords"))
+    (is (contains? indexed-titles "author"))
+    (is (not (contains? indexed-titles "Property type")))
+    (is (not (contains? indexed-titles "Hidden page")))
+    (is (some #(= (str (:block/uuid keywords)) (:id %)) combined))))
+
 (deftest search-blocks-aux-bind-count
   (testing "namespace match SQL keeps bind count aligned"
     (let [sql "select id, page, title, rank from blocks_fts where title match ? or title match ? limit ?"
@@ -221,6 +257,7 @@
                               (swap! fts-binds conj (first bind)))
                             #js []))}]
       (with-redefs [search/combine-results (fn [_db results] results)
+                    d/db? (constantly false)
                     search/search-result->block-result
                     (fn [_conn _q _code-class _option result]
                       result)]
@@ -248,7 +285,7 @@
       (with-redefs [search/combine-results (fn [_db results] results)
                     search/search-result->block-result
                     (fn [_conn _q _code-class _option result]
-                      result)]
+                      (assoc result :block/uuid (uuid (:id result))))]
         (is (empty? (search/search-blocks (atom :large-db) db "xxx and " {:limit 10})))
         (is (empty? (search/search-blocks (atom :large-db) db "xxx AND " {:limit 10})))
         (is (empty? (search/search-blocks (atom :large-db) db "xxx or " {:limit 10})))
@@ -294,7 +331,7 @@
       (with-redefs [search/combine-results (fn [_db results] results)
                     search/search-result->block-result
                     (fn [_conn _q _code-class _option result]
-                      result)]
+                      (assoc result :block/uuid (uuid (:id result))))]
         (let [result (vec (search/search-blocks (atom :large-db) db "nwp" {:limit 10}))]
           (is (= [{:id "67e55044-10b1-426f-9247-bb680e5fe0c8"
                    :page "67e55044-10b1-426f-9247-bb680e5fe0c8"
@@ -302,6 +339,30 @@
                  (mapv #(select-keys % [:id :page :title]) result)))
           (is (pos? (:keyword-score (first result)))))
         (is (some #(= ["%n%w%p%" 40] (:bind %)) @calls))))))
+
+(deftest search-blocks-fuzzy-matches-sanitized-umlaut-titles
+  (testing "umlaut queries normalize to an ASCII LIKE pattern that matches sanitized titles"
+    (let [calls (atom [])
+          page-id "67e55044-10b1-426f-9247-bb680e5fe0c8"
+          db #js {:exec (fn [opts]
+                          (let [sql (aget opts "sql")
+                                bind (js->clj (aget opts "bind"))]
+                            (swap! calls conj {:sql sql :bind bind})
+                            (if (and (string/includes? sql "lower(title) like ?")
+                                     (= "%g%r%u%n%" (first bind)))
+                              (clj->js [[page-id page-id "Grun"]])
+                              #js [])))}]
+      (with-redefs [search/combine-results (fn [_db results] results)
+                    search/search-result->block-result
+                    (fn [_conn _q _code-class _option result]
+                      (assoc result :block/uuid (uuid (:id result))))]
+        (let [result (vec (search/search-blocks (atom :large-db) db "grün" {:limit 10}))]
+          (is (= [{:id page-id
+                   :page page-id
+                   :title "Grun"}]
+                 (mapv #(select-keys % [:id :page :title]) result)))
+          (is (pos? (:keyword-score (first result)))))
+        (is (some #(= ["%g%r%u%n%" 40] (:bind %)) @calls))))))
 
 (deftest search-blocks-fuzzy-prioritizes-page-candidates
   (testing "large graphs keep page rows first without sorting the whole blocks table"
@@ -394,7 +455,7 @@
       (with-redefs [search/combine-results (fn [_db results] results)
                     search/search-result->block-result
                     (fn [_conn _q _code-class _option result]
-                      result)]
+                      (assoc result :block/uuid (uuid (:id result))))]
         (let [result (vec (search/search-blocks (atom :large-db)
                                                 db
                                                 "block"
@@ -406,16 +467,102 @@
           (is (not-any? #(string/includes? % "title match ?") @calls))
           (is (not-any? #(string/includes? % "lower(title) like ?") @calls)))))))
 
+(deftest search-blocks-normalizes-tag-title-query-before-sql
+  (testing "cmd-k tag queries should search the tag page title without paying FTS or broad LIKE scans"
+    (let [page-id "67e55044-10b1-426f-9247-bb680e5fe0c8"
+          calls (atom [])
+          db #js {:exec (fn [opts]
+                          (let [sql (aget opts "sql")
+                                bind (js->clj (aget opts "bind"))]
+                            (swap! calls conj {:sql sql :bind bind})
+                            (cond
+                              (string/includes? sql "title = ? COLLATE NOCASE")
+                              (if (= ["Movies" 10] bind)
+                                (clj->js [[page-id page-id "Movies"]])
+                                #js [])
+
+                              (string/includes? sql "title match ?")
+                              (throw (js/Error. "FTS should not run for exact tag title queries"))
+
+                              (string/includes? sql "lower(title) like ?")
+                              (throw (js/Error. "fuzzy LIKE should not run for exact tag title queries"))
+
+                              :else
+                              #js [])))}]
+      (with-redefs [search/combine-results (fn [_db results] results)
+                    search/search-result->block-result
+                    (fn [_conn _q _code-class _option result]
+                      result)
+                    d/db? (constantly true)
+                    d/datoms (fn [& _]
+                               (throw (js/Error. "direct page scan should not run for exact tag title queries")))]
+        (let [result (vec (search/search-blocks (atom :large-db)
+                                                db
+                                                "#Movies"
+                                                {:limit 10}))]
+          (is (= [{:id page-id
+                   :page page-id
+                   :title "Movies"}]
+                 (mapv #(select-keys % [:id :page :title]) result)))
+          (is (some #(= ["Movies" 10] (:bind %)) @calls))
+          (is (not-any? #(string/includes? (:sql %) "title match ?") @calls))
+          (is (not-any? #(string/includes? (:sql %) "lower(title) like ?") @calls)))))))
+
+(deftest search-blocks-skips-direct-page-scan-after-exact-title-hit
+  (testing "single-term page searches should not scan every Datascript page after an exact search-db hit"
+    (let [page-id "67e55044-10b1-426f-9247-bb680e5fe0c8"
+          db #js {:exec (fn [opts]
+                          (let [sql (aget opts "sql")
+                                bind (js->clj (aget opts "bind"))]
+                            (cond
+                              (and (string/includes? sql "title = ? COLLATE NOCASE")
+                                   (= ["Tag" 10] bind))
+                              (clj->js [[page-id page-id "Tag"]])
+
+                              (string/includes? sql "title match ?")
+                              #js []
+
+                              (string/includes? sql "lower(title) like ?")
+                              #js []
+
+                              :else
+                              #js [])))}]
+      (with-redefs [search/combine-results (fn [_db results] results)
+                    search/search-result->block-result
+                    (fn [_conn _q _code-class _option result]
+                      result)
+                    d/db? (constantly true)
+                    d/datoms (fn [& _]
+                               (throw (js/Error. "direct page scan should not run after exact title hits")))]
+        (let [result (vec (search/search-blocks (atom :large-db)
+                                                db
+                                                "Tag"
+                                                {:limit 10}))]
+          (is (= [{:id page-id
+                   :page page-id
+                   :title "Tag"}]
+                 (mapv #(select-keys % [:id :page :title]) result))))))))
+
+;; A search result map that counts how often its fields are read
+(deftype ReadCountingResult [m reads]
+  ILookup
+  (-lookup [_ k]
+    (swap! reads inc)
+    (-lookup m k))
+  (-lookup [_ k not-found]
+    (swap! reads inc)
+    (-lookup m k not-found))
+
+  IAssociative
+  (-contains-key? [_ k]
+    (-contains-key? m k))
+  (-assoc [_ k v]
+    (-assoc m k v)))
+
 (deftest combine-results-large-result-benchmark
   (testing "large search result sets combine without quadratic scans and keep page boost ranking"
     (let [ids (mapv test-uuid-string (range 1 2501))
           page-id (ids 42)
-          keyword-results (map-indexed
-                           (fn [idx id]
-                             {:id id
-                              :title (str "Result " idx)
-                              :keyword-score (if (= id page-id) 0.5 1.0)})
-                           ids)
           blocks (into {}
                        (map-indexed
                         (fn [idx id]
@@ -423,20 +570,40 @@
                                :block/uuid (uuid id)
                                :block/title (str "Result " idx)
                                :page? (= id page-id)}])
-                        ids))]
+                        ids))
+          db-lookups (atom 0)
+          combine (fn [result-count]
+                    (let [reads (atom 0)
+                          keyword-results (map-indexed
+                                           (fn [idx id]
+                                             (->ReadCountingResult
+                                              {:id id
+                                               :title (str "Result " idx)
+                                               :keyword-score (if (= id page-id) 0.5 1.0)}
+                                              reads))
+                                           (take result-count ids))]
+                      (reset! db-lookups 0)
+                      {:result (doall (search/combine-results :db keyword-results))
+                       :reads @reads
+                       :db-lookups @db-lookups}))]
       (with-redefs [d/entity (fn [_db [_attr id]]
+                               (swap! db-lookups inc)
                                (get blocks (str id)))
                     d/pull-many (fn [_db _selector lookup-refs]
+                                  (swap! db-lookups inc)
                                   (mapv (fn [[_attr id]]
                                           (get blocks (str id)))
                                         lookup-refs))
                     ldb/hidden? (constantly false)
                     ldb/page? :page?]
-        (let [started (system-time)
-              result (doall (search/combine-results :db keyword-results))
-              elapsed-ms (- (system-time) started)]
-          (is (< elapsed-ms 100)
-              (str "combine-results should stay fast for large result sets, took " elapsed-ms "ms"))
+        (let [small (combine (quot (count ids) 4))
+              {:keys [result reads db-lookups]} (combine (count ids))]
+          (is (< reads (* 8 (:reads small)))
+              (str "4 times the results should take about 4 times the reads of result fields, not 16; "
+                   (:reads small) " reads for " (quot (count ids) 4) " results, "
+                   reads " for " (count ids)))
+          (is (= (:db-lookups small) db-lookups)
+              "all results are pulled from the db in 1 batch, not looked up one by one")
           (is (= (count ids) (count result)))
           (is (= page-id (:id (first result)))
               "page boost should still rank matching pages ahead of equally relevant blocks"))))))
@@ -452,9 +619,10 @@
       (with-redefs [search/combine-results (fn [_db results]
                                              (doall results)
                                              rows)
+                    d/db? (constantly false)
                     search/search-result->block-result
                     (fn [_conn _q _code-class _option result]
-                      result)]
+                      (assoc result :block/uuid (uuid (:id result))))]
         (is (= 10
                (count (search/search-blocks (atom :large-db)
                                             (checking-db)
@@ -516,6 +684,149 @@
           (is (not (contains? result :logseq.property/icon)))
           (is (not (contains? result :alias))))))))
 
+(deftest search-result-includes-canonical-breadcrumb-test
+  (let [conn (db-test/create-conn-with-blocks
+              {:pages-and-blocks
+               [{:page {:block/title "Teams"}
+                 :blocks [{:block/title "Parent"}
+                          {:block/title "Search target"}]}]})
+        parent (db-test/find-block-by-content @conn "Parent")
+        target (db-test/find-block-by-content @conn "Search target")
+        _ (d/transact! conn [[:db/add (:db/id target)
+                             :block/parent (:db/id parent)]])
+        result (#'search/search-result->block-result
+                conn
+                "target"
+                nil
+                {:enable-snippet? false
+                 :include-breadcrumb? true}
+                {:id (str (:block/uuid target))
+                 :page (str (:block/uuid (:block/page target)))
+                 :title "Search target"})]
+    (is (= ["Teams" "Parent"]
+           (mapv :block/title (:block.temp/breadcrumb result))))))
+
+(deftest search-breadcrumb-resolves-page-uuid-and-ident-refs-test
+  (let [conn (db-test/create-conn)
+        page (d/entity @conn :logseq.class/Page)
+        page-uuid (:block/uuid page)]
+    (is (uuid? page-uuid))
+    (is (= (:db/id page)
+           (:db/id (block-breadcrumb/shallow-ref-identity @conn page-uuid)))
+        "CMDK page maps often carry only :block/uuid.")
+    (is (= (:db/id page)
+           (:db/id (block-breadcrumb/shallow-ref-identity
+                    @conn {:block/uuid page-uuid :block/title "Page"})))
+        "Pulled :block/page can omit :db/id.")
+    (is (= (:db/id page)
+           (:db/id (block-breadcrumb/shallow-ref-identity
+                    @conn :logseq.class/Page))))
+    (is (vector? (block-breadcrumb/block-breadcrumb @conn page))
+        "Built-in Page is a CMDK hit for queries like page 1.")
+    (let [child-conn (db-test/create-conn-with-blocks
+                      {:pages-and-blocks
+                       [{:page {:block/title "page 1"}
+                         :blocks [{:block/title "child"}]}]})
+          child (db-test/find-block-by-content @child-conn "child")
+          page-uuid (:block/uuid (:block/page child))]
+      (is (uuid? page-uuid))
+      (is (= ["page 1"]
+             (mapv :block/title
+                   (block-breadcrumb/block-breadcrumb
+                    @child-conn
+                    (assoc child :block/page page-uuid))))
+          "search-result page fields are often a raw uuid."))
+    (let [result (#'search/search-result->block-result
+                  conn
+                  "page"
+                  nil
+                  {:enable-snippet? false
+                   :include-breadcrumb? true
+                   :built-in? true}
+                  {:id (str page-uuid)
+                   :page (str page-uuid)
+                   :title "Page"})]
+      (is (= page-uuid (:block/uuid result)))
+      (is (vector? (:block.temp/breadcrumb result))))))
+
+(deftest search-result-resolves-node-ref-uuids-test
+  (let [conn (db-test/create-conn)
+        page-uuid #uuid "77777777-7777-7777-7777-777777777777"
+        target-uuid #uuid "88888888-8888-8888-8888-888888888888"
+        ref-uuid #uuid "99999999-9999-9999-9999-999999999999"]
+    (d/transact! conn [{:db/id -1
+                        :block/name "p1"
+                        :block/title "p1"
+                        :block/uuid page-uuid}
+                       {:db/id -2
+                        :block/title "Target block"
+                        :block/uuid target-uuid
+                        :block/page -1
+                        :block/parent -1
+                        :block/order "a"}
+                       {:db/id -3
+                        :block/title (str "see [[" target-uuid "]]")
+                        :block/uuid ref-uuid
+                        :block/page -1
+                        :block/parent -1
+                        :block/order "b"}])
+    (let [ref-block (db-test/find-block-by-content @conn #"^see")
+          index (search/block->index ref-block)]
+      (is (= "see [[Target block]]" (:title index))
+          "search index stores the resolved title")
+      (let [result (#'search/search-result->block-result
+                    conn
+                    "see"
+                    nil
+                    {:enable-snippet? false}
+                    {:id (str ref-uuid)
+                     :page (str page-uuid)
+                     ;; stale index title from before refs resolved
+                     :title (str "see [[" target-uuid "]]")})]
+        (is (= "see [[Target block]]" (:block/title result))
+            "display title resolves [[uuid]] even from a stale index entry")))))
+
+(deftest search-breadcrumb-survives-every-named-page-test
+  (let [conn (db-test/create-conn)
+        failures (into []
+                       (keep (fn [datom]
+                               (let [block (d/entity @conn (:e datom))]
+                                 (try
+                                   (block-breadcrumb/block-breadcrumb @conn block)
+                                   nil
+                                   (catch :default e
+                                     {:title (:block/title block)
+                                      :ident (:db/ident block)
+                                      :message (ex-message e)
+                                      :data (ex-data e)})))))
+                       (d/datoms @conn :avet :block/uuid))]
+    (is (empty? failures) (pr-str failures))))
+
+(deftest search-result-keeps-tag-identities-for-ui-entity-predicates
+  (let [page-id #uuid "00000000-0000-0000-0000-000000000124"
+        page-tag {:db/id 2
+                  :db/ident :logseq.class/Page
+                  :block/title "Page"}
+        page {:db/id 1
+              :block/uuid page-id
+              :block/title "Foo"
+              :block/tags [page-tag]}]
+    (with-redefs [d/entity (fn [_db [_attr id]]
+                             (when (= id page-id)
+                               page))
+                  ldb/page? (constantly true)
+                  ldb/built-in? (constantly false)
+                  ldb/hidden? (constantly false)]
+      (let [result (#'search/search-result->block-result
+                    (atom :db)
+                    "Foo"
+                    nil
+                    {:enable-snippet? false}
+                    {:id (str page-id)
+                     :page (str page-id)
+                     :title "Foo"})]
+        (is (= [page-tag] (:block/tags result)))))))
+
 (deftest block-index-includes-page-alias-titles
   (testing "page aliases can be matched by page-ref autocomplete search"
     (let [page-id #uuid "00000000-0000-0000-0000-000000000234"
@@ -535,6 +846,20 @@
           (is (= (str page-id) (:id indexed)))
           (is (= "Artificial Intelligence ai" (:title indexed))))))))
 
+(deftest block-index-sanitizes-page-titles-for-accent-insensitive-search
+  (testing "page titles drop accents so accent-stripped node picker queries can match"
+    (let [page-id #uuid "00000000-0000-0000-0000-000000000236"
+          page {:db/id 1
+                :block/uuid page-id
+                :block/title "Überprüfen"}]
+      (with-redefs [ldb/page? (fn [entity] (= (:db/id entity) (:db/id page)))
+                    ldb/object? (constantly false)
+                    ldb/journal? (constantly false)
+                    ldb/closed-value? (constantly false)
+                    ldb/hidden? (constantly false)
+                    ldb/get-title-with-parents (fn [entity] (:block/title entity))]
+        (is (= "Uberprufen" (:title (search/block->index page))))))))
+
 (deftest block-index-does-not-generate-vector-embedding
   (testing "desktop vector embeddings are supplied by the platform embedding backend"
     (let [block-id #uuid "00000000-0000-0000-0000-000000000238"
@@ -552,8 +877,8 @@
           (is (= "Local-first semantic search" (:title indexed)))
           (is (not (contains? indexed :embedding))))))))
 
-(deftest block-index-includes-bounded-vector-context
-  (testing "vector-only text includes local block context without changing the keyword title"
+(deftest block-index-includes-own-title-vector-title-when-enabled
+  (testing "vector-only text uses the same indexed block title without local block context"
     (let [page-id #uuid "00000000-0000-0000-0000-000000000240"
           block-id #uuid "00000000-0000-0000-0000-000000000241"
           page {:db/id 1
@@ -594,18 +919,28 @@
                     ldb/closed-value? (constantly false)
                     ldb/hidden? (constantly false)
                     ldb/get-title-with-parents (fn [entity] (:block/title entity))]
-        (let [indexed (search/block->index block)
-              vector-title (:vector-title indexed)]
+        (let [indexed (search/block->index block {:include-vector-title? true})]
           (is (= "Hybrid retrieval" (:title indexed)))
-          (is (string/includes? vector-title "Page: Search Design"))
-          (is (string/includes? vector-title "Path: Architecture > Vector index"))
-          (is (string/includes? vector-title "Previous: Keyword search"))
-          (is (string/includes? vector-title "Block: Hybrid retrieval"))
-          (is (string/includes? vector-title "Children: Cross block context"))
-          (is (string/includes? vector-title "Next: Ranking policy")))))))
+          (is (= "Hybrid retrieval" (:vector-title indexed))))))))
 
-(deftest build-blocks-indice-reuses-sorted-vector-context
-  (testing "large pages do not sort the same sibling set once per indexed block"
+(deftest block-index-skips-vector-title-when-disabled
+  (let [block-id #uuid "00000000-0000-0000-0000-000000000247"
+        page-id #uuid "00000000-0000-0000-0000-000000000248"
+        block {:db/id 1
+               :block/uuid block-id
+               :block/title "Hybrid retrieval"
+               :block/page {:block/uuid page-id}}]
+    (with-redefs [ldb/page? (constantly false)
+                  ldb/object? (constantly false)
+                  ldb/journal? (constantly false)
+                  ldb/closed-value? (constantly false)
+                  ldb/get-title-with-parents (fn [entity] (:block/title entity))]
+      (let [indexed (search/block->index block)]
+        (is (= "Hybrid retrieval" (:title indexed)))
+        (is (not (contains? indexed :vector-title)))))))
+
+(deftest build-blocks-indice-uses-block-index
+  (testing "large pages do not sort siblings for vector title context"
     (let [page-id #uuid "00000000-0000-0000-0000-000000000250"
           page {:db/id 1
                 :page? true
@@ -632,54 +967,13 @@
                     ldb/closed-value? (constantly false)
                     ldb/hidden? (constantly false)
                     ldb/get-title-with-parents (fn [entity] (:block/title entity))]
-        (is (= 40 (count (search/build-blocks-indice :db))))
-        (is (<= @sort-calls 2))))))
+        (let [indexed (search/build-blocks-indice :db {:include-vector-title? true})]
+          (is (= 40 (count indexed)))
+          (is (zero? @sort-calls))
+          (is (every? #(= (:title %) (:vector-title %)) indexed)))))))
 
-(deftest expand-vector-context-blocks-includes-neighbor-anchors
-  (testing "incremental vector updates refresh anchors whose context includes the changed block"
-    (let [page {:db/id 1
-                :page? true
-                :block/uuid #uuid "00000000-0000-0000-0000-000000000290"
-                :block/title "Search"}
-          parent {:db/id 2
-                  :block/uuid #uuid "00000000-0000-0000-0000-000000000291"
-                  :block/title "Parent"
-                  :block/page page}
-          prev {:db/id 3
-                :block/uuid #uuid "00000000-0000-0000-0000-000000000292"
-                :block/title "Previous"
-                :block/order 1
-                :block/page page}
-          current {:db/id 4
-                   :block/uuid #uuid "00000000-0000-0000-0000-000000000293"
-                   :block/title "Current"
-                   :block/order 2
-                   :block/page page}
-          next {:db/id 5
-                :block/uuid #uuid "00000000-0000-0000-0000-000000000294"
-                :block/title "Next"
-                :block/order 3
-                :block/page page}
-          child {:db/id 6
-                 :block/uuid #uuid "00000000-0000-0000-0000-000000000295"
-                 :block/title "Child"
-                 :block/order 1
-                 :block/page page}
-          parent (assoc parent :block/_parent [prev current next])
-          current (assoc current
-                         :block/parent parent
-                         :block/_parent [child])]
-      (with-redefs [ldb/sort-by-order (fn [children] (sort-by :block/order children))
-                    ldb/hidden? (constantly false)]
-        (is (= [(uuid "00000000-0000-0000-0000-000000000293")
-                (uuid "00000000-0000-0000-0000-000000000291")
-                (uuid "00000000-0000-0000-0000-000000000292")
-                (uuid "00000000-0000-0000-0000-000000000294")
-                (uuid "00000000-0000-0000-0000-000000000295")]
-               (mapv :block/uuid (search/expand-vector-context-blocks [current]))))))))
-
-(deftest sync-search-indice-refreshes-vector-context-on-structure-change
-  (testing "moving a block under a parent re-embeds the parent with child context"
+(deftest sync-search-indice-indexes-only-directly-affected-blocks
+  (testing "moving a block under a parent does not expand indexing to the parent"
     (let [conn (db-test/create-conn-with-blocks
                 {:pages-and-blocks [{:page {:block/title "Teams"}
                                      :blocks [{:block/title "which team is Manu in?"}
@@ -687,13 +981,14 @@
           manu (db-test/find-block-by-content @conn "which team is Manu in?")
           spurs (db-test/find-block-by-content @conn "Spurs")
           tx-report (d/transact! conn [[:db/add (:db/id spurs) :block/parent (:db/id manu)]])
-          blocks-to-add (:blocks-to-add (search/sync-search-indice tx-report))
-          manu-index (some #(when (= "which team is Manu in?" (:title %)) %) blocks-to-add)]
-      (is (some? manu-index))
-      (is (true? (some-> (:vector-title manu-index)
-                         (string/includes? "Children: Spurs"))))))
+          blocks-to-add (:blocks-to-add (search/sync-search-indice tx-report {:include-vector-title? true}))
+          spurs-index (some #(when (= "Spurs" (:title %)) %) blocks-to-add)
+          titles (set (map :title blocks-to-add))]
+      (is (contains? titles "Spurs"))
+      (is (not (contains? titles "which team is Manu in?")))
+      (is (= "Spurs" (:vector-title spurs-index)))))
 
-  (testing "reordering a sibling re-embeds the previous block with next-sibling context"
+  (testing "reordering a sibling does not expand indexing to adjacent siblings"
     (let [conn (db-test/create-conn-with-blocks
                 {:pages-and-blocks [{:page {:block/title "Teams"}
                                      :blocks [{:block/title "Spurs"
@@ -702,11 +997,209 @@
                                                :block/order "b"}]}]})
           spurs (db-test/find-block-by-content @conn "Spurs")
           tx-report (d/transact! conn [[:db/add (:db/id spurs) :block/order "c"]])
-          blocks-to-add (:blocks-to-add (search/sync-search-indice tx-report))
-          tony-index (some #(when (= "Which team is Tony in?" (:title %)) %) blocks-to-add)]
-      (is (some? tony-index))
-      (is (true? (some-> (:vector-title tony-index)
-                         (string/includes? "Next: Spurs")))))))
+          blocks-to-add (:blocks-to-add (search/sync-search-indice tx-report {:include-vector-title? true}))
+          spurs-index (some #(when (= "Spurs" (:title %)) %) blocks-to-add)
+          titles (set (map :title blocks-to-add))]
+      (is (contains? titles "Spurs"))
+      (is (not (contains? titles "Which team is Tony in?")))
+      (is (= "Spurs" (:vector-title spurs-index))))))
+
+(deftest sync-search-indice-reindexes-descendant-pages-when-page-parent-changes
+  (let [parent-a-uuid (random-uuid)
+        parent-b-uuid (random-uuid)
+        child-uuid (random-uuid)
+        grandchild-uuid (random-uuid)
+        conn (db-test/create-conn)
+        page-tag :logseq.class/Page]
+    (d/transact! conn [{:block/uuid parent-a-uuid
+                        :block/title "Parent A"
+                        :block/name "parent a"
+                        :block/tags [page-tag]}
+                       {:block/uuid parent-b-uuid
+                        :block/title "Parent B"
+                        :block/name "parent b"
+                        :block/tags [page-tag]}
+                       {:block/uuid child-uuid
+                        :block/title "Child Page"
+                        :block/name "child page"
+                        :block/tags [page-tag]
+                        :block/parent [:block/uuid parent-a-uuid]
+                        :block/order "a"}
+                       {:block/uuid grandchild-uuid
+                        :block/title "Grand Page"
+                        :block/name "grand page"
+                        :block/tags [page-tag]
+                        :block/parent [:block/uuid child-uuid]
+                        :block/order "a"}])
+    (let [tx-report (d/transact! conn [[:db/add [:block/uuid child-uuid]
+                                        :block/parent [:block/uuid parent-b-uuid]]])
+          blocks-to-add (:blocks-to-add (search/sync-search-indice tx-report {:include-vector-title? true}))
+          titles (set (map :title blocks-to-add))]
+      (is (contains? titles "Parent B/Child Page"))
+      (is (contains? titles "Parent B/Child Page/Grand Page"))
+      (is (every? #(= (:title %) (:vector-title %)) blocks-to-add)))))
+
+(deftest sync-search-indice-skips-vector-title-when-disabled
+  (let [conn (db-test/create-conn-with-blocks
+              {:pages-and-blocks [{:page {:block/title "Teams"}
+                                   :blocks [{:block/title "Spurs"}]}]})
+        spurs (db-test/find-block-by-content @conn "Spurs")
+        tx-report (d/transact! conn [[:db/add (:db/id spurs) :block/title "San Antonio Spurs"]])
+        blocks-to-add (:blocks-to-add (search/sync-search-indice tx-report))
+        spurs-index (some #(when (= "San Antonio Spurs" (:title %)) %) blocks-to-add)]
+    (is (some? spurs-index))
+    (is (not (contains? spurs-index :vector-title)))))
+
+(def ^:private sync-search-indice-performance-block-count 300)
+
+(defn- run-sync-search-indice-new-blocks-case
+  [include-vector-title?]
+  (let [conn (db-test/create-conn-with-blocks
+              {:pages-and-blocks [{:page {:block/title "Bulk Insert"}}]})
+        page (db-test/find-page-by-title @conn "Bulk Insert")
+        now 1760000000000
+        tx-report (d/transact! conn
+                               (mapv (fn [idx]
+                                       {:block/uuid (random-uuid)
+                                        :block/title (str "Inserted " idx)
+                                        :block/page (:db/id page)
+                                        :block/parent (:db/id page)
+                                        :block/order (str "a" idx)
+                                        :block/created-at now
+                                        :block/updated-at now})
+                                     (range sync-search-indice-performance-block-count)))
+        blocks-to-add (:blocks-to-add
+                       (search/sync-search-indice
+                        tx-report
+                        {:include-vector-title? include-vector-title?}))]
+    {:blocks-to-add blocks-to-add}))
+
+;; The work per new block is counted by
+;; sync-search-indice-300-new-blocks-does-not-check-page-descendants (page checks)
+;; and build-blocks-indice-uses-block-index (sibling sorts for the vector title).
+(deftest sync-search-indice-300-new-blocks-performance-when-semantic-search-enabled
+  (let [{:keys [blocks-to-add]} (run-sync-search-indice-new-blocks-case true)]
+    (is (= sync-search-indice-performance-block-count (count blocks-to-add)))
+    (is (every? :vector-title blocks-to-add))
+    (is (every? #(= (:title %) (:vector-title %)) blocks-to-add))))
+
+(deftest sync-search-indice-300-new-blocks-performance-when-semantic-search-disabled
+  (let [{:keys [blocks-to-add]} (run-sync-search-indice-new-blocks-case false)]
+    (is (= sync-search-indice-performance-block-count (count blocks-to-add)))
+    (is (not-any? #(contains? % :vector-title) blocks-to-add))))
+
+(deftest sync-search-indice-300-new-blocks-does-not-check-page-descendants
+  (let [page-checks (atom 0)]
+    (with-redefs [ldb/page? (fn [_entity]
+                              (swap! page-checks inc)
+                              false)]
+      (let [{:keys [blocks-to-add]} (run-sync-search-indice-new-blocks-case true)]
+        (is (= sync-search-indice-performance-block-count (count blocks-to-add)))
+        (is (<= @page-checks sync-search-indice-performance-block-count)
+            "1 page check per new block; checking the new blocks for page descendants doubles it")))))
+
+(deftest sync-search-indice-removes-page-descendants-when-page-is-deleted
+  (let [conn (db-test/create-conn-with-blocks
+              {:pages-and-blocks [{:page {:block/title "Deleted page"}
+                                   :blocks [{:block/title "Parent"
+                                             :build/children [{:block/title "Child"}]}]}]})
+        page (db-test/find-page-by-title @conn "Deleted page")
+        parent (db-test/find-block-by-content @conn "Parent")
+        child (db-test/find-block-by-content @conn "Child")
+        tx-report (d/transact! conn [[:db/add (:db/id page) :logseq.property/deleted-at 1760000000000]])
+        blocks-to-remove-set (:blocks-to-remove-set (search/sync-search-indice tx-report))]
+    (is (contains? blocks-to-remove-set (str (:block/uuid page))))
+    (is (contains? blocks-to-remove-set (str (:block/uuid parent))))
+    (is (contains? blocks-to-remove-set (str (:block/uuid child))))))
+
+(deftest sync-search-indice-removes-block-descendants-when-parent-block-is-deleted
+  (let [conn (db-test/create-conn-with-blocks
+              {:pages-and-blocks [{:page {:block/title "Deleted block"}
+                                   :blocks [{:block/title "Parent"
+                                             :build/children [{:block/title "Child"}]}]}]})
+        parent (db-test/find-block-by-content @conn "Parent")
+        child (db-test/find-block-by-content @conn "Child")
+        tx-report (d/transact! conn [[:db/add (:db/id parent) :logseq.property/deleted-at 1760000000000]])
+        blocks-to-remove-set (:blocks-to-remove-set (search/sync-search-indice tx-report))]
+    (is (contains? blocks-to-remove-set (str (:block/uuid parent))))
+    (is (contains? blocks-to-remove-set (str (:block/uuid child))))))
+
+(deftest sync-search-indice-removes-block-descendants-when-parent-becomes-hidden
+  (let [conn (db-test/create-conn-with-blocks
+              {:pages-and-blocks [{:page {:block/title "Hidden move"}
+                                   :blocks [{:block/title "Hidden parent"
+                                             :logseq.property/hide? true}
+                                            {:block/title "Moved parent"
+                                             :build/children [{:block/title "Moved child"}]}]}]})
+        hidden-parent (db-test/find-block-by-content @conn "Hidden parent")
+        moved-parent (db-test/find-block-by-content @conn "Moved parent")
+        moved-child (db-test/find-block-by-content @conn "Moved child")
+        tx-report (d/transact! conn [[:db/add (:db/id moved-parent) :block/parent (:db/id hidden-parent)]])
+        blocks-to-remove-set (:blocks-to-remove-set (search/sync-search-indice tx-report))]
+    (is (contains? blocks-to-remove-set (str (:block/uuid moved-parent))))
+    (is (contains? blocks-to-remove-set (str (:block/uuid moved-child))))))
+
+(deftest sync-search-indice-adds-block-descendants-when-parent-becomes-visible
+  (let [conn (db-test/create-conn-with-blocks
+              {:pages-and-blocks [{:page {:block/title "Visible move"}
+                                   :blocks [{:block/title "Hidden parent"
+                                             :logseq.property/hide? true
+                                             :build/children [{:block/title "Moved parent"
+                                                               :build/children [{:block/title "Moved child"}]}]}]}]})
+        page (db-test/find-page-by-title @conn "Visible move")
+        moved-parent (db-test/find-block-by-content @conn "Moved parent")
+        tx-report (d/transact! conn [[:db/add (:db/id moved-parent) :block/parent (:db/id page)]])
+        blocks-to-add (:blocks-to-add (search/sync-search-indice tx-report))
+        titles (set (map :title blocks-to-add))]
+    (is (contains? titles "Moved parent"))
+    (is (contains? titles "Moved child"))))
+
+(deftest sync-search-indice-reindexes-holders-when-property-is-deleted
+  (testing "pages and blocks that held a deleted property stay in the FTS add set"
+    (let [conn (db-test/create-conn-with-blocks
+                {:properties {:foo {:logseq.property/type :default}}
+                 :pages-and-blocks
+                 [{:page {:block/title "Test Page"
+                          :build/properties {:foo "page value"}}
+                   :blocks [{:block/title "Holder block"
+                             :build/properties {:foo "block value"}}]}]})
+          property (d/entity @conn :user.property/foo)
+          page (db-test/find-page-by-title @conn "Test Page")
+          holder-block (db-test/find-block-by-content @conn "Holder block")
+          ;; Worker pipeline records property usage on :block/refs. Seed the
+          ;; same links so this test exercises the FTS referrer path.
+          _ (d/transact! conn [[:db/add (:db/id page) :block/refs (:db/id property)]
+                               [:db/add (:db/id holder-block) :block/refs (:db/id property)]])
+          property-uuid (str (:block/uuid property))
+          page-uuid (str (:block/uuid page))
+          holder-uuid (str (:block/uuid holder-block))
+          referrer-ids (set (map :db/id (:block/_refs (d/entity @conn (:db/id property)))))
+          tx-report (d/transact! conn (outliner-page/build-page-retract-tx @conn property))
+          {:keys [blocks-to-add blocks-to-remove-set]} (search/sync-search-indice tx-report)
+          add-ids (set (map :id blocks-to-add))
+          add-titles (set (map :title blocks-to-add))]
+      (is (= #{(:db/id page) (:db/id holder-block)} referrer-ids)
+          "holders reference the property before delete")
+      (is (some? (d/entity @conn (:db/id page)))
+          "holder page remains in Datascript")
+      (is (some? (d/entity @conn (:db/id holder-block)))
+          "holder block remains in Datascript")
+      (is (nil? (d/entity @conn :user.property/foo))
+          "deleted property is gone from Datascript")
+      (is (contains? add-ids page-uuid)
+          "holder page is reindexed after property delete")
+      (is (contains? add-ids holder-uuid)
+          "holder block is reindexed after property delete")
+      (is (contains? add-titles "Test Page"))
+      (is (contains? add-titles "Holder block"))
+      (is (contains? blocks-to-remove-set property-uuid)
+          "deleted property leaves the FTS index")
+      (is (contains? blocks-to-remove-set page-uuid)
+          "holder page is removed then re-upserted")
+      (is (contains? blocks-to-remove-set holder-uuid)
+          "holder block is removed then re-upserted")
+      (is (not (contains? add-ids property-uuid))
+          "deleted property is not re-added to the FTS index"))))
 
 (deftest search-blocks-includes-vector-only-results
   (testing "zvec vector hits are merged into desktop search even when SQLite has no keyword hit"
@@ -1260,3 +1753,118 @@
     (is (some? error))
     (is (re-find #"Search upsert-blocks wrong data"
                  (or (ex-message error) (str error))))))
+
+(defn- <open-search-db
+  []
+  (let [dir (node-helper/create-tmp-dir "search-db")]
+    (#'platform-node/open-sqlite-db nil {:path (node-path/join dir "search.sqlite")})))
+
+(defn- query-rows
+  [db sql & bind]
+  (js->clj (.exec db #js {:sql sql :bind (to-array bind) :rowMode "array"})))
+
+(defn- fts-rows-out-of-step
+  "Ids of blocks rows whose FTS row, looked up by the blocks rowid, is missing
+  or holds other values"
+  [db]
+  (mapv first (query-rows db "SELECT b.id FROM blocks b LEFT JOIN blocks_fts f ON f.rowid = b.rowid
+                              WHERE f.rowid IS NULL OR f.id IS NOT b.id OR f.title IS NOT b.title OR f.page IS NOT b.page")))
+
+(defn- search-ids
+  [db q]
+  (with-redefs [search/combine-results (fn [_db results] results)
+                search/search-result->block-result (fn [_conn _q _code-class _option result]
+                                                     (assoc result :block/uuid (uuid (:id result))))]
+    (set (map :id (search/search-blocks (atom :large-db) db q {:limit 10 :enable-snippet? false})))))
+
+(defn- index-rows
+  [page id-titles]
+  (clj->js (map (fn [[id title]] {:id id :title title :page page}) id-titles)))
+
+(deftest fts-rows-keep-blocks-rowids-test
+  (async done
+    (let [page (str (random-uuid))
+          [a b c d] (repeatedly 4 #(str (random-uuid)))]
+      (-> (p/let [db (<open-search-db)]
+            (search/create-tables-and-triggers! db)
+            (search/upsert-blocks! db (index-rows page [[a "alpha apple"] [b "bravo banana"] [c "charlie cherry"]]))
+            (is (= #{a} (search-ids db "apple")))
+            (is (= #{b} (search-ids db "banana")))
+            (testing "an update and a delete find the FTS row by the blocks rowid"
+              (search/upsert-blocks! db (index-rows page [[a "alpha apricot"]]))
+              (search/delete-blocks! db [b])
+              (search/upsert-blocks! db (index-rows page [[d "delta date"]]))
+              (is (= [] (fts-rows-out-of-step db)))
+              (is (= [[3]] (query-rows db "SELECT count(*) FROM blocks_fts"))))
+            (testing "search results after the update and the delete"
+              (is (= #{} (search-ids db "apple")))
+              (is (= #{a} (search-ids db "apricot")))
+              (is (= #{} (search-ids db "banana")))
+              (is (= #{c} (search-ids db "cherry")))
+              (is (= #{d} (search-ids db "date"))))
+            (.close db))
+          (p/catch (fn [e] (is false (str e))))
+          (p/finally done)))))
+
+(def ^:private version-4-fts-triggers
+  "The triggers of search index version 4, which find FTS rows by id"
+  ["CREATE TRIGGER blocks_ad AFTER DELETE ON blocks BEGIN
+      DELETE from blocks_fts where id = old.id;
+    END;"
+   "CREATE TRIGGER blocks_ai AFTER INSERT ON blocks BEGIN
+      INSERT INTO blocks_fts (id, title, page) VALUES (new.id, new.title, new.page);
+    END;"
+   "CREATE TRIGGER blocks_au AFTER UPDATE ON blocks BEGIN
+      DELETE from blocks_fts where id = old.id;
+      INSERT INTO blocks_fts (id, title, page) VALUES (new.id, new.title, new.page);
+    END;"])
+
+(defn- create-version-4-index!
+  [db]
+  (.exec db "CREATE TABLE blocks (id TEXT NOT NULL PRIMARY KEY, title TEXT NOT NULL, page TEXT)")
+  (.exec db "CREATE VIRTUAL TABLE blocks_fts USING fts5(id, title, page, tokenize=\"trigram\")")
+  (doseq [trigger version-4-fts-triggers]
+    (.exec db trigger))
+  (.exec db "PRAGMA user_version = 4"))
+
+(deftest fts-rowid-migration-keeps-search-right-test
+  (async done
+    (let [page (str (random-uuid))
+          [a b c d e f g] (repeatedly 7 #(str (random-uuid)))
+          expected {"apricot" #{a} "banana" #{} "blueberry" #{b} "cherry" #{} "date" #{d}
+                    "elder" #{} "eggplant" #{e} "fig" #{} "grape" #{g}}
+          search-results (fn [db] (into {} (map (fn [q] [q (search-ids db q)]) (keys expected))))]
+      (-> (p/let [db (<open-search-db)]
+            (create-version-4-index! db)
+            (search/upsert-blocks! db (index-rows page [[a "alpha apple"] [b "bravo banana"] [c "charlie cherry"]
+                                                        [d "delta date"] [e "echo elder"] [f "foxtrot fig"]]))
+            (search/upsert-blocks! db (index-rows page [[a "alpha apricot"]]))
+            ;; the graph open path, which leaves an existing index as it is
+            (search/create-tables-and-triggers! db)
+            (is (= [a] (fts-rows-out-of-step db)) "version 4 moved the updated row to a new FTS rowid")
+            (search/start-fts-rowid-migration! db)
+            (is (= 3 (search/copy-fts-rowid-batch! db 0 3)))
+            (testing "edits while the index moves: before and after the copied rows"
+              (search/upsert-blocks! db (index-rows page [[b "bravo blueberry"] [e "echo eggplant"] [g "golf grape"]]))
+              (search/delete-blocks! db [c f])
+              (is (= expected (search-results db))))
+            (loop [after 3]
+              (when-let [after' (search/copy-fts-rowid-batch! db after 3)]
+                (recur after')))
+            (search/finish-fts-rowid-migration! db 5)
+            (is (= [] (fts-rows-out-of-step db)))
+            (is (= [[5]] (query-rows db "SELECT count(*) FROM blocks_fts")))
+            (is (= [[5]] (query-rows db "PRAGMA user_version")))
+            (is (= [["blocks_ad"] ["blocks_ai"] ["blocks_au"]]
+                   (query-rows db "SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name")))
+            (is (= [] (query-rows db "SELECT name FROM sqlite_master WHERE name LIKE 'blocks_fts_next%'")))
+            (is (= expected (search-results db)))
+            (testing "the rowid triggers after the move"
+              (search/upsert-blocks! db (index-rows page [[d "delta durian"]]))
+              (search/delete-blocks! db [a])
+              (is (= [] (fts-rows-out-of-step db)))
+              (is (= #{d} (search-ids db "durian")))
+              (is (= #{} (search-ids db "apricot"))))
+            (.close db))
+          (p/catch (fn [e] (is false (str e))))
+          (p/finally done)))))

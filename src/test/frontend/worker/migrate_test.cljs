@@ -3,8 +3,11 @@
             [cljs.test :refer [deftest is]]
             [datascript.core :as d]
             [frontend.worker.db.migrate :as db-migrate]
+            [frontend.worker.pipeline :as worker-pipeline]
             [logseq.db :as ldb]
-            [logseq.db.frontend.schema :as db-schema]))
+            [logseq.db.common.order :as db-order]
+            [logseq.db.frontend.schema :as db-schema]
+            [logseq.db.sqlite.create-graph :as sqlite-create-graph]))
 
 (defn- entities-with
   [db attr]
@@ -113,6 +116,21 @@
     (is (= graph-created-at
            (:kv/value (d/entity @conn :logseq.kv/graph-created-at)))
         "Graph created at not changed by fn")))
+
+(deftest ensure-built-in-data-live-repair-assigns-canonical-revision
+  (let [conn (d/create-conn db-schema/schema)
+        pipeline-before @ldb/*transact-pipeline-fn]
+    (d/transact! conn (sqlite-create-graph/build-db-initial-data ""))
+    (d/transact! conn [[:db/retractEntity :logseq.property/icon]])
+    (ldb/register-transact-pipeline-fn! worker-pipeline/transact-pipeline)
+    (try
+      (db-migrate/ensure-built-in-data-exists! conn)
+      (let [icon-property (d/entity @conn :logseq.property/icon)]
+        (is (some? icon-property))
+        (is (nat-int? (:block/tx-id icon-property))
+            "A recreated built-in is immediately readable through the canonical API."))
+      (finally
+        (reset! ldb/*transact-pipeline-fn pipeline-before)))))
 
 (deftest migrate-65-25-deletes-legacy-properties
   (let [conn (d/create-conn legacy-65-24-schema)
@@ -263,6 +281,24 @@
                       (d/entity @conn [:block/uuid range-comments-uuid])))))
         "Existing range comment targets should be preserved")))
 
+(deftest migrate-65-27-with-missing-comments-built-ins-does-not-crash
+  (let [conn (d/create-conn db-schema/schema)]
+    (d/transact! conn [{:db/ident :logseq.kv/schema-version
+                        :kv/value {:major 65 :minor 27}}
+                       {:db/ident :logseq.class/Root
+                        :block/title "Root Tag"}])
+
+    (is (nil? (d/entity @conn :logseq.class/Comments)))
+    (is (nil? (d/entity @conn :logseq.property.comments/blocks)))
+
+    (db-migrate/migrate conn :target-version {:major 65 :minor 33})
+
+    (is (= {:major 65 :minor 33}
+           (:kv/value (d/entity @conn :logseq.kv/schema-version))))
+    (is (some? (d/entity @conn :logseq.class/Comments)))
+    (is (some? (d/entity @conn :logseq.class/Comment)))
+    (is (some? (d/entity @conn :logseq.property.comments/blocks)))))
+
 (deftest migrate-65-30-adds-assignee-property
   (let [conn (d/create-conn db-schema/schema)]
     (d/transact! conn [{:db/ident :logseq.kv/schema-version
@@ -338,6 +374,39 @@
              (ref-ids (:logseq.property.comments/blocks
                        (d/entity migration-db [:block/uuid comments-area-uuid]))))))))
 
+(deftest migrate-65-34-advances-repaired-page-order-allocator
+  (let [conn (d/create-conn db-schema/schema)
+        child-uuid (random-uuid)]
+    (d/transact! conn (sqlite-create-graph/build-db-initial-data ""))
+    (d/transact! conn [{:db/ident :logseq.kv/schema-version
+                        :kv/value {:major 65 :minor 33}}
+                       {:db/id "parent"
+                        :block/uuid (random-uuid)
+                        :block/title "Country"
+                        :block/name "country"
+                        :block/tags :logseq.class/Page}
+                       {:block/uuid (random-uuid)
+                        :block/title "Overview"
+                        :block/parent "parent"
+                        :block/page "parent"
+                        :block/order "bzz"}
+                       {:block/uuid child-uuid
+                        :block/title "Australia"
+                        :block/name "australia"
+                        :block/tags :logseq.class/Page
+                        :block/parent "parent"}])
+    (with-redefs [db-order/*max-key (atom "a0")]
+      (let [result (db-migrate/migrate conn :target-version {:major 65 :minor 34})
+            migration-report (first (:upgrade-result-coll result))
+            repaired-order (:block/order (d/entity @conn [:block/uuid child-uuid]))]
+        (is (= {:major 65 :minor 34}
+               (:kv/value (d/entity @conn :logseq.kv/schema-version))))
+        (is (= {:fix db-order/missing-internal-page-parent-order-tx}
+               (:migrate-updates migration-report)))
+        (is (pos? (compare repaired-order "bzz")))
+        (is (pos? (compare (db-order/gen-key) repaired-order)))
+        (is (nil? (db-migrate/migrate conn :target-version {:major 65 :minor 34})))))))
+
 (deftest migrate-65-33-adds-gallery-view-properties
   (let [conn (d/create-conn db-schema/schema)
         property-idents [:logseq.property.view/gallery-asset-property
@@ -370,3 +439,51 @@
     (is (every? #(= :raw-number (:logseq.property/type (d/entity @conn %)))
                 [:logseq.property.view/gallery-card-width
                  :logseq.property.view/gallery-card-height]))))
+
+(deftest migrate-65-35-removes-file-graph-attributes
+  (let [conn (d/create-conn db-schema/schema)
+        block-uuid #uuid "33333333-3333-3333-3333-333333333333"
+        file-attrs {:block/scheduled 20240102
+                    :block/deadline 20240103
+                    :block/marker "NOW"
+                    :block/priority "B"
+                    :block/properties-text-values {:key "value"}
+                    :block/invalid-properties #{"@key"}}]
+    (d/transact! conn (sqlite-create-graph/build-db-initial-data ""))
+    (d/transact! conn [{:db/ident :logseq.kv/schema-version
+                       :kv/value {:major 65 :minor 34}}
+                      (merge {:block/uuid block-uuid
+                              :block/title "Task text"
+                              :logseq.property/heading 2}
+                             file-attrs)])
+    (let [result (db-migrate/migrate conn :target-version {:major 65 :minor 35})
+          block (d/entity @conn [:block/uuid block-uuid])]
+      (is (every? #(nil? (entities-with @conn %)) (keys file-attrs)))
+      (is (= {:block/title "Task text" :logseq.property/heading 2}
+             (select-keys block [:block/title :logseq.property/heading])))
+      (is (= {:major 65 :minor 35}
+             (:kv/value (d/entity @conn :logseq.kv/schema-version))))
+      (is (= (set (keys file-attrs))
+             (set (get-in result [:upgrade-result-coll 0 :migrate-updates :delete-properties]))))
+      (is (nil? (db-migrate/migrate conn :target-version {:major 65 :minor 35}))))))
+(deftest upgrade-version-skips-existing-property
+  (let [conn (d/create-conn db-schema/schema)
+        property-ident :logseq.property/assignee
+        custom-title "Custom assignee title"
+        custom-created-at 1234567890
+        custom-order "zzzz"]
+    (d/transact! conn
+                 [{:db/ident property-ident
+                   :block/uuid #uuid "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+                   :block/title custom-title
+                   :block/created-at custom-created-at
+                   :block/order custom-order}])
+    (let [before (d/entity @conn property-ident)
+          _ (#'db-migrate/upgrade-version!
+             conn "65.30" {:properties [property-ident]})
+          after (d/entity @conn property-ident)]
+      (is (some? after) "Existing property remains after upgrade")
+      (is (= (:db/id before) (:db/id after)))
+      (is (= custom-title (:block/title after)))
+      (is (= custom-created-at (:block/created-at after)))
+      (is (= custom-order (:block/order after))))))

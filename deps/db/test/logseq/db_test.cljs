@@ -3,6 +3,7 @@
             [datascript.core :as d]
             [datascript.storage :as ds-storage :refer [IStorage]]
             [logseq.db :as ldb]
+            [logseq.db.frontend.validate :as db-validate]
             [logseq.db.test.helper :as db-test]))
 
 (defrecord InMemoryStorage [*disk]
@@ -80,6 +81,73 @@
     (is (= "Apr 11th, 2026"
            (:block/title (ldb/get-journal-page-by-day @conn 20260411))))))
 
+(defn- create-sibling-conn
+  [middle-attrs]
+  (let [conn (db-test/create-conn)]
+    (d/transact! conn
+                 [{:db/id -1
+                   :block/title "page"
+                   :block/name "page"}
+                  {:db/id -2
+                   :db/ident :user.property/p}
+                  {:db/id -3
+                   :block/title "ordinary before"
+                   :block/parent -1
+                   :block/order "a0"}
+                  (merge
+                   {:db/id -4
+                    :block/title "property value"
+                    :block/parent -1
+                    :block/order "a1"}
+                   middle-attrs)
+                  {:db/id -5
+                   :block/title "ordinary after"
+                   :block/parent -1
+                   :block/order "a2"}])
+    conn))
+
+(defn- block-by-title
+  [db title]
+  (d/entity db
+            (d/q '[:find ?b .
+                   :in $ ?title
+                   :where [?b :block/title ?title]]
+                 db title)))
+
+(deftest ordinary-sibling-skips-created-from-property-children
+  (let [conn (create-sibling-conn
+              {:logseq.property/created-from-property -2})
+        before (block-by-title @conn "ordinary before")
+        after (block-by-title @conn "ordinary after")]
+    (is (some? before))
+    (is (some? after))
+    (is (= (:db/id before) (:db/id (ldb/get-left-sibling after))))
+    (is (= (:db/id after) (:db/id (ldb/get-right-sibling before))))))
+
+(deftest ordinary-sibling-skips-closed-value-property-children
+  (let [conn (create-sibling-conn
+              {:block/closed-value-property -2})
+        before (block-by-title @conn "ordinary before")
+        after (block-by-title @conn "ordinary after")]
+    (is (some? before))
+    (is (some? after))
+    (is (= (:db/id before) (:db/id (ldb/get-left-sibling after))))
+    (is (= (:db/id after) (:db/id (ldb/get-right-sibling before))))))
+
+(deftest closed-value-siblings-are-the-other-closed-values-of-its-property
+  (let [values [["a" (random-uuid)] ["b" (random-uuid)] ["c" (random-uuid)]]
+        conn (db-test/create-conn-with-blocks
+              {:properties {:user.property/choice
+                            {:logseq.property/type :default
+                             :build/closed-values (mapv (fn [[title u]] {:value title :uuid u}) values)}}})
+        [first-value middle-value last-value] (sort-by :block/order
+                                                       (map (fn [[_ u]] (d/entity @conn [:block/uuid u])) values))]
+    (is (= 3 (count (distinct (map :block/order [first-value middle-value last-value])))))
+    (is (= (:db/id last-value) (:db/id (ldb/get-right-sibling middle-value))))
+    (is (= (:db/id first-value) (:db/id (ldb/get-left-sibling middle-value))))
+    (is (nil? (ldb/get-right-sibling last-value)))
+    (is (nil? (ldb/get-left-sibling first-value)))))
+
 (deftest page-exists
   (let [conn (db-test/create-conn-with-blocks
               {:properties
@@ -133,6 +201,132 @@
          (ldb/transact! temp-conn [{:db/ident :logseq.class/Task
                                     :block/tags :logseq.class/Property}])
          (ldb/transact! temp-conn [[:db/retract :logseq.class/Task :block/tags :logseq.class/Property]]))))))
+
+(deftest batch-transact-with-temp-conn-preserves-retracts-test
+  (testing "temp conn batch replays retractions instead of treating every datom as an add"
+    (let [conn (db-test/create-conn-with-blocks
+                {:pages-and-blocks [{:page {:block/title "page 1"}
+                                     :blocks [{:block/title "old"}]}]})
+          block (db-test/find-block-by-content @conn "old")
+          block-id (:db/id block)]
+      (ldb/batch-transact-with-temp-conn!
+       conn
+       {}
+       (fn [temp-conn]
+         (ldb/transact! temp-conn [[:db/retract [:block/uuid (:block/uuid block)] :block/title "old"]])
+         (ldb/transact! temp-conn [[:db/add [:block/uuid (:block/uuid block)] :block/title "new"]])))
+      (is (= "new" (:block/title (d/entity @conn block-id)))))))
+
+(deftest batch-transact-with-temp-conn-preserves-cardinality-one-schema-test
+  (testing "temp conn emits replacement retractions for cardinality-one attrs"
+    (let [conn (db-test/create-conn-with-blocks
+                {:pages-and-blocks [{:page {:block/title "page 1"}
+                                     :blocks [{:block/title "old"}]}]})
+          block (db-test/find-block-by-content @conn "old")
+          block-id (:db/id block)]
+      (ldb/transact! conn [[:db/add block-id :block/order "a0"]])
+      (ldb/batch-transact-with-temp-conn!
+       conn
+       {}
+         (fn [temp-conn]
+           (ldb/transact! temp-conn [[:db/add [:block/uuid (:block/uuid block)] :block/order "a1"]])))
+      (is (= "a1" (:block/order (d/entity @conn block-id)))))))
+
+(deftest batch-transact-with-temp-conn-before-commit-can-abort-live-commit-test
+  (testing "before-commit runs after temp work and before the live conn is modified"
+    (let [conn (db-test/create-conn-with-blocks
+                {:pages-and-blocks [{:page {:block/title "page 1"}
+                                     :blocks [{:block/title "old"}]}]})
+          block (db-test/find-block-by-content @conn "old")
+          block-id (:db/id block)]
+      (is (thrown? js/Error
+                   (ldb/batch-transact-with-temp-conn!
+                    conn
+                    {}
+                    (fn [temp-conn]
+                      (ldb/transact! temp-conn [[:db/add [:block/uuid (:block/uuid block)] :block/title "new"]]))
+                    {:before-commit #(throw (js/Error. "abort before commit"))})))
+      (is (= "old" (:block/title (d/entity @conn block-id)))))))
+
+(deftest validated-transact-retries-when-live-conn-changes-before-commit-test
+  (testing "validated transact does not overwrite a concurrent live commit"
+    (let [conn (db-test/create-conn-with-blocks
+                {:pages-and-blocks [{:page {:block/title "page 1"}
+                                     :blocks [{:block/title "first"}
+                                              {:block/title "second"}]}]})
+          first-block (db-test/find-block-by-content @conn "first")
+          second-block (db-test/find-block-by-content @conn "second")
+          injected? (atom false)
+          original-pipeline @ldb/*transact-pipeline-fn]
+      (try
+        (ldb/register-transact-pipeline-fn!
+         (fn [tx-report]
+           (when (and (not @injected?)
+                      (some (fn [datom]
+                              (and (= :block/title (:a datom))
+                                   (= "first updated" (:v datom))))
+                            (:tx-data tx-report)))
+             (reset! injected? true)
+             (ldb/transact! conn [[:db/add (:db/id second-block) :block/title "second updated"]]))
+           tx-report))
+        (ldb/transact! conn [[:db/add (:db/id first-block) :block/title "first updated"]])
+        (is (= "first updated" (:block/title (d/entity @conn (:db/id first-block)))))
+        (is (= "second updated" (:block/title (d/entity @conn (:db/id second-block)))))
+        (finally
+          (reset! ldb/*transact-pipeline-fn original-pipeline))))))
+
+(deftest fix-db-transact-runs-pipeline-without-recursive-validation-test
+  (let [conn (db-test/create-conn-with-blocks
+              {:pages-and-blocks [{:page {:block/title "page 1"}
+                                   :blocks [{:block/title "before"}]}]})
+        block (db-test/find-block-by-content @conn "before")
+        block-id (:db/id block)
+        original-pipeline @ldb/*transact-pipeline-fn]
+    (try
+      (ldb/register-transact-pipeline-fn!
+       (fn [{:keys [db-before db-after tx-data tx-meta]}]
+         (let [stamp-report (d/with db-after
+                                    [{:db/id block-id
+                                      :block/tx-id 42}])]
+           (assoc stamp-report
+                  :db-before db-before
+                  :tx-data (concat tx-data (:tx-data stamp-report))
+                  :tx-meta tx-meta))))
+      (with-redefs [db-validate/validate-tx-report
+                    (fn [& _]
+                      (throw (js/Error. "Repair transactions must not recursively validate")))]
+        (ldb/transact! conn
+                       [{:db/id block-id
+                         :block/title "after"}]
+                       {:fix-db? true}))
+      (is (= "after" (:block/title (d/entity @conn block-id))))
+      (is (= 42 (:block/tx-id (d/entity @conn block-id)))
+          "Repair transactions commit canonical data produced by the pipeline.")
+      (finally
+        (reset! ldb/*transact-pipeline-fn original-pipeline)))))
+
+(deftest transact-new-graph-refs-skips-pipeline-test
+  (let [conn (db-test/create-conn-with-blocks
+              {:pages-and-blocks [{:page {:block/title "page 1"}
+                                   :blocks [{:block/title "before"}]}]})
+        block (db-test/find-block-by-content @conn "before")
+        block-id (:db/id block)
+        pipeline-calls (atom 0)
+        original-pipeline @ldb/*transact-pipeline-fn]
+    (try
+      (ldb/register-transact-pipeline-fn!
+       (fn [tx-report]
+         (swap! pipeline-calls inc)
+         tx-report))
+      (ldb/transact! conn
+                     [{:db/id block-id
+                       :block/title "after"}]
+                     {:transact-new-graph-refs? true})
+      (is (zero? @pipeline-calls)
+          "Import finalize already wrote :block/refs; do not rebuild them in the pipeline.")
+      (is (= "after" (:block/title (d/entity @conn block-id))))
+      (finally
+        (reset! ldb/*transact-pipeline-fn original-pipeline)))))
 
 (deftest test-batch-transact-clears-stale-tx-tail-before-next-store-tail
   (let [block-uuid #uuid "00000001-2026-0421-0000-000000000000"
@@ -199,6 +393,28 @@
       (is (= "People" (:title (first results))))
       (is (= ["Alice"]
              (map :block/title (:entities (first results))))))))
+
+(deftest get-all-pages-excludes-nested-pages-under-recycled-parent
+  (let [conn (db-test/create-conn-with-blocks
+              {:pages-and-blocks
+               [{:page {:block/title "page1"}
+                 :blocks [{:block/title "page2"
+                           :block/name "page2"
+                           :build/tags [:logseq.class/Page]}]}
+                {:page {:block/title "keep"}}]})
+        page1 (db-test/find-page-by-title @conn "page1")
+        titles (fn [db]
+                 (->> (ldb/get-all-pages db)
+                      (map :block/title)
+                      set))]
+    (is (contains? (titles @conn) "page2"))
+    (d/transact! conn [{:db/id (:db/id page1)
+                        :logseq.property/deleted-at 1}])
+    (let [after (titles @conn)]
+      (is (contains? after "keep"))
+      (is (not (contains? after "page1")))
+      (is (not (contains? after "page2"))
+          "ldb/get-all-pages must hide nested pages under a recycled parent."))))
 
 (deftest get-bidirectional-properties-ignores-recycled-entities
   (let [conn (db-test/create-conn-with-blocks
@@ -270,3 +486,39 @@
       (is (= 300 (count (:entities (first results)))))
       (is (<= @attr-lookups 12)
           (str "expected bounded attr lookups, got " @attr-lookups)))))
+
+(deftest sort-page-random-blocks
+  (testing "non-consecutive blocks are sorted in page preorder"
+    (let [conn (db-test/create-conn-with-blocks
+                {:pages-and-blocks
+                 [{:page {:block/title "page 1"}
+                   :blocks [{:block/title "b1"
+                             :build/children [{:block/title "b1-1"}
+                                              {:block/title "b1-2"}]}
+                            {:block/title "b2"}
+                            {:block/title "b3"
+                             :build/children [{:block/title "b3-1"}]}]}]})
+          pick (fn [title] (db-test/find-block-by-content @conn title))
+          shuffled [(pick "b3-1") (pick "b2") (pick "b1-2") (pick "b1")]]
+      (is (= ["b1" "b1-2" "b2" "b3-1"]
+             (map :block/title (ldb/sort-page-random-blocks @conn shuffled))))))
+
+  (testing "sorting a few blocks doesn't traverse the whole page"
+    (let [conn (db-test/create-conn-with-blocks
+                {:pages-and-blocks
+                 [{:page {:block/title "page 1"}
+                   :blocks (mapv (fn [i] {:block/title (str "b" i)})
+                                 (range 2000))}]})
+          picks (map #(db-test/find-block-by-content @conn (str "b" %))
+                     [7 1000 1999])
+          sort-by-order-calls (atom 0)
+          original-sort-by-order ldb/sort-by-order
+          sorted (with-redefs [ldb/sort-by-order
+                               (fn [blocks]
+                                 (swap! sort-by-order-calls inc)
+                                 (original-sort-by-order blocks))]
+                   (ldb/sort-page-random-blocks @conn picks))]
+      (is (= ["b7" "b1000" "b1999"] (map :block/title sorted)))
+      (is (<= @sort-by-order-calls (count picks))
+          (str "expected sibling sorts bounded by the selected blocks, got "
+               @sort-by-order-calls)))))

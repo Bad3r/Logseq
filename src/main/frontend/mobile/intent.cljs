@@ -11,9 +11,10 @@
             [frontend.config :as config]
             [frontend.context.i18n :refer [interpolate-rich-text-node t]]
             [frontend.date :as date]
-            [frontend.db :as db]
+            [frontend.db.async :as db-async]
             [frontend.handler.assets :as assets-handler]
             [frontend.handler.editor :as editor-handler]
+            [frontend.handler.editor.assets :as editor-assets]
             [frontend.handler.notification :as notification]
             [frontend.mobile.util :as mobile-util]
             [frontend.state :as state]
@@ -117,14 +118,13 @@
           file-base64-str (some-> file (.-data))
           file (some-> file-base64-str (utils/base64ToUint8Array)
                        (vector) (clj->js) (js/File. basename #js {}))
-          result (editor-handler/db-based-save-assets!
+          result (editor-assets/db-based-save-assets!
                   (state/get-current-repo) [file] {})]
     (first result)))
 
 (defn- handle-received-media [result]
   (p/let [{:keys [url]} result
-          page (or (state/get-current-page) (string/lower-case (db/get-today-journal-title)))
-          format (db/get-page-format page)]
+          format :markdown]
     (-> (embed-asset-file url format)
         (p/catch (fn [error]
                    (log/error :share-import-media-failed {:error error :url url})
@@ -132,8 +132,9 @@
 
 (defn- handle-received-application [result]
   (p/let [{:keys [url type]} result
-          page (or (state/get-current-page) (string/lower-case (db/get-today-journal-title)))
-          format (db/get-page-format page)
+          today-page-title (db-async/<get-today-journal-title (state/get-current-repo))
+          page (or (state/get-current-page) (string/lower-case today-page-title))
+          format :markdown
           application-type (last (string/split type "/"))
           content (cond
                     (contains? (set/union config/doc-formats config/media-formats)
@@ -148,7 +149,7 @@
                       (interpolate-rich-text-node
                        (t :mobile.share/unsupported-import-type)
                        [application-type
-                        [:a {:href "https://github.com/logseq/logseq/issues"
+                        [:a {:href "https://github.com/logseq/db-test/issues"
                              :target "_blank"} "GitHub"]])]
                      :warning false))]
     (when content
@@ -179,7 +180,7 @@
               file-base64-str (some-> file (.-data))
               file (some-> file-base64-str (utils/base64ToUint8Array)
                            (vector) (clj->js) (js/File. basename #js {}))
-              result (editor-handler/db-based-save-assets!
+              result (editor-assets/db-based-save-assets!
                       (state/get-current-repo) [file] {})]
         result)
       (p/catch (fn [error]
@@ -199,7 +200,7 @@
        [:div
         (interpolate-rich-text-node
          (t :mobile.share/unsupported-content-warning)
-         [[:a {:href "https://github.com/logseq/logseq/issues/new?labels=from:in-app&template=bug_report.yaml"
+         [[:a {:href "https://github.com/logseq/db-test/issues/new?labels=from:in-app&template=bug_report.yaml"
                :target "_blank"} "GitHub"]])
         [:pre.code (with-out-str (pprint/pprint resource))]] :warning false))
 
@@ -212,7 +213,7 @@
        [:div
         (interpolate-rich-text-node
          (t :mobile.share/unsupported-content-warning)
-         [[:a {:href "https://github.com/logseq/logseq/issues/new?labels=from:in-app&template=bug_report.yaml"
+         [[:a {:href "https://github.com/logseq/db-test/issues/new?labels=from:in-app&template=bug_report.yaml"
                :target "_blank"} "GitHub"]])
         [:pre.code (with-out-str (pprint/pprint resource))]] :warning false))))
 
@@ -220,8 +221,9 @@
   "Mobile share intent handler v2, use complex payload to support more types of content."
   [payload]
   ;; use :text template, use {url} as rich text placeholder
-  (p/let [page (or (state/get-current-page) (string/lower-case (db/get-today-journal-title)))
-          format (db/get-page-format page)
+  (p/let [today-page-title (db-async/<get-today-journal-title (state/get-current-repo))
+          page (or (state/get-current-page) (string/lower-case today-page-title))
+          format :markdown
 
           template (get-in (state/get-config)
                            [:quick-capture-templates :text]
@@ -241,7 +243,7 @@
                                   (keyword (:ext resource))))
                      resources)))
       (let [time (date/get-current-time)
-            date-ref-name (db/get-today-journal-title)
+            date-ref-name today-page-title
             content (-> template
                         (string/replace "{time}" time)
                         (string/replace "{date}" date-ref-name)
@@ -285,7 +287,7 @@
          [:div
           (interpolate-rich-text-node
            (t :mobile.share/unsupported-content-warning)
-           [[:a {:href "https://github.com/logseq/logseq/issues/new?labels=from:in-app&template=bug_report.yaml"
+           [[:a {:href "https://github.com/logseq/db-test/issues/new?labels=from:in-app&template=bug_report.yaml"
                  :target "_blank"} "GitHub"]])
           [:pre.code (with-out-str (pprint/pprint result))]] :warning false)))))
 

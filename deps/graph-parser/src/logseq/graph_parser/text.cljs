@@ -75,8 +75,10 @@
     (= v "false")
     false
 
+    ;; only when the number keeps the text: `007` or a too long integer stays text
     (re-find #"^\d+$" v)
-    (parse-long v)))
+    (let [n (parse-long v)]
+      (when (= (str n) v) n))))
 
 (defn- get-ref-from-ast
   [[typ data]]
@@ -127,10 +129,9 @@
                k')))
 
 (defn- extract-refs-by-commas
+  "Split comma-separated plain text. Inline parse keeps commas inside [[page, name]]."
   [v format]
-  (let [plains (->> (map first (gp-mldoc/->edn v (gp-mldoc/default-config format)))
-                    first
-                    second
+  (let [plains (->> (gp-mldoc/inline->edn v (gp-mldoc/default-config format))
                     (filter #(and (vector? %) (= "Plain" (first %))))
                     (map second))]
     (set (mapcat sep-by-comma plains))))

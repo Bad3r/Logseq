@@ -1,10 +1,14 @@
 (ns frontend.handler.block-test
-  (:require [cljs.test :refer [deftest is testing]]
+  (:require [cljs.test :refer [async deftest is testing]]
             [clojure.string :as string]
             [datascript.core :as d]
-            [frontend.db :as db]
+            [frontend.db.async :as db-async]
             [frontend.handler.block :as block-handler]
-            [logseq.db.test.helper :as db-test]))
+            [frontend.modules.outliner.op :as outliner-op]
+            [frontend.state :as state]
+            [logseq.outliner.core :as outliner-core]
+            [logseq.db.test.helper :as db-test]
+            [promesa.core :as p]))
 
 (deftest block-unique-title-no-truncate-when-disabled
   (testing "disable truncate for cmdk path"
@@ -31,8 +35,7 @@
                          :Milestone {:block/title "Milestone"
                                      :build/class-extends [:Project]}}})
         milestone (d/entity @conn :user.class/Milestone)]
-    (with-redefs [db/get-db (fn [] @conn)]
-      (is (= "Milestone" (block-handler/block-unique-title milestone))))))
+    (is (= "Milestone" (block-handler/block-unique-title milestone :db @conn)))))
 
 (deftest block-unique-title-shows-class-parent-when-title-conflicts
   (let [conn (db-test/create-conn-with-blocks
@@ -44,9 +47,8 @@
                                                  :build/class-extends [:Area]}}})
         project-milestone (d/entity @conn :user.class/Milestone)
         area-milestone (d/entity @conn :other.class/Milestone)]
-    (with-redefs [db/get-db (fn [] @conn)]
-      (is (= "Project/Milestone" (block-handler/block-unique-title project-milestone)))
-      (is (= "Area/Milestone" (block-handler/block-unique-title area-milestone))))))
+    (is (= "Project/Milestone" (block-handler/block-unique-title project-milestone :db @conn)))
+    (is (= "Area/Milestone" (block-handler/block-unique-title area-milestone :db @conn)))))
 
 (deftest block-unique-title-resolves-plain-class-map-before-title-formatting
   (let [conn (db-test/create-conn-with-blocks
@@ -60,6 +62,154 @@
         plain-class-map {:db/id (:db/id project-milestone)
                          :block/title (:block/title project-milestone)
                          :block/tags [(d/entid @conn :logseq.class/Tag)]}]
-    (with-redefs [db/get-db (fn [] @conn)
-                  db/entity (fn [eid] (d/entity @conn eid))]
-      (is (= "Project/Milestone" (block-handler/block-unique-title plain-class-map))))))
+    (is (= "Project/Milestone" (block-handler/block-unique-title plain-class-map :db @conn)))))
+
+(deftest get-top-level-blocks-uses-original-block-without-renderer-rehydration-test
+  (let [block-id #uuid "11111111-1111-1111-1111-111111111111"
+        block {:db/id 1
+               :block/uuid block-id
+               :block/title "linked block"}
+        original {:db/id 2
+                  :block/uuid #uuid "22222222-2222-2222-2222-222222222222"
+                  :block/title "original block"}
+        selected-node-without-original
+        #js {:getAttribute #({"blockid" (str block-id)} %)}
+        selected-node #js {:getAttribute
+                           #({"blockid" (str block-id)
+                              "originalblockid" (str (:block/uuid original))} %)}
+        later-selected-node #js {:getAttribute
+                                 #({"blockid" (str block-id)
+                                    "originalblockid" (str (random-uuid))} %)}]
+    (with-redefs [outliner-core/blocks-with-level (fn [_] [(assoc block :block/level 1)])
+                  state/get-edit-block (constantly nil)
+                  state/get-input (constantly nil)
+                  state/get-selection-blocks (constantly [selected-node-without-original
+                                                          selected-node
+                                                          later-selected-node])]
+      (is (= [(select-keys original [:block/uuid])]
+             (block-handler/get-top-level-blocks [block]))))))
+
+(deftest copy-summaries-exclude-covered-descendants
+  (async done
+    (let [conn (db-test/create-conn-with-blocks
+                [{:page {:block/title "outline"}
+                  :blocks [{:block/title "ancestor"
+                            :build/children [{:block/title "middle"
+                                              :build/children [{:block/title "leaf"}]}]}]}])
+          db @conn
+          ancestor-id (:block/uuid (db-test/find-block-by-content db "ancestor"))
+          leaf-id (:block/uuid (db-test/find-block-by-content db "leaf"))]
+      (p/with-redefs [db-async/<q (fn [_graph _opts query & inputs]
+                                  (p/resolved (apply d/q query db inputs)))
+                     state/get-edit-block (constantly nil)
+                     state/get-input (constantly nil)
+                     state/get-selection-blocks (constantly [])]
+        (-> (p/let [summaries (db-async/<get-block-summaries "graph" [leaf-id ancestor-id])]
+              (is (= [ancestor-id]
+                     (mapv :block/uuid (block-handler/get-top-level-blocks summaries)))))
+            (p/catch #(is false (str %)))
+            (p/finally done))))))
+
+(deftest edit-block-loads-target-through-worker-test
+  (async done
+    (let [block-id #uuid "11111111-1111-1111-1111-111111111111"
+          loaded-block {:db/id 42
+                        :block/uuid block-id
+                        :block/title "worker title"}
+          calls (atom [])]
+      (p/with-redefs [state/get-current-repo (constantly "test")
+                      db-async/<get-block
+                      (fn [repo id opts]
+                        (swap! calls conj [:get-block repo id opts])
+                        (p/resolved loaded-block))
+                      state/pub-event!
+                      (fn [event]
+                        (swap! calls conj [:event event]))
+                      state/get-edit-block
+                      (constantly nil)
+                      state/clear-edit!
+                      (fn [& args]
+                        (swap! calls conj (into [:clear-edit] args)))
+                      state/clear-selection!
+                      (fn []
+                        (swap! calls conj [:clear-selection]))
+                      state/get-current-editor-container-id
+                      (constantly :test-container)
+                      state/set-editing!
+                      (fn [& args]
+                        (swap! calls conj (into [:set-editing] args)))
+                      state/set-editor-last-input-time!
+                      (fn [repo _time]
+                        (swap! calls conj [:mark-input repo]))]
+        (-> (block-handler/edit-block! {:block/uuid block-id
+                                         :block/title "stale title"}
+                                        :max)
+            (p/then
+             (fn []
+               (is (= [[:get-block "test" block-id {:children? false}]
+                       [:event [:editor/save-code-editor]]
+                       [:event [:editor/save-current-block]]
+                       [:clear-edit {:clear-editing-block? false}]
+                       [:clear-selection]
+                       [:set-editing
+                        (str "edit-block-" block-id)
+                        "worker title"
+                        loaded-block
+                        "worker title"
+                        {:container-id :test-container
+                         :direction nil
+                         :event nil
+                         :pos :max}]
+                       [:mark-input "test"]]
+                      @calls))))
+            (p/catch
+             (fn [error]
+               (is false (str error))))
+            (p/finally done))))))
+
+(deftest edit-block-with-loaded-data-updates-editor-synchronously-test
+  (let [block-id #uuid "11111111-1111-1111-1111-111111111111"
+        block {:db/id 42
+               :block/uuid block-id
+               :block/title "loaded title"}
+        editing (atom nil)]
+    (with-redefs [state/get-current-repo (constantly "test")
+                  state/get-edit-block (constantly block)
+                  state/clear-selection! (constantly nil)
+                  state/get-current-editor-container-id (constantly :test-container)
+                  state/set-editing! (fn [& args]
+                                       (reset! editing args))
+                  state/set-editor-last-input-time! (constantly nil)]
+      (block-handler/edit-block! block 0 {:save-code-editor? false
+                                          :skip-load? true})
+      (is (= [(str "edit-block-" block-id)
+              "loaded title"
+              block
+              ""
+              {:container-id :test-container
+               :direction nil
+               :event nil
+               :pos 0}]
+             @editing)
+          "Loaded block data should enter editor state before edit-block! returns."))))
+
+(deftest indent-outdent-does-not-use-global-editor-state-test
+  (async done
+    (let [block-id #uuid "11111111-1111-1111-1111-111111111111"
+          block {:db/id 42
+                 :block/uuid block-id
+                 :block/title "block"}
+          calls (atom [])]
+      (p/with-redefs [block-handler/get-top-level-blocks (fn [_] [block])
+                      state/get-selection-blocks (constantly nil)
+                      state/get-edit-block (constantly block)
+                      state/set-editing-block-id! (fn [value]
+                                                    (swap! calls conj [:set-editing value]))
+                      block-handler/outliner-tx-meta (constantly nil)
+                      outliner-op/indent-outdent-blocks! (fn [& _] nil)]
+        (-> (block-handler/indent-outdent-blocks! [block] true (constantly nil))
+            (p/then (fn []
+                      (is (empty? @calls))))
+            (p/catch (fn [error]
+                       (is false (str error))))
+            (p/finally done))))))

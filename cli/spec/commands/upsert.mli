@@ -8,8 +8,9 @@ type block_opts = {
   target_page : string option;
   pos : Block.position option;
   content : string option;
-  blocks_edn : string option;
+  blocks_markdown : string option;
   blocks_file : Cli_primitive.path option;
+  dry_run : bool;
   update_tags_edn : string option;
   update_properties_edn : string option;
   remove_tags_edn : string option;
@@ -19,6 +20,7 @@ type block_opts = {
 type page_opts = {
   id : Cli_primitive.db_id option;
   page : string option;
+  restore : bool;
   update_tags_edn : string option;
   update_properties_edn : string option;
   remove_tags_edn : string option;
@@ -94,10 +96,12 @@ type block_create = {
   target : block_target;
   pos : Block.position;
   status : Cli_primitive.keyword option;
-  tags : Selector.tag list;
-  properties : Property.assignment list;
-  blocks : Block.t list;
+  tags : Selector.tag Rrbvec.t;
+  properties : Property.assignment Rrbvec.t;
+  blocks : Block.t Rrbvec.t;
+  markdown_blocks : bool;
   update_plan : Property.update_plan;
+  dry_run : bool;
 }
 
 type block_update = {
@@ -106,10 +110,10 @@ type block_update = {
   source : block_source;
   target : block_target option;
   pos : Block.position option;
-  update_tags : Selector.tag list;
-  update_properties : Property.assignment list;
-  remove_tags : Selector.tag list;
-  remove_properties : Property.key list;
+  update_tags : Selector.tag Rrbvec.t;
+  update_properties : Property.assignment Rrbvec.t;
+  remove_tags : Selector.tag Rrbvec.t;
+  remove_properties : Property.key Rrbvec.t;
   content : string option;
   source_label : string option;
   target_label : string option;
@@ -127,6 +131,7 @@ type action =
       mode : mode;
       id : Cli_primitive.db_id option;
       page : string option;
+      restore : bool;
       plan : Property.update_plan;
     }
   | Upsert_task of {
@@ -137,8 +142,8 @@ type action =
       uuid : Cli_primitive.uuid option;
       page : string option;
       content : string option;
-      update_properties : Property.assignment list;
-      clear_properties : Property.key list;
+      update_properties : Property.assignment Rrbvec.t;
+      clear_properties : Property.key Rrbvec.t;
       status_input : string option;
     }
   | Upsert_asset of {
@@ -157,8 +162,8 @@ type action =
       mode : mode;
       id : Cli_primitive.db_id option;
       name : string option;
-      add_properties : Property.key list;
-      remove_properties : Property.key list;
+      add_properties : Property.key Rrbvec.t;
+      remove_properties : Property.key Rrbvec.t;
     }
   | Upsert_property of {
       repo : Cli_primitive.repo;

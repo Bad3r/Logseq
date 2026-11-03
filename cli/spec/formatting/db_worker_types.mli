@@ -1,4 +1,4 @@
-type list_options = Melange_edn.any
+type list_options = Melange_edn_melange.any
 
 type page_filter = {
   expand : bool;
@@ -11,8 +11,9 @@ type page_filter = {
 }
 
 type node_filter = {
-  tag_ids : Cli_primitive.db_id list;
-  property_idents : Cli_primitive.keyword list;
+  tag_ids : Cli_primitive.db_id Rrbvec.t;
+  property_idents : Cli_primitive.keyword Rrbvec.t;
 }
 
-val minimal_list_item : Entity.t -> Melange_edn.map Melange_edn.t
+val minimal_list_item :
+  Entity.t -> Melange_edn_melange.map Melange_edn_melange.t

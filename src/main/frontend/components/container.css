@@ -43,7 +43,7 @@
   &.is-left-sidebar-open {
     padding-left: 0;
 
-    @screen sm {
+    @media (min-width: 640px) {
       padding-left: var(--ls-left-sidebar-width);
     }
   }
@@ -118,7 +118,12 @@
   }
 
   a.item {
-    @apply flex items-center pl-1.5 pr-0.5 h-8 select-none;
+    /* Match the 16px nav icon: text-sm's 20px line-box sits 2px higher than the icon. */
+    @apply flex items-center pl-1.5 pr-0.5 h-8 select-none leading-4;
+
+    > .ui__icon {
+      @apply items-center h-4 shrink-0 leading-none;
+    }
 
     .graph-icon {
       @apply ml-[3px] mr-[11px];
@@ -185,7 +190,7 @@
           }
 
           > strong {
-            @apply sm:text-xs text-base font-medium;
+            @apply sm:text-xs text-sm font-medium;
           }
         }
 
@@ -219,6 +224,10 @@
 
             .page-icon {
               @apply flex items-center;
+            }
+
+            .sidebar-page-actions {
+              display: none;
             }
 
             &[data-popup-active] {
@@ -295,6 +304,10 @@
 
     .sidebar-content-group-inner > .bd ul li > a:first-of-type:hover {
       @apply bg-gray-04 opacity-100;
+
+      .sidebar-page-actions {
+        display: inline-flex;
+      }
     }
   }
 
@@ -311,7 +324,7 @@
     }
   }
 
-  @screen sm {
+  @media (min-width: 640px) {
     padding-top: 0;
     width: var(--ls-left-sidebar-width) !important;
 
@@ -364,6 +377,8 @@
     @apply w-full h-full;
 
     .left-sidebar-inner {
+      --tw-translate-x: 0;
+      translate: 0 0;
       transform: translate3d(0, 0, 0);
       overflow: hidden;
     }
@@ -383,6 +398,8 @@
   &.is-closing {
     .left-sidebar-inner {
       transition: transform .3s;
+      --tw-translate-x: -100%;
+      translate: -100% 0;
       transform: translate3d(-100%, 0, 0) !important;
     }
 
@@ -421,7 +438,7 @@
     }
   }
 
-  @screen sm {
+  @media (min-width: 640px) {
     @apply w-0 z-[var(--ls-z-index-level-1)] transition-[width];
 
     &:before {
@@ -444,7 +461,7 @@
 
 .ls-left-sidebar-open {
 
-  @screen sm {
+  @media (min-width: 640px) {
     .cp__header > .r {
       display: flex;
     }
@@ -494,7 +511,7 @@
     @apply px-8 pt-4;
   }
 
-  @screen sm {
+  @media (min-width: 640px) {
     .page {
       @apply px-2 pt-0;
     }
@@ -570,46 +587,6 @@
 
   &.open {
     max-width: 60vw;
-  }
-
-  &-scollable {
-    min-height: 100%;
-    overflow-y: scroll;
-  }
-
-  &-inner {
-    padding-top: 0;
-    background-color: var(--lx-gray-02, var(--ls-secondary-background-color));
-  }
-
-  &-settings {
-    @apply flex flex-row;
-    margin-bottom: 0;
-    margin-top: 0;
-    overflow: auto;
-
-    &-btn {
-      display: block;
-      white-space: nowrap;
-    }
-  }
-
-  &-topbar {
-    position: sticky;
-    position: -webkit-sticky;
-    top: 0;
-    left: 0;
-    right: 0;
-    background-color: var(--ls-right-sidebar-topbar-color, var(--lx-gray-02, var(--ls-secondary-background-color, #d8e1e8)));
-    z-index: 999;
-    user-select: none;
-    -webkit-app-region: drag;
-
-    a,
-    svg,
-    button {
-      -webkit-app-region: no-drag;
-    }
   }
 
   .page {
@@ -696,6 +673,41 @@
   }
 }
 
+.cp__right-sidebar-inner {
+  padding-top: 0;
+  background-color: var(--lx-gray-02, var(--ls-secondary-background-color));
+}
+
+.cp__right-sidebar-settings {
+  @apply flex flex-row;
+  margin-bottom: 0;
+  margin-top: 0;
+  overflow: auto;
+}
+
+.cp__right-sidebar-settings-btn {
+  display: block;
+  white-space: nowrap;
+}
+
+.cp__right-sidebar-topbar {
+  position: sticky;
+  position: -webkit-sticky;
+  top: 0;
+  left: 0;
+  right: 0;
+  background-color: var(--ls-right-sidebar-topbar-color, var(--lx-gray-02, var(--ls-secondary-background-color, #d8e1e8)));
+  z-index: 999;
+  user-select: none;
+  -webkit-app-region: drag;
+
+  a,
+  svg,
+  button {
+    -webkit-app-region: no-drag;
+  }
+}
+
 .cp__sidebar-main-content[data-is-full-width='true'] {
   max-width: 100vw;
 }
@@ -756,16 +768,16 @@ li.dragging-target {
   height: calc(100vh - var(--ls-headbar-height) - 4rem);
 }
 
-a.ui__modal-close svg, a.close svg, span.rotating-arrow svg {
+a.close svg, span.rotating-arrow svg {
   color: var(--ls-primary-text-color);
 }
 
-a.ui__modal-close, a.close {
+a.close {
   color: var(--ls-primary-text-color);
   opacity: 0.6;
 }
 
-a.ui__modal-close:hover, a.close:hover {
+a.close:hover {
   opacity: 1;
 }
 
@@ -788,9 +800,7 @@ html[data-theme='dark'] {
   }
 }
 
-.blocks-selection-mode .page-title,
-.blocks-selection-mode .block-content-inner,
-.blocks-selection-mode .block-body,
-.blocks-selection-mode .ls-properties-area {
-  @apply select-none;
+.ls-block.selected,
+.ls-block.selected * {
+  user-select: none;
 }

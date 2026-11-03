@@ -7,11 +7,11 @@ type t = {
   name : string option;
   title : string option;
   kind : kind;
-  tags : Cli_primitive.keyword list;
+  tags : Cli_primitive.keyword Rrbvec.t;
   created_at : Time.date option;
   updated_at : Time.date option;
   deleted_at : Time.date option;
-  raw : Melange_edn.any;
+  raw : Melange_edn_melange.any;
 }
 
-val of_value : Melange_edn.any -> t
+val of_value : Melange_edn_melange.any -> t

@@ -8,7 +8,8 @@ let strip_leading_colon value =
   else value
 
 let unquote_transit_value = function
-  | Melange_edn.Any (Melange_edn.Tagged (("transit/quote" | "'"), value)) ->
+  | Melange_edn_melange.Any
+      (Melange_edn_melange.Tagged (("transit/quote" | "'"), value)) ->
       value
   | value -> value
 
@@ -31,25 +32,26 @@ let rec json_of_value value =
   | _, _, _, _, Some s, _, _, _ -> Js.Json.string (strip_leading_colon s)
   | _, _, _, _, _, Some b, _, _ -> Js.Json.string (Bytes.to_string b)
   | _, _, _, _, _, _, Some xs, _ ->
-      Js.Json.array (Array.of_list (List.map json_of_value xs))
+      Js.Json.array (xs |> Vec.map json_of_value |> Vec.to_array)
   | _, _, _, _, _, _, _, Some xs ->
       let object_ = Js.Dict.empty () in
-      List.iter
+      Vec.iter
         (fun (k, v) ->
           let key =
             match Edn_util.as_string_like k with
             | Some s -> strip_leading_colon s
-            | None -> Melange_edn.to_edn_string k
+            | None -> Melange_edn_melange.to_edn_string k
           in
           Js.Dict.set object_ key (json_of_value v))
         xs;
       Js.Json.object_ object_
-  | _ -> Melange_edn.to_json value
+  | _ -> Melange_edn_melange.to_json value
 
 let data_to_value = function
   | Cli_result.Message s ->
-      Edn_util.map [ (Edn_util.keyword "message", Edn_util.string s) ]
-  | Items xs -> Edn_util.vector xs
+      Edn_util.map_vec
+        (Vec.of_array [| (Edn_util.keyword "message", Edn_util.string s) |])
+  | Items xs -> Edn_util.vector_vec xs
   | Entity v | Query_result v | Raw v -> v
   | Empty -> Edn_util.nil
 
@@ -64,25 +66,26 @@ let contains_substring ~needle text =
 
 let sensitive_field key =
   let key = String.lowercase_ascii (strip_leading_colon key) in
-  List.exists
+  Vec.exists
     (fun needle -> contains_substring ~needle key)
-    [ "token"; "secret"; "password" ]
+    (Vec.of_array [| "token"; "secret"; "password" |])
 
 let rec redact_sensitive_value value =
   match Edn_util.as_map value with
   | Some fields ->
       fields
-      |> List.map (fun (key, value) ->
+      |> Vec.map (fun (key, value) ->
           let value =
             match Edn_util.as_string_like key with
             | Some key when sensitive_field key -> Edn_util.string "[REDACTED]"
             | _ -> redact_sensitive_value value
           in
           (key, value))
-      |> Edn_util.map
+      |> Edn_util.map_vec
   | None -> (
       match Edn_util.as_seq value with
-      | Some values -> Edn_util.vector (List.map redact_sensitive_value values)
+      | Some values ->
+          Edn_util.vector_vec (values |> Vec.map redact_sensitive_value)
       | None -> value)
 
 let result_data_value result =
@@ -98,48 +101,41 @@ let result_data_value result =
 let candidate_to_value (candidate : Error.candidate) =
   let fields =
     match candidate.name with
-    | Some name -> [ (Edn_util.keyword "name", Edn_util.string name) ]
-    | None -> []
+    | Some name -> Vec.singleton (Edn_util.keyword "name", Edn_util.string name)
+    | None -> Vec.empty
   in
   let fields =
     match candidate.id with
-    | Some id -> (Edn_util.keyword "id", Edn_util.int64 id) :: fields
+    | Some id -> Vec.push_front fields (Edn_util.keyword "id", Edn_util.int64 id)
     | None -> fields
   in
-  Edn_util.map fields
+  Edn_util.map_vec fields
 
 let error_to_value ?(edn = false) (error : Error.t) =
   let code_value =
-    if edn then Edn_util.any error.code
-    else
-      let code = Edn_util.keyword_to_string error.code in
-      let code =
-        if String.length code > 0 && code.[0] = ':' then
-          String.sub code 1 (String.length code - 1)
-        else code
-      in
-      Edn_util.string code
+    if edn then Edn_util.any (Error.code_to_keyword error.code)
+    else Edn_util.string (Error.code_to_string error.code)
   in
   let fields =
-    [
-      (Edn_util.keyword "code", code_value);
-      (Edn_util.keyword "message", Edn_util.string error.message);
-    ]
+    Vec.of_array
+      [|
+        (Edn_util.keyword "code", code_value);
+        (Edn_util.keyword "message", Edn_util.string error.message);
+      |]
   in
   let fields =
     match error.hint with
     | None -> fields
-    | Some hint -> fields @ [ (Edn_util.keyword "hint", Edn_util.string hint) ]
+    | Some hint ->
+        Vec.push_back fields (Edn_util.keyword "hint", Edn_util.string hint)
   in
   let fields =
-    match error.candidates with
-    | [] -> fields
-    | candidates ->
-        fields
-        @ [
-            ( Edn_util.keyword "candidates",
-              Edn_util.vector (List.map candidate_to_value candidates) );
-          ]
+    if Vec.is_empty error.candidates then fields
+    else
+      let candidates = error.candidates in
+      Vec.push_back fields
+        ( Edn_util.keyword "candidates",
+          Edn_util.vector_vec (candidates |> Vec.map candidate_to_value) )
   in
   let fields =
     match error.context with
@@ -147,18 +143,18 @@ let error_to_value ?(edn = false) (error : Error.t) =
     | Some context -> (
         match Edn_util.as_map context with
         | Some context_fields ->
-            let reserved = [ "code"; "message"; "hint"; "candidates" ] in
-            fields
-            @ List.filter
-                (fun (key, _) ->
+            let reserved =
+              Vec.of_array [| "code"; "message"; "hint"; "candidates" |]
+            in
+            Vec.append fields
+              (context_fields
+              |> Vec.filter (fun (key, _) ->
                   match Edn_util.as_string_like key with
-                  | Some key ->
-                      not (List.mem (strip_leading_colon key) reserved)
-                  | None -> true)
-                context_fields
-        | None -> fields @ [ (Edn_util.keyword "context", context) ])
+                  | Some key -> not (Vec.mem (strip_leading_colon key) reserved)
+                  | None -> true))
+        | None -> Vec.push_back fields (Edn_util.keyword "context", context))
   in
-  Edn_util.map fields
+  Edn_util.map_vec fields
 
 let to_json result =
   let object_ = Js.Dict.empty () in
@@ -172,7 +168,7 @@ let to_json result =
       let error =
         match result.error with
         | Some e -> error_to_value e
-        | None -> Edn_util.map []
+        | None -> Edn_util.map_vec Vec.empty
       in
       Js.Dict.set object_ "status" (Js.Json.string "error");
       Js.Dict.set object_ "error" (json_of_value error);
@@ -188,20 +184,21 @@ let to_edn result =
         let error =
           match result.error with
           | Some e -> error_to_value ~edn:true e
-          | None -> Edn_util.map []
+          | None -> Edn_util.map_vec Vec.empty
         in
         (Edn_util.keyword "error", Edn_util.keyword "error", error)
   in
-  Melange_edn.to_edn_string
-    (Edn_util.map
-       [ (Edn_util.keyword "status", status); (payload_key, payload) ])
+  Melange_edn_melange.to_edn_string
+    (Edn_util.map_vec
+       (Vec.of_array
+          [| (Edn_util.keyword "status", status); (payload_key, payload) |]))
 
 let render_human table = Output.Human_output.to_string table
 let count_footer count = "Count: " ^ Humanize_types.format_count count
 
 let field_label key =
   key |> Edn_util.as_string_like
-  |> Option.value ~default:(Melange_edn.to_edn_string key)
+  |> Option.value ~default:(Melange_edn_melange.to_edn_string key)
   |> strip_leading_colon
 
 let value_text value =
@@ -218,56 +215,63 @@ let value_text value =
   | _, _, Some value, _, _ -> string_of_int value
   | _, _, _, Some value, _ -> string_of_bool value
   | _, _, _, _, Some value -> string_of_float value
-  | _ -> Melange_edn.to_edn_string value
+  | _ -> Melange_edn_melange.to_edn_string value
 
 let query_result_human value =
   match Edn_util.get value "result" with
   | Some result -> (
       match Edn_util.as_seq result with
-      | Some values -> String.concat "\n" (List.map value_text values)
+      | Some values -> values |> Vec.map value_text |> Vec.string_concat "\n"
       | None -> value_text result)
   | None -> value_text value
 
-let has_suffix ~suffix value =
-  let suffix_len = String.length suffix in
-  let value_len = String.length value in
-  value_len >= suffix_len
-  && String.sub value (value_len - suffix_len) suffix_len = suffix
+let is_keyword_namespace_char = function
+  | 'a' .. 'z' | '0' .. '9' | '.' | '-' | '_' -> true
+  | _ -> false
 
-let normalized_label label = String.lowercase_ascii label
+let is_keyword_namespace value =
+  value <> "" && String.for_all is_keyword_namespace_char value
 
-let is_created_at_field label =
-  has_suffix ~suffix:"created-at" (normalized_label label)
+let human_header_label label =
+  let label = strip_leading_colon label in
+  let parts = Vec.split_on_char '/' label in
+  if Vec.length parts = 2 then
+    let namespace = Vec.nth parts 0 in
+    let name = Vec.nth parts 1 in
+    if is_keyword_namespace namespace && name <> "" then name else label
+  else label
 
-let is_updated_at_field label =
-  has_suffix ~suffix:"updated-at" (normalized_label label)
+let add_column acc label =
+  if Vec.mem label acc then acc else Vec.push_back acc label
 
-let is_datetime_field label =
-  is_created_at_field label || is_updated_at_field label
-
-let move_datetime_columns_last columns =
-  let non_datetime, datetime =
-    List.partition (fun label -> not (is_datetime_field label)) columns
-  in
-  let created_at = List.filter is_created_at_field datetime in
-  let updated_at = List.filter is_updated_at_field datetime in
-  non_datetime @ created_at @ updated_at
-
-let add_column acc label = if List.mem label acc then acc else acc @ [ label ]
-
-let table_columns items =
+let discovered_table_columns items =
   items
-  |> List.fold_left
+  |> Vec.fold_left
        (fun acc fields ->
          fields
-         |> List.map (fun (key, _) -> field_label key)
-         |> List.fold_left add_column acc)
-       []
-  |> move_datetime_columns_last
+         |> Vec.map (fun (key, _) -> field_label key)
+         |> Vec.fold_left add_column acc)
+       Vec.empty
+
+let order_table_columns header_order columns =
+  let ordered =
+    header_order
+    |> Vec.filter_map (fun expected ->
+        Vec.find_opt
+          (fun label -> label = expected || human_header_label label = expected)
+          columns)
+  in
+  let ordered =
+    Vec.fold_left
+      (fun acc label ->
+        if Vec.mem label acc then acc else Vec.push_back acc label)
+      Vec.empty ordered
+  in
+  ordered
 
 let field_by_label label fields =
   fields
-  |> List.find_map (fun (key, value) ->
+  |> Vec.find_map (fun (key, value) ->
       if field_label key = label then Some value else None)
 
 let is_title_label label =
@@ -281,9 +285,8 @@ let title_max_display_width config =
   else (Cli_config.defaults ()).list_title_max_display_width
 
 let truncate_title_cell max_width value =
-  value |> String.split_on_char '\n'
-  |> List.map (fun line -> Display_width.truncate line max_width)
-  |> String.concat "\n"
+  let first_line = Vec.split_on_char '\n' value |> Vec.peek_front in
+  Display_width.truncate first_line max_width
 
 let is_list_command = function
   | Command_id.List_page | List_tag | List_property | List_task | List_node
@@ -298,69 +301,46 @@ let is_search_command = function
 let is_list_or_search_command command =
   is_list_command command || is_search_command command
 
-let search_columns columns =
-  let is_label expected label =
-    String.equal (String.lowercase_ascii label) expected
-  in
-  let db_id, rest = List.partition (is_label "db/id") columns in
-  let title, rest = List.partition (is_label "block/title") rest in
-  db_id @ rest @ title
-
-let asset_column_role label =
-  match String.lowercase_ascii label with
-  | "id" | "db/id" -> Some "id"
-  | "title" | "block/title" -> Some "title"
-  | "size" | "logseq.property.asset/size" -> Some "size"
-  | "type" | "asset-type" | "logseq.property.asset/type" -> Some "type"
-  | _ -> None
-
-let columns_by_role roles columns =
-  roles
-  |> List.filter_map (fun role ->
-      List.find_opt
-        (fun label ->
-          Option.equal String.equal (asset_column_role label) (Some role))
-        columns)
-
-let asset_columns columns =
-  let prefix_roles = [ "id"; "title"; "size"; "type" ] in
-  let prefix = columns_by_role prefix_roles columns in
-  let prefix_or_datetime label =
-    Option.is_some (asset_column_role label) || is_datetime_field label
-  in
-  let middle =
-    List.filter (fun label -> not (prefix_or_datetime label)) columns
-  in
-  let created_at = List.filter is_created_at_field columns in
-  let updated_at = List.filter is_updated_at_field columns in
-  prefix @ middle @ created_at @ updated_at
-
-let columns_for_command command items =
-  let columns = table_columns items in
-  match command with
-  | Command_id.List_asset -> asset_columns columns
-  | _ -> if is_search_command command then search_columns columns else columns
+let table_columns ~human_table_headers_order items =
+  discovered_table_columns items
+  |> order_table_columns human_table_headers_order
 
 let should_truncate_title command label =
   is_list_command command && is_title_label label
 
-let list_search_human command value config =
+let is_task_keyword_value_label label =
+  match human_header_label label with
+  | "status" | "priority" -> true
+  | _ -> false
+
+let list_cell_value_text command label value =
+  let value = unquote_transit_value value in
+  match command with
+  | Command_id.List_task when is_task_keyword_value_label label -> (
+      match Edn_util.as_keyword value with
+      | Some keyword -> human_header_label keyword
+      | None -> value_text value)
+  | _ -> value_text value
+
+let list_search_human ?(human_table_headers_order = Vec.empty) command value
+    config =
   match Option.bind (Edn_util.get value "items") Edn_util.as_seq with
   | None -> None
   | Some items ->
-      let mapped = List.filter_map Edn_util.as_map items in
-      if List.length mapped <> List.length items then None
+      let mapped = Vec.filter_map Edn_util.as_map items in
+      if Vec.length mapped <> Vec.length items then None
       else
         let title_width = title_max_display_width config in
-        let columns = columns_for_command command mapped in
+        let columns = table_columns ~human_table_headers_order mapped in
         let headers = columns in
         let rows =
           mapped
-          |> List.map (fun fields ->
+          |> Vec.map (fun fields ->
               columns
-              |> List.map (fun label ->
+              |> Vec.map (fun label ->
                   let value =
-                    fields |> field_by_label label |> Option.map value_text
+                    fields |> field_by_label label
+                    |> Option.map (list_cell_value_text command label)
                     |> Option.value ~default:""
                   in
                   if should_truncate_title command label then
@@ -370,7 +350,7 @@ let list_search_human command value config =
         Some
           (render_human
              (Output.Human_output.create ~headers
-                ~footer:(count_footer (List.length rows))
+                ~footer:(count_footer (Vec.length rows))
                 ~rows ()))
 
 let graph_list_human value config =
@@ -380,23 +360,23 @@ let graph_list_human value config =
         config.Cli_config.graph |> Option.map Cli_primitive.string_of_graph
       in
       let current_graph =
-        match List.assoc_opt (Edn_util.keyword "current-graph") fields with
+        match Vec.assoc_opt (Edn_util.keyword "current-graph") fields with
         | Some value -> (
             match Edn_util.as_string value with
             | Some _ as graph -> graph
             | None -> configured_graph)
         | None -> configured_graph
       in
-      match List.assoc_opt (Edn_util.keyword "graphs") fields with
+      match Vec.assoc_opt (Edn_util.keyword "graphs") fields with
       | Some graphs_value -> (
           match Edn_util.as_vector graphs_value with
           | Some graphs ->
               let rows =
-                List.map
+                Vec.map
                   (fun graph ->
                     let graph =
                       Option.value (Edn_util.as_string graph)
-                        ~default:(Melange_edn.to_edn_string graph)
+                        ~default:(Melange_edn_melange.to_edn_string graph)
                     in
                     let prefix =
                       if Option.equal String.equal current_graph (Some graph)
@@ -404,18 +384,22 @@ let graph_list_human value config =
                       else if Option.is_some current_graph then "  "
                       else ""
                     in
-                    [ prefix ^ graph ])
+                    Vec.singleton (prefix ^ graph))
                   graphs
               in
               render_human
                 (Output.Human_output.create
-                   ~footer:(count_footer (List.length rows))
+                   ~footer:(count_footer (Vec.length rows))
                    ~rows ())
           | None -> "")
       | None -> "")
   | None -> ""
 
-let to_human result config =
+let to_human ?human_table_headers_order result config =
+  let human_table_headers_order =
+    Option.value human_table_headers_order
+      ~default:result.Cli_result.human_table_headers_order
+  in
   let output = result.Cli_result.output Output.Mode.Human in
   match (result.Cli_result.command, result.data, output) with
   | Some Command_id.Graph_list, Some (Cli_result.Raw value), Output.Human _ ->
@@ -425,7 +409,9 @@ let to_human result config =
       query_result_human value
   | Some command, Some (Cli_result.Raw value), Output.Human _
     when is_list_or_search_command command -> (
-      match list_search_human command value config with
+      match
+        list_search_human ~human_table_headers_order command value config
+      with
       | Some output -> output
       | None -> (
           match output with
@@ -435,9 +421,9 @@ let to_human result config =
   | _, _, (Output.Json _ | Output.Edn _) -> ""
 
 let format_error err _ =
-  "Error (" ^ Edn_util.keyword_to_string err.Error.code ^ "): " ^ err.message
+  "Error (" ^ Error.code_to_string err.Error.code ^ "): " ^ err.message
 
-let format_result result config =
+let format_result ?human_table_headers_order result config =
   match (result.Cli_result.command, result.data) with
   | Some Command_id.Skill_show, Some (Cli_result.Message message) -> message
   | _ -> (
@@ -446,7 +432,7 @@ let format_result result config =
       | Some (Output.Mode.Packed Output.Mode.Edn) -> to_edn result
       | Some (Output.Mode.Packed Output.Mode.Human) | None -> (
           match result.Cli_result.status with
-          | Ok -> to_human result config
+          | Ok -> to_human ?human_table_headers_order result config
           | Error -> (
               match result.error with
               | Some err -> format_error err result.command
@@ -455,5 +441,5 @@ let format_result result config =
 let format_counted_table ~headers ~rows =
   render_human
     (Output.Human_output.create ~headers
-       ~footer:("Count: " ^ Humanize_types.format_count (List.length rows))
+       ~footer:("Count: " ^ Humanize_types.format_count (Vec.length rows))
        ~rows ())

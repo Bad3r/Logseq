@@ -12,7 +12,6 @@
                      [cljs-bean.core :as bean]
                      [cljs-time.core :as t]
                      [clojure.pprint]
-                     [datascript.impl.entity :as de]
                      [dommy.core :as d]
                      [frontend.loader :refer [load]]
                      [frontend.mobile.util :as mobile-util]
@@ -100,8 +99,6 @@
                (gdom/getElementByClass "sidebar-item-list")
                (app-scroll-container-node))))))
 #?(:cljs (defonce el-visible-in-viewport? utils/elementIsVisibleInViewport))
-#?(:cljs (defonce convert-to-roman utils/convertToRoman))
-#?(:cljs (defonce convert-to-letters utils/convertToLetters))
 #?(:cljs (def string-join-path common-util/string-join-path))
 
 #?(:cljs
@@ -157,8 +154,10 @@
 #?(:cljs
    (defn set-change-value
      "compatible change event for React"
-     [node value]
-     (utils/triggerInputChange node value)))
+     ([node value]
+      (utils/triggerInputChange node value))
+     ([node value caret-pos]
+      (utils/triggerInputChange node value caret-pos))))
 
 #?(:cljs
    (defn p-handle
@@ -715,6 +714,30 @@
           (remove (fn [b] (d/has-class? b "property-value-container"))))))
 
 #?(:cljs
+   (defn property-value-inner-block
+     "The real `.ls-block[blockid]` inside a property-value wrapper, if any."
+     [node]
+     (when (and node (d/has-class? node "property-value-container"))
+       (.querySelector node ".ls-block[blockid]"))))
+
+#?(:cljs
+   (defn unwrap-property-value-container
+     "Map a selected property-value wrapper to its inner block."
+     [node]
+     (or (property-value-inner-block node) node)))
+
+#?(:cljs
+   (defn selection-node-block-id
+     "Block UUID for a selected node, including text property-value wrappers."
+     [node]
+     (when (some-> node .-getAttribute)
+       (when-let [id (or (d/attr node "blockid")
+                         (some-> (property-value-inner-block node)
+                                 (d/attr "blockid")))]
+         (when (uuid-string? (str id))
+           (uuid id))))))
+
+#?(:cljs
    (defn get-selected-text
      []
      (utils/getSelectionText)))
@@ -731,21 +754,18 @@
 
 #?(:cljs
    (defn copy-to-clipboard!
-     [text & {:keys [graph html blocks embed-block? owner-window]}]
-     (let [blocks (map (fn [block] (if (de/entity? block)
-                                     (-> (into {} block)
-                                         ;; FIXME: why :db/id is not included?
-                                         (assoc :db/id (:db/id block)))
-                                     block)) blocks)
+     [text & {:keys [graph html blocks embed-block? owner-window op]}]
+     (let [blocks (map identity blocks)
            data (clj->js
                  (common-util/remove-nils-non-nested
                   {:text text
                    :html html
                    :blocks (when (and graph (seq blocks))
                              (pr-str
-                              {:graph graph
+                               {:graph graph
                                :embed-block? embed-block?
-                               :blocks (mapv #(dissoc % :block.temp/load-status %) blocks)}))}))]
+                               :op op
+                               :blocks (vec blocks)}))}))]
        (if owner-window
          (write-clipboard data owner-window)
          (write-clipboard data)))))
@@ -772,9 +792,6 @@
     (println (str "Debug " k))
     (time (reset! result (doall (f))))
     @result))
-
-#?(:cljs
-   (def concat-without-nil common-util/concat-without-nil))
 
 #?(:cljs
    (defn set-title!
@@ -818,11 +835,11 @@
                         (skip-same-top-blocks blocks block)
                         blocks)
                        exclude-property?
-                       (remove (fn [node] (d/has-class? node "property-value-container"))))]
-          (when-let [index (.indexOf blocks block)]
-            (let [idx (dec index)]
-              (when (>= idx 0)
-                (nth-safe blocks idx)))))))))
+                       (remove (fn [node] (d/has-class? node "property-value-container"))))
+              index (.indexOf blocks block)]
+          ;; a block no longer in the page has no neighbour
+          (when (pos? index)
+            (nth-safe blocks (dec index))))))))
 
 #?(:cljs
    (defn get-prev-block-non-collapsed-non-embed
@@ -830,10 +847,10 @@
      (when-let [blocks (->> (get-blocks-noncollapse)
                             remove-embedded-blocks
                             remove-property-value-blocks)]
-       (when-let [index (.indexOf blocks block)]
-         (let [idx (dec index)]
-           (when (>= idx 0)
-             (nth-safe blocks idx)))))))
+       (let [index (.indexOf blocks block)]
+         ;; a block no longer in the page has no neighbour
+         (when (pos? index)
+           (nth-safe blocks (dec index)))))))
 
 #?(:cljs
    (defn get-next-block-non-collapsed
@@ -844,25 +861,29 @@
                        (skip-same-top-blocks blocks block)
                        blocks)
                       exclude-property?
-                      (remove (fn [node] (d/has-class? node "property-value-container"))))]
-         (when-let [index (.indexOf blocks block)]
-           (let [idx (inc index)]
-             (when (>= (count blocks) idx)
-               (nth-safe blocks idx))))))))
+                      (remove (fn [node] (d/has-class? node "property-value-container"))))
+             index (.indexOf blocks block)]
+         ;; a block no longer in the page has no neighbour (index -1 would
+         ;; give the page's first block)
+         (when-not (neg? index)
+           (nth-safe blocks (inc index)))))))
 
 #?(:cljs
    (defn get-next-block-non-collapsed-skip
      [block]
      (when-let [blocks (get-blocks-noncollapse)]
-       (when-let [index (.indexOf blocks block)]
-         (loop [idx (inc index)]
-           (when (>= (count blocks) idx)
-             (let [block (nth-safe blocks idx)
-                   nested? (->> (array-seq (gdom/getElementsByClass "selected"))
-                                (some (fn [dom] (.contains dom block))))]
-               (if nested?
-                 (recur (inc idx))
-                 block))))))))
+       (let [index (.indexOf blocks block)]
+         ;; a block no longer in the page has no neighbour (index -1 would
+         ;; give the page's first block)
+         (when-not (neg? index)
+           (loop [idx (inc index)]
+             (when (> (count blocks) idx)
+               (let [block (nth-safe blocks idx)
+                     nested? (->> (array-seq (gdom/getElementsByClass "selected"))
+                                  (some (fn [dom] (.contains dom block))))]
+                 (if nested?
+                   (recur (inc idx))
+                   block)))))))))
 
 (defn rand-str
   [n]
@@ -929,9 +950,6 @@
 
 #?(:cljs
    (def safe-page-name-sanity-lc common-util/safe-page-name-sanity-lc))
-
-#?(:cljs
-   (def get-page-title common-util/get-page-title))
 
 #?(:cljs
    (defn add-style!
@@ -1367,6 +1385,17 @@
    (defn rtc-test?
      []
      (string/includes? js/window.location.search "?rtc-test=true")))
+
+#?(:cljs
+   (defn rtc-test-without-virtualization?
+     []
+     (and (rtc-test?)
+          (not (string/includes? js/window.location.search "virtualized=true")))))
+
+#?(:cljs
+   (defn force-virtualization?
+     []
+     (string/includes? js/window.location.search "virtualized=true")))
 
 #?(:cljs
    (defn sanitize-port-input

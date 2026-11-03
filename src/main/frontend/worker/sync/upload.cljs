@@ -23,6 +23,7 @@
 (def snapshot-upload-max-bytes 1000000)
 (def snapshot-frame-header-bytes 4)
 (def ignored-oversized-upload-attrs #{:logseq.property.tldraw/page})
+(def snapshot-local-only-attrs #{:block/tx-id})
 (def snapshot-content-type "application/transit+json")
 (def snapshot-content-encoding "gzip")
 (def snapshot-text-encoder (js/TextEncoder.))
@@ -178,7 +179,8 @@
 (defn <prepare-upload-temp-sqlite!
   [repo graph-id source-conn aes-key update-progress]
   (p/let [temp (sync-temp-sqlite/<create-temp-sqlite-conn (d/schema @source-conn) [])
-          datoms (d/datoms @source-conn :eavt)
+          datoms (remove #(contains? snapshot-local-only-attrs (:a %))
+                         (d/datoms @source-conn :eavt))
           large-title-eids (into #{}
                                  (keep (fn [datom]
                                          (when (sync-large-title/large-title-datom? datom)
@@ -223,13 +225,11 @@
   [repo graph-id]
   (when-not (seq graph-id)
     (fail-fast :db-sync/missing-field {:repo repo :field :graph-id}))
-  (try
-    (uuid graph-id)
-    (catch :default e
+  ;; cljs `uuid` accepts any string; `parse-uuid` returns nil for a non-uuid
+  (or (parse-uuid graph-id)
       (fail-fast :db-sync/invalid-field {:repo repo
                                          :field :graph-id
-                                         :value graph-id
-                                         :error e}))))
+                                         :value graph-id})))
 
 (defn- set-graph-sync-metadata!
   [repo graph-id graph-e2ee?]
@@ -270,7 +270,8 @@
       :else
       (do
         (sync-util/require-auth-token! {:repo repo :field :auth-token})
-        (p/let [_ (sync-crypt/ensure-user-rsa-keys! {:ensure-server? true})
+        (p/let [_ (when graph-e2ee?
+                    (sync-crypt/ensure-user-rsa-keys! {:ensure-server? true}))
                 body (coerce-http-request :graphs/create
                                           {:graph-name graph-name
                                            :schema-version schema-version
@@ -364,8 +365,9 @@
                             (sync-crypt/<ensure-graph-aes-key repo graph-id))
                   _ (when (and graph-e2ee? (nil? aes-key))
                       (fail-fast :db-sync/missing-field {:repo repo :field :aes-key}))]
-            (let [snapshot-checksum (sync-checksum/recompute-checksum @source-conn)]
-              (client-op/update-local-checksum repo snapshot-checksum)
+            (let [db @source-conn
+                  snapshot-checksum (sync-checksum/recompute-checksum db)]
+              (client-op/update-local-checksum repo snapshot-checksum (:max-tx db))
               (p/let [_ (update-progress {:sub-type :upload-progress
                                           :message (if graph-e2ee? "Encrypting..." "Preparing...")})
                       {:keys [db] :as temp} (<prepare-upload-temp-sqlite!

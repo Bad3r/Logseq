@@ -26,18 +26,21 @@
         header (:header result)
         [selected-choices] (hooks/use-atom *selected-choices)
         row [:div.flex.flex-row.justify-between.w-full
-             {:class (when chosen? "chosen")
-              :on-pointer-down util/stop-propagation}
-             [:div.flex.flex-row.items-center.gap-1
-              (when multiple-choices?
-                (ui/checkbox {:checked (boolean (selected-choices (:value result)))
-                              :on-click (fn [e]
-                                          (.preventDefault e))
-                              :disabled (:disabled? result)}))
-              value]
-             (when (and (map? result) (:id result))
-               [:div.tip.flex
-                [:code.opacity-20.bg-transparent (:id result)]])]]
+	             {:class (when chosen? "chosen")
+	              :on-pointer-down util/stop-propagation}
+	             [:div.flex.flex-row.items-center.gap-1
+	              (when multiple-choices?
+	                (ui/checkbox {:checked (boolean (selected-choices (:value result)))
+	                              :on-click (fn [e]
+	                                          (.preventDefault e))
+	                              :disabled (:disabled? result)}))
+	              value]
+             [:div.tip.flex.items-center.gap-1
+              (when (and (not multiple-choices?)
+                         (selected-choices (:value result)))
+                (ui/icon "check" {:size 14}))
+              (when (and (map? result) (:id result))
+                [:code.opacity-20.bg-transparent (:id result)])]]]
     (if header
       [:div.flex.flex-col.gap-1
        header
@@ -46,7 +49,16 @@
 
 (hsx/defc search-input
   [*input {:keys [prompt-key input-default-placeholder input-opts on-input]}]
-  (let [[input set-input!] (hooks/use-state @*input)]
+  (let [[input set-input!] (hooks/use-state @*input)
+        *input-el (hooks/use-ref nil)
+        auto-focus? (not (util/mobile?))]
+    (hooks/use-effect!
+     (fn []
+       (when auto-focus?
+         (let [timeout (js/setTimeout #(some-> (hooks/deref *input-el) (.focus)) 16)]
+           #(js/clearTimeout timeout))))
+     [auto-focus?])
+
     (hooks/use-effect!
      (fn []
        (reset! *input input)
@@ -59,12 +71,23 @@
          (set-input! "")))
      [(hooks/use-debounced-value @*input 100)])
 
+    (hooks/use-effect!
+     (fn []
+       (when-not (util/mobile?)
+         (js/setTimeout
+          (fn []
+            (some-> (hooks/deref *input-el) (.focus)))
+          0))
+       (fn []))
+     [])
+
     [:div.input-wrap
      [:input.cp__select-input.w-full
       (merge {:type "text"
+              :ref *input-el
               :class "!p-1.5"
               :placeholder (or input-default-placeholder (t prompt-key))
-              :auto-focus (not (util/mobile?))
+              :auto-focus auto-focus?
               :value input
               :on-change (fn [e]
                            (let [v (util/evalue e)]
@@ -87,11 +110,10 @@
   [{:keys [items limit on-chosen empty-placeholder grouped?
            prompt-key input-default-placeholder close-modal?
            extract-fn extract-chosen-fn host-opts on-input input-opts
-           item-cp transform-fn tap-*input-val
+           item-cp transform-fn tap-*input-val tap-*selected-choices
            multiple-choices? on-apply new-case-sensitive?
            dropdown? show-new-when-not-exact-match? exact-match-exclude-items
            input-container initial-open? loading?
-           choose-first-on-enter?
            clear-input-on-chosen?]
     :or {limit 100
          prompt-key :select/default-prompt
@@ -124,6 +146,12 @@
              (when (fn? tap-*input-val)
                (tap-*input-val *input)))
            [tap-*input-val *input])
+        _ (hooks/use-effect!
+           (fn []
+             (when (fn? tap-*selected-choices)
+               (tap-*selected-choices *selected-choices))
+             nil)
+           [tap-*selected-choices])
         full-choices (cond->>
                       (remove nil? items)
                        (seq input)
@@ -180,28 +208,16 @@
                                  (when on-chosen (on-chosen chosen true @*selected-choices e))))
                              (do
                                (when (and close-modal? (not multiple-choices?))
-                                 (state/close-modal!))
+                                 (state/close-dialog!))
                                (when on-chosen
                                  (on-chosen chosen true @*selected-choices e))))))
         input-opts* (if (fn? input-opts) (input-opts (empty? search-result)) input-opts)
-        input-opts' (if choose-first-on-enter?
-                      (let [on-key-down (:on-key-down input-opts*)]
-                        (assoc input-opts*
-                               :on-key-down
-                               (fn [e]
-                                 (if (and (= "Enter" (util/ekey e)) (seq search-result))
-                                   (do
-                                     (util/stop e)
-                                     (choose-result! (first search-result) e))
-                                   (when on-key-down
-                                     (on-key-down e))))))
-                      input-opts*)
         input-container (or
                          input-container
                          (search-input *input
                                        {:prompt-key prompt-key
                                         :input-default-placeholder input-default-placeholder
-                                        :input-opts input-opts'
+                                        :input-opts input-opts*
                                         :on-input on-input}))
         results-container-f (fn []
                               (if loading?
@@ -226,7 +242,13 @@
                                                                             (util/stop e)
                                                                             (when @*toggle (@*toggle))
                                                                             (on-apply selected-choices)
-                                                                            (when close-modal? (state/close-modal!)))})])]))]
+                                                                            (when close-modal? (state/close-dialog!)))})])]))]
+    (hooks/use-effect!
+     (fn []
+       (when (fn? tap-*input-val)
+         (tap-*input-val *input))
+       nil)
+     [tap-*input-val])
     [:div.cp__select
      (merge {:class "cp__select-main"}
             host-opts)
@@ -273,7 +295,7 @@
                           (ui/button
                            (t :graph.switch/add-graph-action)
                            :href (rfe/href :graphs)
-                           :on-click state/close-modal!)])}
+                           :on-click state/close-dialog!)])}
    :graph-remove
    {:items-fn (fn []
                 (->> (state/get-repos)

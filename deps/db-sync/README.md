@@ -135,7 +135,7 @@ pnpm test:node-adapter
 | --- | --- |
 | DB_SYNC_PORT | HTTP server port |
 | DB_SYNC_BASE_URL | External base URL for asset links |
-| DB_SYNC_ADMIN_TOKEN | Admin-only token for operator graph deletion endpoints |
+| DB_SYNC_ADMIN_TOKEN | Admin-only token (header `x-db-sync-admin-token`): passes the graph access check on sync and asset routes, and the operator graph deletion endpoints |
 | DB_SYNC_DATA_DIR | Data directory for sqlite + assets |
 | DB_SYNC_STORAGE_DRIVER | Storage backend selection (sqlite) |
 | DB_SYNC_ASSETS_DRIVER | Assets backend selection (filesystem) |
@@ -148,5 +148,4 @@ pnpm test:node-adapter
 | COGNITO_JWKS_URL | Cognito JWKS URL |
 
 ## Notes
-- Protocol definitions live in `docs/agent-guide/db-sync/protocol.md`.
-- DB sync implementation guide is in `docs/agent-guide/db-sync/db-sync-guide.md`.
+- Runtime and db-sync engineering guidance is consolidated in `../../docs/agent-guide/implemented/architecture/2026-08-24-logseq-runtime-and-engineering-guide.md`; current protocol and route definitions live under `src/logseq/db_sync/worker/`.

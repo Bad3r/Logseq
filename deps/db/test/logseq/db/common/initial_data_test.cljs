@@ -4,12 +4,28 @@
   (:require ["fs" :as fs]
             ["path" :as node-path]
             [cljs.test :refer [deftest async use-fixtures is testing]]
+            [clojure.string :as string]
             [datascript.core :as d]
             [logseq.db.common.initial-data :as common-initial-data]
+            [logseq.db.frontend.property :as db-property]
             [logseq.db.common.sqlite-cli :as sqlite-cli]
             [logseq.db.sqlite.build :as sqlite-build]
             [logseq.db.sqlite.create-graph :as sqlite-create-graph]
             [logseq.db.test.helper :as db-test]))
+
+(deftest latest-journals-stays-within-journal-day-index
+  (let [conn (db-test/create-conn-with-blocks
+              {:pages-and-blocks [{:page {:build/journal 20240101}}
+                                  {:page {:build/journal 29990101}}
+                                  {:page {:block/title "Alias target"}}]})
+        future-id (:e (first (d/datoms @conn :avet :block/journal-day 29990101)))
+        alias-id (:db/id (db-test/find-page-by-title @conn "Alias target"))]
+    (d/transact! conn [[:db/add future-id :block/alias alias-id]])
+    (is (= [20240101]
+           (mapv :block/journal-day (common-initial-data/get-latest-journals @conn))))
+    (d/transact! conn [[:db/retractEntity
+                       (:e (first (d/datoms @conn :avet :block/journal-day 20240101)))]])
+    (is (empty? (common-initial-data/get-latest-journals @conn)))))
 
 (use-fixtures
   :each
@@ -44,6 +60,17 @@
                          :where [?b :file/content] [?b :file/path "logseq/config.edn"]])
                   (map first)))
           "Correct file with content is found"))))
+
+(deftest get-initial-data-includes-property-description-datoms
+  (create-graph-dir "tmp/graphs" "test-db")
+  (let [conn* (sqlite-cli/open-db! "tmp/graphs" "test-db")
+        _ (d/transact! conn* (sqlite-create-graph/build-db-initial-data "{}"))
+        {:keys [schema initial-data]} (common-initial-data/get-initial-data @conn*)
+        conn (d/conn-from-datoms initial-data schema)
+        description (-> (d/entity @conn :logseq.property/deadline)
+                        :logseq.property/description)]
+    (is (string/includes? (str (db-property/property-value-content description))
+                          "finish something"))))
 
 (deftest restore-initial-data
   (create-graph-dir "tmp/graphs" "test-db")

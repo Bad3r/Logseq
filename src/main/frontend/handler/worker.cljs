@@ -6,6 +6,7 @@
             [frontend.common.crypt :as crypt]
             [frontend.context.i18n :as i18n]
             [frontend.handler.e2ee :as e2ee-handler]
+            [frontend.handler.file-graph-import :as file-graph-import]
             [frontend.handler.notification :as notification]
             [frontend.state :as state]
             [lambdaisland.glogi :as log]
@@ -57,6 +58,10 @@
      :assets/asset-file-write-finish
      (fn [m] (assoc-in m [repo asset-id] (or ts (.now js/Date)))))))
 
+(defmethod handle :thread-api/set-ui-state [_ _worker args]
+  (when-let [f (get @thread-api/*thread-apis :thread-api/set-ui-state)]
+    (apply f args)))
+
 (defmethod handle :thread-api/search-index-build-progress [_ _worker args]
   (when-let [f (get @thread-api/*thread-apis :thread-api/search-index-build-progress)]
     (apply f args)))
@@ -66,9 +71,7 @@
 
 (defmethod handle :sync-conflicts-updated [_ _worker {:keys [repo block-uuid conflicts]}]
   (when (and (seq repo) block-uuid)
-    (state/set-state! :sync/block-conflicts
-                      (or conflicts [])
-                      :path-in-sub-atom [repo (str block-uuid)])))
+    (state/set-sync-block-conflicts! repo block-uuid conflicts)))
 
 (defmethod handle :rtc-log [_ _worker log]
   (state/pub-event! [:rtc/log log]))
@@ -155,6 +158,15 @@
           (p/let [_ (e2ee-handler/<native-delete-secret! key)]
             {:supported? true}))))
 
+    :read-import-file
+    (let [path (:path payload)]
+      (if-not (string? path)
+        (p/rejected (ex-info "invalid read-import-file payload"
+                             {:code :invalid-ui-action-payload
+                              :action action
+                              :payload payload}))
+        (file-graph-import/<read-file-graph-import-file path)))
+
     (p/rejected (ex-info "unsupported db-worker ui action"
                          {:code :unsupported-ui-action
                           :action action
@@ -215,6 +227,17 @@
 (defn handle-message!
   [^js worker wrapped-worker]
   (assert worker "worker doesn't exists")
+  (let [handle-worker-failure!
+        (fn [event]
+          (when (identical? worker @state/*db-worker-thread)
+            (log/error :db-worker/stopped-unexpectedly {:event event})
+            (set! (.-onmessage worker) nil)
+            (set! (.-onerror worker) nil)
+            (set! (.-onmessageerror worker) nil)
+            (reset! state/*db-worker-thread nil)
+            (reset! state/*db-worker nil)))]
+    (set! (.-onerror worker) handle-worker-failure!)
+    (set! (.-onmessageerror worker) handle-worker-failure!))
   (set! (.-onmessage worker)
         (fn [event]
           (let [data (.-data event)]

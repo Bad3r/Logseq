@@ -1,11 +1,15 @@
 (ns frontend.db.query-dsl-test
   (:require [cljs.test :refer [are deftest testing use-fixtures is]]
             [clojure.string :as string]
-            [frontend.db :as db]
-            [frontend.db.query-dsl :as query-dsl]
-            [frontend.db.react :as react]
-            [frontend.test.helper :as test-helper :include-macros true :refer [load-test-files]]
-            [frontend.util :as util]))
+            [datascript.core :as d]
+            [frontend.db.conn :as conn]
+            [frontend.db.utils :as db-utils]
+            [frontend.test.helper :as test-helper :include-macros true]
+            [frontend.util :as util]
+            [frontend.worker.query-dsl :as query-dsl]
+            [logseq.common.util.date-time :as date-time-util]
+            [logseq.db :as ldb]
+            [logseq.db.sqlite.build :as sqlite-build]))
 
 ;; TODO: quickcheck
 ;; 1. generate query filters
@@ -37,6 +41,37 @@
     {:block/page [:db/id :block/name :block/title :block/journal-day]}
     {:block/_parent ...}])
 
+(defn- build-query-test-block
+  [block]
+  (if-let [status (some->> (:build.test/title block)
+                           (re-find test-helper/bare-marker-pattern)
+                           second
+                           test-helper/file-to-db-statuses)]
+    (-> {:block/title
+         (string/replace-first (:build.test/title block) test-helper/bare-marker-pattern "")}
+        (assoc :block/tags [{:db/ident :logseq.class/Task}])
+        (update :build/properties merge {:logseq.property/status status}))
+    block))
+
+(defn- load-test-files
+  [options*]
+  (let [options (cond (:page (first options*))
+                      {:pages-and-blocks options* :auto-create-ontology? true}
+                      :else
+                      (assoc options* :auto-create-ontology? true))
+        options' (update options
+                         :pages-and-blocks
+                         (fn [pbs]
+                           (mapv (fn [m]
+                                   (update m :blocks
+                                           (fn [blocks]
+                                             (mapv build-query-test-block blocks))))
+                                 pbs)))
+        {:keys [init-tx block-props-tx]} (sqlite-build/build-blocks-tx options')
+        init-index (map #(select-keys % [:block/uuid]) init-tx)]
+    (d/transact! (conn/get-db test-helper/test-db false)
+                 (concat init-index init-tx block-props-tx))))
+
 (def dsl-query*
   "Overrides dsl-query/query with ENV variables. When $EXAMPLE is set, prints query
   result of build query. This is useful for documenting examples and debugging.
@@ -51,7 +86,10 @@
                         (let [res (apply old-build-query args')]
                           (println "EXAMPLE:" (pr-str (:query res)))
                           res))]
-          (apply query-dsl/query args))))
+          (let [[repo s] args]
+            (query-dsl/execute-query s
+                                     (conn/get-db repo)
+                                     {:block-attrs db-block-attrs})))))
     (some? js/process.env.DB_QUERY_TYPE)
     (fn dsl-query-star [& args]
       (let [old-build-property @#'query-dsl/build-property]
@@ -69,24 +107,30 @@
                                    m)]
                           m'))
                       query-dsl/db-block-attrs db-block-attrs]
-          (apply query-dsl/query args))))
+          (let [[repo s] args]
+            (query-dsl/execute-query s
+                                     (conn/get-db repo)
+                                     {:block-attrs db-block-attrs})))))
     :else
     (fn dsl-query-star [& args]
       (with-redefs [query-dsl/db-block-attrs db-block-attrs]
-        (apply query-dsl/query args)))))
+        (let [[repo s] args]
+          (query-dsl/execute-query s
+                                   (conn/get-db repo)
+                                   {:block-attrs db-block-attrs}))))))
 
 (defn- dsl-query
   [s]
-  (react/clear-query-state!)
   (when-let [result (dsl-query* test-helper/test-db s)]
-    (map first (deref result))))
+    (map first result)))
 
 (defn- custom-query
   [query]
-  (react/clear-query-state!)
-  (when-let [result (with-redefs [query-dsl/db-block-attrs db-block-attrs]
-                      (query-dsl/custom-query test-helper/test-db query {}))]
-    (map first (deref result))))
+  (with-redefs [query-dsl/db-block-attrs db-block-attrs]
+    (when-let [result (query-dsl/execute-custom-query query
+                                                      (conn/get-db test-helper/test-db)
+                                                      {:block-attrs db-block-attrs})]
+      (map first result))))
 
 ;; Tests
 ;; =====
@@ -113,7 +157,10 @@
       "(and \"for #clojure\")"
 
       "(and \"for #clojure\" #foo)"
-      "(and \"for #clojure\" #tag foo)")))
+      "(and \"for #clojure\" #tag foo)"
+
+      "(and [[outside]] (property prop \"2 [[6a8ead3b-a450-4916-a7e2-d16d0d2b59fd]]\"))"
+      "(and \"[[outside]]\" (property prop \"2 [[6a8ead3b-a450-4916-a7e2-d16d0d2b59fd]]\"))")))
 
 (defn- testable-content
   "Only test :block/title up to page-ref to make tests readable"
@@ -131,6 +178,7 @@
               {:block/title "b3"
                :build/properties {:prop-d #{[:build/page {:block/title "no-space-link"}]}
                                   :prop-c #{[:build/page {:block/title "page a"}] [:build/page {:block/title "page b"}] [:build/page {:block/title "page c"}]}
+                                  :prop-linked-title #{[:build/page {:block/title "2 [[6a8ead3b-a450-4916-a7e2-d16d0d2b59fd]]"}]}
                                   :prop-linked-num #{[:build/page {:block/title "3000"}]}}}
               {:block/title "b4", :build/properties {:prop-d #{[:build/page {:block/title "nada"}]}}}]}])
 
@@ -173,6 +221,11 @@
          (map (comp first string/split-lines :block/title)
               (dsl-query "(property prop-linked-num 3000)")))
       "Blocks have property with integer page value")
+
+  (is (= ["b3"]
+         (map (comp first string/split-lines :block/title)
+              (dsl-query "(and (property prop-linked-title \"2 [[6a8ead3b-a450-4916-a7e2-d16d0d2b59fd]]\"))")))
+      "Page-reference syntax in quoted property values remains literal")
 
   (is (= ["b3"]
          (map (comp first string/split-lines :block/title)
@@ -299,6 +352,28 @@
            (set (map :block/title (dsl-query "(property status \"Doing\")"))))
         "Blocks or tagged with or descended from a tag that don't have closed default-value property value")))
 
+(deftest cards-query-includes-classes-extending-card
+  (load-test-files
+   {:classes {:Milestone {:build/class-extends [:logseq.class/Card]}
+              :Project {:build/class-extends [:Milestone]}}
+    :pages-and-blocks
+    [{:page {:block/title "page1"}
+      :blocks [{:block/title "direct card"
+                :build/tags [:logseq.class/Card]}
+               {:block/title "milestone card"
+                :build/tags [:Milestone]}
+               {:block/title "project card"
+                :build/tags [:Project]}
+               {:block/title "plain"}]}]})
+  (let [db (conn/get-db test-helper/test-db)
+        titles (set (map (comp :block/title first)
+                         (query-dsl/execute-query
+                          "(page page1)" db
+                          {:cards? true
+                           :block-attrs db-block-attrs})))]
+    (is (= #{"direct card" "milestone card" "project card"} titles)
+        "cards? includes blocks tagged with Card and any class extending it")))
+
 (deftest block-property-query-performance
   (let [pages (->> (repeat 10 {:tags ["tag1" "tag2"]})
                    (map-indexed (fn [idx {:keys [tags]}]
@@ -421,6 +496,26 @@
          (map testable-content
               (dsl-query "(and (task doing) (or [[A]] [[B]]))")))))
 
+(deftest task-queries-with-multi-word-and-custom-statuses
+  (load-test-files
+   [{:page {:block/title "page1"}
+     :blocks [{:block/title "review task"
+               :build/properties {:logseq.property/status :logseq.property/status.in-review}}
+              {:block/title "waiting task"
+               :build/properties {:logseq.property/status [:build/page {:block/title "QA Ready"}]}}]}])
+
+  (testing "multi-word statuses match case-insensitively"
+    (is (= ["review task"]
+           (map testable-content (dsl-query "(task \"In Review\")"))))
+    (is (= ["review task"]
+           (map testable-content (dsl-query "(task \"in review\")")))))
+
+  (testing "custom status values match case-insensitively"
+    (is (= ["waiting task"]
+           (map testable-content (dsl-query "(task \"QA Ready\")"))))
+    (is (= ["waiting task"]
+           (map testable-content (dsl-query "(task \"qa ready\")"))))))
+
 ;; Ensure some filters work when no data with relevant properties exist
 (deftest queries-with-no-data
   (load-test-files {:pages-and-blocks []})
@@ -470,6 +565,16 @@
                    (dsl-query "(priority high medium low)"))))
       "Three arg queries and args that have no match"))
 
+(deftest priority-queries-with-multi-word-and-custom-values
+  (load-test-files
+   [{:page {:block/title "page1"}
+     :blocks [{:block/title "urgent b"
+               :build/properties {:logseq.property/priority [:build/page {:block/title "Very High"}]}}]}])
+  (is (= ["urgent b"]
+         (map :block/title (dsl-query "(priority \"Very High\")"))))
+  (is (= ["urgent b"]
+         (map :block/title (dsl-query "(priority \"very high\")")))))
+
 (deftest nested-boolean-queries
   (load-test-files
    [{:page {:block/title "page1", :build/properties {:foo "bar"}}
@@ -504,7 +609,7 @@
     (is (= #{"bar" "b1" "b2Z"}
            (->> (dsl-query (str "(not (and " task-filter " (or [[page 1]] [[page 2]])))"))
                 (keep testable-content)
-                (remove (fn [s] (db/page? (db/get-page s))))
+                (remove (fn [s] (ldb/page? (ldb/get-page (conn/get-db test-helper/test-db) s))))
                 set)))
 
     (is (= #{"b2Z" "b4Z"}
@@ -562,12 +667,14 @@
 
   (is (= ["page1"]
          (map (fn [result]
-                (:block/title (db/entity (:db/id (:block/page result)))))
+                (:block/title (db-utils/entity (conn/get-db test-helper/test-db)
+                                               (:db/id (:block/page result)))))
               (dsl-query "(page page1)"))))
 
   (is (= []
          (map (fn [result]
-                (:block/title (db/entity (:db/id (:block/page result)))))
+                (:block/title (db-utils/entity (conn/get-db test-helper/test-db)
+                                               (:db/id (:block/page result)))))
               (dsl-query "(page nope)")))
       "Correctly returns no results"))
 
@@ -592,12 +699,40 @@
            (map testable-content (dsl-query "[[page 2]]")))
         "Page ref arg")
 
+    (let [page (ldb/get-page (conn/get-db test-helper/test-db) "page 2")
+          query (str "[[" (:block/uuid page) "]]")]
+      (is (= ["b2"]
+             (map testable-content (dsl-query query)))
+          "UUID page ref arg"))
+
     (is (= ["b2"]
            (map testable-content (dsl-query "#tag1")))
         "Tag arg")
 
     (is (empty? (dsl-query "[[blarg]]"))
         "Nonexistent page returns no results"))
+
+  (testing "dynamic page variables use the query resource context"
+    (let [today-title (date-time-util/int->journal-title
+                       20240704
+                       date-time-util/default-journal-title-formatter)]
+      (load-test-files
+       [{:page {:block/title "context page"}
+         :blocks [{:block/title "current [[context page]]"}
+                  {:block/title (str "today [[" today-title "]]")}]}])
+      (let [db (conn/get-db test-helper/test-db)
+            execute (fn [query opts]
+                      (->> (query-dsl/execute-query
+                            query db
+                            (assoc opts :block-attrs db-block-attrs))
+                           (map first)
+                           (map testable-content)))]
+        (is (= ["current"]
+               (execute "<% current page %>"
+                        {:current-page-title "context page"})))
+        (is (= ["today"]
+               (execute "<% today %>"
+                        {:today-day 20240704}))))))
 
   (testing "basic boolean queries"
     (is (= ["b2"]
@@ -705,11 +840,4 @@
   (test-helper/start-test-db!)
 
   (query-dsl/query test-helper/test-db "(task done)")
-
- ;; Useful for debugging
-  (prn
-   (datascript.core/q
-    '[:find (pull ?b [*])
-      :where
-      [?b :block/name]]
-    (frontend.db/get-db test-helper/test-db))))
+  nil)

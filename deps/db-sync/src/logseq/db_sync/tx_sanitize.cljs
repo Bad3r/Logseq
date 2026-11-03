@@ -1,7 +1,8 @@
 (ns logseq.db-sync.tx-sanitize
   (:require [clojure.set :as set]
             [datascript.core :as d]
-            [logseq.db :as ldb]))
+            [logseq.db :as ldb]
+            [logseq.db.frontend.kv-entity :as kv-entity]))
 
 (def ^:private retract-entity-ops
   #{:db/retractEntity :db.fn/retractEntity})
@@ -27,8 +28,118 @@
 (def ^:private entity-op-kinds
   #{:db/add :db/retract :db/cas :db.fn/cas})
 
+(defn- entity-op?
+  [item]
+  (and (vector? item)
+       (<= 4 (count item))
+       (contains? entity-op-kinds (first item))))
+
+(def ^:private ignored-kv-entities
+  (into #{}
+        (keep (fn [[kw config]]
+                (when (get-in config [:rtc :rtc/ignore-entity-when-init-upload])
+                  kw)))
+        kv-entity/kv-entities))
+
+(defn- tx-ignored-kv-entity-refs
+  [tx-data]
+  (into ignored-kv-entities
+        (keep (fn [item]
+                (cond
+                  (and (map? item)
+                       (contains? ignored-kv-entities (:db/ident item)))
+                  (:db/id item)
+
+                  (and (entity-op? item)
+                       (= :db/ident (nth item 2))
+                       (contains? ignored-kv-entities (nth item 3)))
+                  (second item))))
+        tx-data))
+
+(defn- ignored-kv-entity-ref?
+  [db ignored-entity-refs entity-ref]
+  (or (contains? ignored-entity-refs entity-ref)
+      (when-let [eid (entity-ref->eid db entity-ref)]
+        (contains? ignored-kv-entities (:db/ident (d/entity db eid))))))
+
+(defn- ignored-kv-entity-op?
+  [db ignored-entity-refs item]
+  (cond
+    (and (map? item) (contains? item :db/id))
+    (ignored-kv-entity-ref? db ignored-entity-refs (:db/id item))
+
+    (retract-entity-op? item)
+    (ignored-kv-entity-ref? db ignored-entity-refs (second item))
+
+    (entity-op? item)
+    (ignored-kv-entity-ref? db ignored-entity-refs (second item))
+
+    :else
+    false))
+
+(defn- strip-ignored-kv-entity-ops
+  [db tx-data]
+  (let [ignored-entity-refs (tx-ignored-kv-entity-refs tx-data)]
+    (remove (partial ignored-kv-entity-op? db ignored-entity-refs) tx-data)))
+
+(defn- drop-ops-targeting-retracted-entities
+  [db tx-data]
+  (let [retract-eids (->> tx-data
+                          (keep (fn [item]
+                                  (when (retract-entity-op? item)
+                                    (entity-ref->eid db (second item)))))
+                          set)]
+    (if (empty? retract-eids)
+      tx-data
+      (remove (fn [item]
+                (and (entity-op? item)
+                     (contains? retract-eids
+                                (entity-ref->eid db (second item)))))
+              tx-data))))
+
+(def ^:private bookkeeping-attrs
+  "Attrs that are safe to drop when their target entity doesn't exist on the
+   server. Stamping them on a retracted eid would resurrect an invalid ghost
+   entity (e.g. only {:block/updated-at}), which then fails validation and
+   rejects the tx."
+  #{:block/created-at :block/updated-at :block/order})
+
+(defn- missing-positive-eid?
+  [db entity-ref]
+  (and (integer? entity-ref)
+       (pos? entity-ref)
+       (nil? (d/entity db entity-ref))))
+
+(defn- drop-stamps-on-missing-entities
+  "Drops stamp ops (`[:db/add e bookkeeping-attr v]` and entity maps carrying
+   only bookkeeping attrs) whose target eid has no entity in db. Synced txs
+   carry raw eids that can go stale when another client deleted the entity;
+   writing them would resurrect a ghost entity that fails validation."
+  [db tx-data]
+  (remove (fn [item]
+            (cond
+              (and (entity-op? item)
+                   (= :db/add (first item))
+                   (contains? bookkeeping-attrs (nth item 2)))
+              (missing-positive-eid? db (second item))
+
+              (and (map? item) (contains? item :db/id))
+              (and (missing-positive-eid? db (:db/id item))
+                   (every? #(contains? (conj bookkeeping-attrs :db/id) %)
+                           (keys item)))
+
+              :else
+              false))
+          tx-data))
+
 (def ^:private migration-deleted-attrs
   #{:block/path-refs
+    :block/scheduled
+    :block/deadline
+    :block/marker
+    :block/priority
+    :block/properties-text-values
+    :block/invalid-properties
     :block/pre-block?
     :logseq.property.embedding/hnsw-label
     :logseq.property.embedding/hnsw-label-updated-at})
@@ -38,7 +149,7 @@
   (keep (fn [item]
           (when-not (and (vector? item)
                          (<= 4 (count item))
-                         (contains? entity-op-kinds (first item))
+                         (entity-op? item)
                          (contains? migration-deleted-attrs (nth item 2)))
             item))
         tx-data))
@@ -94,16 +205,82 @@
     :else
     nil))
 
+(defn- hierarchy-op?
+  [item]
+  (or (retract-entity-op? item)
+      (and (map? item)
+           (some #(contains? item %) [:block/parent :block/page]))
+      (and (entity-op? item)
+           (contains? #{:block/parent :block/page} (nth item 2)))))
+
+(defn- page-anchor?
+  [entity]
+  (or (ldb/page? entity) (:block/name entity) (:db/ident entity)))
+
+(defn- derive-block-page-fixups
+  "Derives `:block/page` for changed blocks and their descendants from the
+   final parent hierarchy. The immutable preview resolves tempids and retracts;
+   corrections are appended to the same transaction and journal entry."
+  [db tx-data]
+  (when (some hierarchy-op? tx-data)
+    (let [{:keys [db-after tx-data]} (d/with db tx-data)
+          roots (into #{} (keep #(when (contains? #{:block/parent :block/page} (:a %))
+                                  (:e %))) tx-data)
+          affected (loop [todo (vec roots) seen #{}]
+                     (if-let [eid (peek todo)]
+                       (let [entity (d/entity db-after eid)]
+                         (if (or (contains? seen eid) (nil? entity) (page-anchor? entity))
+                           (recur (pop todo) seen)
+                           (recur (into (pop todo)
+                                        (map :e (d/datoms db-after :avet :block/parent eid)))
+                                  (conj seen eid))))
+                       seen))
+          pages (atom {})
+          entity-ref (fn [eid]
+                       (if-let [uuid (:block/uuid (d/entity db-after eid))]
+                         [:block/uuid uuid]
+                         eid))]
+      (letfn [(derive [eid visiting]
+                (if (contains? @pages eid)
+                  (get @pages eid)
+                  (when-not (contains? visiting eid)
+                    (let [parent (:block/parent (d/entity db-after eid))
+                          page (when parent
+                                 (if (page-anchor? parent)
+                                   (:db/id parent)
+                                   (or (when (contains? affected (:db/id parent))
+                                         (derive (:db/id parent) (conj visiting eid)))
+                                       (some-> parent :block/page :db/id)
+                                       (:db/id parent))))]
+                      (swap! pages assoc eid page)
+                      page))))]
+        (into []
+              (keep (fn [eid]
+                      (when-let [page (derive eid #{})]
+                        (when (not= page (some-> (d/entity db-after eid) :block/page :db/id))
+                          [:db/add (entity-ref eid) :block/page (entity-ref page)]))))
+              (sort affected))))))
+
 (defn sanitize-tx
   ([db tx-data]
    (sanitize-tx db tx-data nil))
-  ([db tx-data {:keys [drop-missing-retract-ops?]
-                :or {drop-missing-retract-ops? false}}]
+  ([db tx-data {:keys [drop-missing-retract-ops?
+                       drop-ops-targeting-retracted-entities?
+                       retract-touched-descendants?]
+                :or {drop-missing-retract-ops? false
+                     drop-ops-targeting-retracted-entities? false
+                     retract-touched-descendants? false}}]
    (let [tx-data* (cond->> (strip-migration-deleted-attrs tx-data)
+                    true
+                    (drop-stamps-on-missing-entities db)
+                    (seq ignored-kv-entities)
+                    (strip-ignored-kv-entity-ops db)
                     drop-missing-retract-ops?
                     (remove (fn [item]
                               (and (retract-entity-op? item)
-                                   (nil? (entity-ref->eid db (second item)))))))
+                                   (nil? (entity-ref->eid db (second item))))))
+                    drop-ops-targeting-retracted-entities?
+                    (drop-ops-targeting-retracted-entities db))
          tx-data* (drop-conflicted-encrypted-retracts tx-data*)
          tx-data* (vec tx-data*)
          retract-eids (->> tx-data*
@@ -121,7 +298,9 @@
                                                   (when (:block/uuid entity)
                                                     (ldb/get-block-full-children-ids db eid)))))
                                       set)
-         missing-retract-eids (sort (set/difference descendant-retract-eids retract-eids touched-eids))]
-     (cond-> tx-data*
-       (seq missing-retract-eids)
-       (into (map (fn [eid] [:db/retractEntity eid]) missing-retract-eids))))))
+         preserved-eids (cond-> retract-eids
+                          (not retract-touched-descendants?)
+                          (set/union touched-eids))
+         missing-retract-eids (sort (set/difference descendant-retract-eids preserved-eids))
+         tx-data* (into tx-data* (map (fn [eid] [:db/retractEntity eid]) missing-retract-eids))]
+     (into tx-data* (derive-block-page-fixups db tx-data*)))))

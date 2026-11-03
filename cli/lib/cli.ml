@@ -4,19 +4,33 @@ type app_context = {
 }
 
 type run_input = {
-  argv : string list;
-  env : (string * string) list;
+  argv : string Rrbvec.t;
+  env : (string * string) Rrbvec.t;
   cwd : Cli_primitive.path;
   stdin : string option;
 }
 
 let command_metadata () =
-  Graph.metadata () @ List_command.metadata () @ Upsert.metadata ()
-  @ Remove.metadata () @ Search.metadata () @ Query.metadata ()
-  @ Show.metadata () @ Server_command.metadata () @ Sync.metadata ()
-  @ Completion.metadata () @ Skill.metadata () @ Example.metadata ()
-  @ Doctor.metadata () @ Debug.metadata () @ Agent.metadata ()
-  @ Auth_command.metadata ()
+  Vec.fold_left Vec.append Vec.empty
+    (Vec.of_array
+       [|
+         Graph.metadata ();
+         List_command.metadata ();
+         Upsert.metadata ();
+         Remove.metadata ();
+         Search.metadata ();
+         Query.metadata ();
+         Show.metadata ();
+         Server_command.metadata ();
+         Sync.metadata ();
+         Completion.metadata ();
+         Skill.metadata ();
+         Example.metadata ();
+         Doctor.metadata ();
+         Debug.metadata ();
+         Agent.metadata ();
+         Auth_command.metadata ();
+       |])
 
 let command_registry () = Command_registry.make (command_metadata ())
 
@@ -24,13 +38,18 @@ let make_app ?version:_ () =
   { registry = command_registry (); defaults = Cli_config.defaults () }
 
 let make_app_context = make_app
-let env_lookup env key = List.assoc_opt key env
-let is_option token = String.length token > 0 && token.[0] = '-'
-
+let env_lookup env key = Vec.assoc_opt key env
+(* See cli_parse.ml — only a dash followed by markdown whitespace is a
+   list-item value; every other dash prefix is still an option. *)
+let is_option token =
+  let is_blank c = c = ' ' || c = '\t' || c = '\n' || c = '\r' in
+  let n = String.length token in
+  n > 0 && token.[0] = '-' && not (n > 1 && is_blank token.[1])
 let option_value key options =
-  List.find_map (fun (k, v) -> if k = key then v else None) options
-
-let option_present key options = List.exists (fun (k, _) -> k = key) options
+  Vec.find_map
+    (fun (candidate, value) -> if candidate = key then value else None)
+    options
+let option_present key options = Vec.mem_assoc key options
 
 let normalize_key = function
   | "-g" -> Some "graph"
@@ -61,7 +80,7 @@ let boolean_option = function
   | "include-built-in" | "include-journal" | "journal-only" | "include-hidden"
   | "with-properties" | "with-extends" | "with-classes" | "with-type"
   | "page-hierarchy" | "linked-references" | "ref-id-footer" | "progress"
-  | "upload-keys" ->
+  | "upload-keys" | "dry-run" ->
       true
   | _ -> false
 
@@ -71,32 +90,41 @@ let boolean_literal value =
   | _ -> false
 
 let parse_tokens argv =
-  let rec loop options positional = function
-    | [] -> (List.rev options, List.rev positional)
-    | "--" :: rest -> (List.rev options, List.rev_append positional rest)
-    | token :: rest -> (
+  let rec loop options positional remaining =
+    match Vec.pop_front remaining with
+    | None -> (options, positional)
+    | Some ("--", rest) -> (options, Vec.append positional rest)
+    | Some (token, rest) -> (
         match split_equals_option token with
         | Some (key, value) ->
-            loop ((key, Some value) :: options) positional rest
+            loop (Vec.push_back options (key, Some value)) positional rest
         | None -> (
             match normalize_key token with
             | Some key when boolean_option key -> (
-                match rest with
-                | value :: tail when boolean_literal value ->
-                    loop ((key, Some value) :: options) positional tail
-                | _ -> loop ((key, Some "true") :: options) positional rest)
+                match Vec.pop_front rest with
+                | Some (value, tail) when boolean_literal value ->
+                    loop
+                      (Vec.push_back options (key, Some value))
+                      positional tail
+                | _ ->
+                    loop
+                      (Vec.push_back options (key, Some "true"))
+                      positional rest)
             | Some key -> (
-                match rest with
-                | value :: tail when not (is_option value) ->
-                    loop ((key, Some value) :: options) positional tail
-                | _ -> loop ((key, None) :: options) positional rest)
-            | None -> loop options (token :: positional) rest))
+                match Vec.pop_front rest with
+                | Some (value, tail) when not (is_option value) ->
+                    loop
+                      (Vec.push_back options (key, Some value))
+                      positional tail
+                | _ -> loop (Vec.push_back options (key, None)) positional rest)
+            | None -> loop options (Vec.push_back positional token) rest))
   in
-  loop [] [] argv
+  loop Vec.empty Vec.empty argv
 
 let stdin_required_for_show_id argv =
   let options, positional = parse_tokens argv in
-  positional = [ "show" ]
+  Vec.length positional = 1
+  && Vec.peek_front positional = "show"
   && option_present "id" options
   && Option.is_none (option_value "id" options)
 
@@ -126,11 +154,15 @@ let result_text_for_mode result (Output.Mode.Packed mode) =
   | Output.Mode.Json -> Format_types.to_json result
   | Output.Mode.Edn -> Format_types.to_edn result
 
-type pending_output = { stdout : string; stderr : string list; exit_code : int }
+type pending_output = {
+  stdout : string;
+  stderr : string Rrbvec.t;
+  exit_code : int;
+}
 
 let pending_output : pending_output option ref = ref None
 
-let set_pending_output ?(stderr = []) ~exit_code stdout =
+let set_pending_output ?(stderr = Vec.empty) ~exit_code stdout =
   pending_output := Some { stdout; stderr; exit_code }
 
 let take_pending_output () =
@@ -151,24 +183,22 @@ let set_pending_message_output ?command mode message =
   set_pending_output ~exit_code:0 (result_text_for_mode result mode)
 
 let is_prefix prefix path =
-  let rec loop prefix path =
-    match (prefix, path) with
-    | [], _ -> true
-    | p :: ps, x :: xs when p = x -> loop ps xs
-    | _ -> false
+  let rec loop index =
+    index >= Vec.length prefix
+    || (Vec.nth prefix index = Vec.nth path index && loop (index + 1))
   in
-  List.length prefix <= List.length path && loop prefix path
+  Vec.length prefix <= Vec.length path && loop 0
 
 let group_help_path registry path =
-  match path with
-  | [] -> true
-  | _ when Option.is_some (Command_registry.find_by_path path registry) -> false
-  | _ ->
-      List.exists
-        (fun command ->
-          is_prefix path command.Command_registry.path
-          && List.length command.Command_registry.path > List.length path)
-        registry.Command_registry.commands
+  if Vec.is_empty path then true
+  else if Option.is_some (Command_registry.find_by_path path registry) then
+    false
+  else
+    Vec.exists
+      (fun command ->
+        is_prefix path command.Command_registry.path
+        && Vec.length command.Command_registry.path > Vec.length path)
+      registry.Command_registry.commands
 
 let help_group registry options positional =
   if option_present "help" options then Some positional
@@ -184,36 +214,52 @@ let command_name = function
 
 let profile_lines config result exit_code =
   match config.Cli_config.profile_session with
-  | None -> []
+  | None -> Vec.empty
   | Some session ->
       Profile_types.report session
         ~command:(command_name result.Cli_result.command)
         ~status:(profile_status exit_code)
       |> Profile_types.render_lines
 
-let verbose_line config result =
-  if not config.Cli_config.verbose then []
-  else
-    [
-      Melange_edn.to_edn_string
-        (Edn_util.map
-           [
-             (Edn_util.keyword "level", Edn_util.keyword "debug");
-             (Edn_util.keyword "message", Edn_util.keyword "cli/parsed-options");
-             ( Edn_util.keyword "command",
-               Edn_util.string (command_name result.Cli_result.command) );
-             (Edn_util.keyword "root-dir", Edn_util.string config.root_dir);
-           ]);
-    ]
+let human_table_headers_order registry command =
+  match command with
+  | None -> Vec.empty
+  | Some command ->
+      registry.Command_registry.commands
+      |> Vec.find_opt (fun meta -> meta.Command_registry.id = command)
+      |> Option.map (fun (meta : Command_registry.command_meta) ->
+          meta.human_table_headers_order)
+      |> Option.value ~default:Vec.empty
 
-type raw_argv
-type parsed_argv
-type resolved_config
-type built_action
-type executed_action
-type error
-type final
-type not_final
+let with_registry_metadata app result =
+  Cli_result.with_human_table_headers_order
+    (human_table_headers_order app.registry result.Cli_result.command)
+    result
+
+let verbose_line config result =
+  if not config.Cli_config.verbose then Vec.empty
+  else
+    Vec.singleton
+      (Melange_edn_melange.to_edn_string
+         (Edn_util.map_vec
+            (Vec.of_array
+               [|
+                 (Edn_util.keyword "level", Edn_util.keyword "debug");
+                 ( Edn_util.keyword "message",
+                   Edn_util.keyword "cli/parsed-options" );
+                 ( Edn_util.keyword "command",
+                   Edn_util.string (command_name result.Cli_result.command) );
+                 (Edn_util.keyword "root-dir", Edn_util.string config.root_dir);
+               |])))
+
+type raw_argv = [ `Raw_argv ]
+type parsed_argv = [ `Parsed_argv ]
+type resolved_config = [ `Resolved_config ]
+type built_action = [ `Built_action ]
+type executed_action = [ `Executed_action ]
+type error = [ `Error ]
+type final = [ `Final ]
+type not_final = [ `Not_final ]
 
 type ('phase, 'final) state =
   | Raw_argv_state : run_input -> (raw_argv, not_final) state
@@ -281,12 +327,14 @@ let graph_exists_error graph =
   let graph_name = Cli_primitive.string_of_graph graph in
   Error.make
     ~context:
-      (Edn_util.map [ (Edn_util.keyword "graph", Edn_util.string graph_name) ])
-    (Edn_util.keyword_t "graph-exists")
+      (Edn_util.map_vec
+         (Vec.of_array
+            [| (Edn_util.keyword "graph", Edn_util.string graph_name) |]))
+    Error.Graph_exists
     ("graph already exists: " ^ graph_name)
 
 let action_graph_exists config graph =
-  List.exists
+  Vec.exists
     (fun existing ->
       String.equal
         (Cli_primitive.string_of_graph existing)
@@ -383,9 +431,10 @@ let execute_action : type marker.
     app_context ->
     (built_action, marker) state ->
     (executed_action, final) state Error.build_result Cli_effect.t =
- fun _ (Built_action_state (config, action)) ->
+ fun app (Built_action_state (config, action)) ->
   Cli_effect.map
-    (fun result -> Ok (Executed_action_state (config, result)))
+    (fun result ->
+      Ok (Executed_action_state (config, with_registry_metadata app result)))
     (Cli_action.execute action config)
 
 let format_cli_result result config = Format_types.format_result result config
@@ -402,8 +451,8 @@ let final_effect : type phase. (phase, final) state -> int Cli_effect.t =
       let output = format_cli_result result config in
       let exit_code = result_exit_code result in
       write_stdout_line output;
-      List.iter prerr_endline (verbose_line config result);
-      List.iter prerr_endline (profile_lines config result exit_code);
+      Vec.iter prerr_endline (verbose_line config result);
+      Vec.iter prerr_endline (profile_lines config result exit_code);
       flush stdout;
       flush stderr;
       Cli_effect.pure exit_code
@@ -414,12 +463,12 @@ let final_effect : type phase. (phase, final) state -> int Cli_effect.t =
         | None ->
             {
               stdout = Format_types.format_error err None;
-              stderr = [];
+              stderr = Vec.empty;
               exit_code = 1;
             }
       in
       write_stdout_line output.stdout;
-      List.iter prerr_endline output.stderr;
+      Vec.iter prerr_endline output.stderr;
       flush stdout;
       flush stderr;
       Cli_effect.pure output.exit_code

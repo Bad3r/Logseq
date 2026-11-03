@@ -2,10 +2,27 @@
   (:require [clojure.string :as string]
             [cljs.test :refer [deftest is testing]]
             [datascript.core :as d]
+            [logseq.common.util.page-ref :as page-ref]
             [logseq.db :as ldb]
             [logseq.db.test.helper :as db-test]
+            [logseq.outliner.core :as outliner-core]
             [logseq.outliner.op :as outliner-op]
             [logseq.outliner.property :as outliner-property]))
+
+(deftest insert-blocks-preserves-existing-reference-ids
+  (let [conn (db-test/create-conn-with-blocks
+              [{:page {:block/title "Test"}
+                :blocks [{:block/title "Target"} {:block/title "Referenced"}]}])
+        target (db-test/find-block-by-content @conn "Target")
+        referenced (db-test/find-block-by-content @conn "Referenced")
+        uuid' (random-uuid)]
+    (outliner-core/insert-blocks!
+     conn [{:block/uuid uuid'
+            :block/title (page-ref/->page-ref (:block/uuid referenced))
+            :block/refs [(:db/id referenced)]}]
+     target {:sibling? true :keep-uuid? true})
+    (is (= #{(:block/uuid referenced)}
+           (set (map :block/uuid (:block/refs (d/entity @conn [:block/uuid uuid']))))))))
 
 (deftest toggle-reaction-op
   (testing "toggles reactions via outliner ops"
@@ -40,6 +57,37 @@
                                 {})
         (let [block-entity (d/entity @conn [:block/uuid target-uuid])]
           (is (empty? (:logseq.property.reaction/_target block-entity))))))))
+
+(deftest collapse-expand-blocks-op
+  (let [conn (db-test/create-conn-with-blocks
+              [{:page {:block/title "Test"}
+                :blocks [{:block/title "Parent"}]}])
+        block (db-test/find-block-by-content @conn "Parent")
+        block-id (:block/uuid block)]
+    (outliner-op/apply-ops!
+     conn
+     [[:collapse-expand-blocks [[{:block/uuid block-id
+                                  :block/collapsed? true}]
+                                {}]]]
+     {})
+    (is (true? (:block/collapsed? (d/entity @conn [:block/uuid block-id]))))
+    (outliner-op/apply-ops!
+     conn
+     [[:collapse-expand-blocks [[{:block/uuid block-id
+                                  :block/collapsed? false}]
+                                {}]]]
+     {})
+    (is (false? (:block/collapsed? (d/entity @conn [:block/uuid block-id]))))))
+
+(deftest resolve-indent-outdent-parent-original-test
+  (let [conn (db-test/create-conn-with-blocks
+              [{:page {:block/title "Test"}
+                :blocks [{:block/title "Original"}]}])
+        original (db-test/find-block-by-content @conn "Original")
+        opts (#'outliner-op/resolve-indent-outdent-opts
+              @conn
+              {:parent-original {:block/uuid (:block/uuid original)}})]
+    (is (= (:db/id original) (get-in opts [:parent-original :db/id])))))
 
 (deftest apply-ops-plugin-property-sequence-test
   (testing "plugin property ops remain visible after a single apply-ops! batch"
@@ -150,6 +198,7 @@
                                               {:block/title "time block"
                                                :build/properties {:log-time "<%time%>"}}]}]}]
                  :properties {:log-time {:logseq.property/type :default}}})
+          target-page (ldb/get-page @conn "Target Page")
           template-root (db-test/find-block-by-content @conn "template root")
           target-block (db-test/find-block-by-content @conn "target block")
           template-blocks (->> (ldb/get-block-and-children @conn (:block/uuid template-root)
@@ -166,7 +215,9 @@
                                                        (:block/uuid target-block)
                                                        {:template-blocks blocks-to-insert}]]]
                                     {})
-          page-var-block (db-test/find-block-by-content @conn "page is [[Target Page]]")
+          page-var-block (db-test/find-block-by-content
+                          @conn
+                          (str "page is " (page-ref/->page-ref (:block/uuid target-page))))
           time-block (some->> (d/q '[:find [?b ...]
                                      :in $ ?title ?page-title
                                      :where

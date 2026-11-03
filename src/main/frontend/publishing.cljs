@@ -5,6 +5,7 @@
             [cljs.reader :as reader]
             [clojure.string :as string]
             [frontend.components.block :as block]
+            [frontend.components.block.breadcrumb :as block-breadcrumb]
             [frontend.components.editor :as editor]
             [frontend.components.page :as page-component]
             [frontend.components.reference :as reference]
@@ -17,7 +18,9 @@
             [frontend.modules.shortcut.core :as shortcut]
             [frontend.page :as page]
             [frontend.persist-db.browser :as db-browser]
+            [frontend.rfx :as rfx]
             [frontend.routes :as routes]
+            [frontend.runtime.globals :as runtime-globals]
             [frontend.state :as state]
             [promesa.core :as p]
             [reitit.frontend :as rf]
@@ -51,7 +54,7 @@
   []
   ;; Client sets repo name (and graph type) based on what was written in app state
   (when-let [data js/window.logseq_db]
-    (let [repo (-> @state/state :config keys first)]
+    (let [repo (-> (state/get-state) :config keys first)]
       (state/set-current-repo! repo)
       (p/let [_ (repo-handler/restore-and-setup-repo! repo)
               _ (let [db-transit-str (unescape-html data)]
@@ -60,11 +63,19 @@
         (state/set-db-restoring! false)
         (ui-handler/re-render-root!)))))
 
+(defn- apply-published-state!
+  [data]
+  (let [repo (or (:git/current-repo data)
+                 (first (keys (:config data))))]
+    (state/swap-state! merge (cond-> data
+                               repo (assoc :git/current-repo repo)))
+    (when repo
+      (state/set-current-repo! repo))))
+
 (defn restore-state!
   []
   (when-let [data js/window.logseq_state]
-    (let [data (reader/read-string data)]
-      (swap! state/state merge data))))
+    (apply-published-state! (reader/read-string data))))
 
 (defn set-router!
   []
@@ -77,7 +88,7 @@
 (defn start []
   (when-let [node (.getElementById js/document "root")]
     (set-router!)
-    (.render (rdc/createRoot node) (page/current-page))))
+    (.render (rdc/createRoot node) (rfx/provider (page/current-page)))))
 
 (defn- register-components-fns!
   []
@@ -86,7 +97,7 @@
   (state/set-component! :block/linked-references reference/references)
   (state/set-component! :block/container block/block-container)
   (state/set-component! :block/inline-title block/inline-title)
-  (state/set-component! :block/breadcrumb block/breadcrumb)
+  (state/set-component! :block/breadcrumb block-breadcrumb/breadcrumb)
   (state/set-component! :block/blocks-container block/blocks-container)
   (state/set-component! :block/reference block/block-reference)
   (state/set-component! :block/properties-cp block/db-properties-cp)
@@ -100,6 +111,7 @@
   ;; init is called ONCE when the page loads
   ;; this is called in the index.html and must be exported
   ;; so it is available even in :advanced release builds
+  (runtime-globals/install!)
   (register-components-fns!)
   ;; Set :preferred-lang as some components depend on it
   (i18n/start)

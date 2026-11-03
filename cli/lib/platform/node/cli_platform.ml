@@ -1,7 +1,35 @@
 open Cli_effect.Infix
 
 let hostname = Cli_unix.gethostname
-let argv () = Node.Process.argv
+
+module Stdout = struct
+  type writable
+
+  external stdout : writable = "stdout" [@@mel.module "process"]
+
+  external on_error :
+    writable -> (_[@mel.as "error"]) -> ((Js.Exn.t -> unit)[@u]) -> unit = "on"
+  [@@mel.send]
+
+  external error_code : Js.Exn.t -> string option = "code"
+  [@@mel.get] [@@mel.return { undefined_to_opt }]
+end
+
+let stdout_error_handler_installed = ref false
+
+let install_stdout_error_handler () =
+  if not !stdout_error_handler_installed then (
+    stdout_error_handler_installed := true;
+    Stdout.on_error Stdout.stdout (fun[@u] error ->
+        match Stdout.error_code error with
+        | Some "EPIPE" -> exit 0
+        | _ ->
+            Js.Exn.raiseError
+              (Option.value (Js.Exn.message error) ~default:"JavaScript error")))
+
+let argv () =
+  install_stdout_error_handler ();
+  Node.Process.argv
 
 type login_callback_request = { target : string option }
 type login_callback_response = { status : int; body : string }
@@ -217,7 +245,7 @@ module HTTP = struct
     let body = request_body method_ body in
     let init =
       Fetch.RequestInit.make ~method_
-        ~headers:(Fetch.HeadersInit.makeWithArray (Array.of_list headers))
+        ~headers:(Fetch.HeadersInit.makeWithArray (Rrbvec.to_array headers))
         ?body
         ~signal:(Fetch.AbortController.signal controller)
         ()
@@ -311,40 +339,40 @@ module Events = struct
         ~signal:(Fetch.AbortController.signal controller)
         ()
     in
-    let handle_response response =
-      if not (Fetch.Response.ok response) then
-        Js.Promise.reject
-          (Js.Exn.raiseError
-             ("events request failed ("
-             ^ string_of_int (Fetch.Response.status response)
-             ^ ")"))
-      else
-        match response_body response with
-        | None ->
-            Fetch.Response.text response
-            |> Js.Promise.then_ (fun text ->
-                if not !closed then on_chunk text;
-                Js.Promise.resolve ())
-        | Some body ->
-            let reader = get_reader body in
-            reader_ref := Some reader;
-            read_loop closed (make_decoder ()) reader on_chunk
-    in
-    ignore
-      (Fetch.fetchWithInit url init
-       |> Js.Promise.then_ handle_response
-       |> Js.Promise.catch (fun _ -> Js.Promise.resolve ())
-        : unit Js.Promise.t);
-    let close () =
-      closed := true;
-      Fetch.AbortController.abort controller;
-      (match !reader_ref with
-      | None -> ()
-      | Some reader ->
-          ignore
-            (cancel reader |> Js.Promise.catch (fun _ -> Js.Promise.resolve ())
-              : unit Js.Promise.t));
-      Cli_effect.pure ()
-    in
-    Cli_effect.pure { close }
+    Cli_effect.bind
+      (HTTP.promise_to_effect (Fetch.fetchWithInit url init))
+      (fun response ->
+        if not (Fetch.Response.ok response) then
+          Cli_effect.error
+            (Js.Exn.raiseError
+               ("events request failed ("
+               ^ string_of_int (Fetch.Response.status response)
+               ^ ")"))
+        else
+          let request =
+            (match response_body response with
+              | None ->
+                  Fetch.Response.text response
+                  |> Js.Promise.then_ (fun text ->
+                      if not !closed then on_chunk text;
+                      Js.Promise.resolve ())
+              | Some body ->
+                  let reader = get_reader body in
+                  reader_ref := Some reader;
+                  read_loop closed (make_decoder ()) reader on_chunk)
+            |> Js.Promise.catch (fun _ -> Js.Promise.resolve ())
+          in
+          let close () =
+            Fetch.AbortController.abort controller;
+            (match !reader_ref with
+            | None -> ()
+            | Some reader ->
+                ignore
+                  (cancel reader
+                   |> Js.Promise.catch (fun _ -> Js.Promise.resolve ())
+                    : unit Js.Promise.t));
+            Cli_effect.catch (HTTP.promise_to_effect request) (fun _ ->
+                Cli_effect.pure ())
+          in
+          Cli_effect.pure { close })
 end

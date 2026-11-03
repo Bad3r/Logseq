@@ -10,10 +10,12 @@
             [electron.cli-install :as cli-install]
             [electron.configs :as cfgs]
             [electron.db :as db]
+            [electron.db-worker :as db-worker]
             [electron.embedding-server :as embedding-server]
             [electron.exceptions :as exceptions]
             [electron.handler :as handler]
             [electron.i18n :as i18n :refer [t]]
+            [electron.lifecycle :as lifecycle]
             [electron.logger :as logger]
             [electron.release-warning :as release-warning]
             [electron.server :as server]
@@ -40,6 +42,7 @@
 
 (defonce *setup-fn (volatile! nil))
 (defonce *teardown-fn (volatile! nil))
+(defonce *lifecycle-op (volatile! (p/resolved nil)))
 (defonce *quit-dirty? (volatile! true))
 
 (defn setup-updater! [^js win]
@@ -80,8 +83,10 @@
    (fn [^js request callback]
      (let [url (.-url request)
            url (decode-protected-assets-schema-path url)
-           path (string/replace url "assets://" "")
-           path (js/decodeURIComponent path)]
+           ;; Query and fragment belong to the document URL, not the filename.
+           path (-> (first (string/split url #"[?#]" 2))
+                    (string/replace "assets://" "")
+                    (js/decodeURIComponent))]
        (cond (or (string/starts-with? path "/")
                  (re-find #"(?i)^/[a-zA-Z]:" path))
              (callback #js {:path path})
@@ -365,6 +370,7 @@
                     (preferred-unix-cli-dir))]
     (cli-install/install-cli-launcher!
      {:windows? utils/win32?
+      :packaged? (.-isPackaged ^js app)
       :cli-path cli-path
       :cli-dir! cli-dir!
       :exe-path (.getPath app "exe")
@@ -374,7 +380,6 @@
       :read-file! #(.readFileSync fs % "utf8")
       :write-file! #(.writeFileSync fs %1 %2 "utf8")
       :chmod! #(fs/chmodSync %1 %2)
-      :show-message-box! #(.showMessageBox dialog (clj->js %))
       :show-error-box! #(.showErrorBox dialog %1 %2)
       :t t
       :log-info! logger/info
@@ -391,72 +396,78 @@
            (-> (.default devtoolsInstaller (.-REACT_DEVELOPER_TOOLS devtoolsInstaller))
                (.then #(js/console.log "Added Extension:" (.-REACT_DEVELOPER_TOOLS devtoolsInstaller)))))
 
-         (let [t0 (setup-interceptor! app')
-               ^js win (win/create-main-window!)
-               _ (reset! *win win)]
+         (-> (db-worker/<prepare-startup!)
+             (p/then
+              (fn [_]
+                (let [t0 (setup-interceptor! app')
+                      ^js win (win/create-main-window!)
+                      _ (reset! *win win)]
 
-           (utils/<restore-proxy-settings)
+                  (utils/<restore-proxy-settings)
 
-           (js-utils/disableXFrameOptions win)
+                  (js-utils/disableXFrameOptions win)
 
-           (db/ensure-graphs-dir!)
-           (install-cli-launcher!)
+                  (db/ensure-graphs-dir!)
+                  (install-cli-launcher!)
 
-           ;; Windows/Linux: handle deeplink URL passed on first launch via argv
-           (handle-initial-deeplink! win)
-           (maybe-warn-wrong-release!)
+                  ;; Windows/Linux: handle deeplink URL passed on first launch via argv
+                  (handle-initial-deeplink! win)
+                  (maybe-warn-wrong-release!)
 
-           (vreset! *setup-fn
-                    (fn []
-                      (let [t1 (setup-updater! win)
-                            t2 (setup-app-manager! win)
-                            t3 (handler/set-ipc-handler! win)
-                            t4 (server/setup! win)
-                            t5 (when (cfgs/semantic-search-enabled?)
-                                 (embedding-server/setup! app'))
-                            tt (exceptions/setup-exception-listeners!)]
+                  (vreset! *setup-fn
+                           (fn []
+                             (let [t1 (setup-updater! win)
+                                   t2 (setup-app-manager! win)
+                                   t3 (handler/set-ipc-handler! win)
+                                   t4 (server/setup! win)
+                                   t5 (when (cfgs/semantic-search-enabled?)
+                                        (embedding-server/setup! app'))
+                                   tt (exceptions/setup-exception-listeners!)]
 
-                        (vreset! *teardown-fn
-                                 #(-> (handler/stop-all-db-workers!)
-                                      (p/finally
-                                        (fn []
-                                          (doseq [f [t0 t1 t2 t3 t4 t5 tt]]
-                                            (and f (f))))))))))
+                               (vreset! *teardown-fn
+                                        #(-> (handler/stop-all-db-workers!)
+                                             (p/finally
+                                               (fn []
+                                                 (doseq [f [t0 t1 t2 t3 t4 t5 tt]]
+                                                   (and f (f))))))))))
 
-           ;; setup effects
-           (@*setup-fn)
+                  ;; setup effects
+                  (@*setup-fn)
 
-           ;; main window events
-           (.on win "close" (fn [e]
-                              (when @*quit-dirty? ;; when not updating
-                                (.preventDefault e)
+                  ;; main window events
+                  (.on win "close" (fn [e]
+                                     (when @*quit-dirty? ;; when not updating
+                                       (.preventDefault e)
 
-                                (let [windows (win/get-all-windows)
-                                      window @*win
-                                      multiple-windows? (> (count windows) 1)]
-                                  (cond
-                                    (or multiple-windows? (not mac?) @win/*quitting?)
-                                    (when window
-                                      (win/close-handler win e)
-                                      (reset! *win nil))
+                                       (let [windows (win/get-all-windows)
+                                             window @*win
+                                             multiple-windows? (> (count windows) 1)]
+                                         (cond
+                                           (or multiple-windows? (not mac?) @win/*quitting?)
+                                           (when window
+                                             (win/close-handler win e)
+                                             (reset! *win nil))
 
-                                    (and mac? (not multiple-windows?))
-                                        ;; Just hiding - don't do any actual closing operation
-                                    (do (.preventDefault ^js/Event e)
-                                        (if (and mac? (.isFullScreen win))
-                                          (do (.once win "leave-full-screen" #(.hide win))
-                                              (.setFullScreen win false))
-                                          (.hide win)))
-                                    :else
-                                    nil)))))
-           (.on app' "before-quit" (fn [_e]
-                                     (reset! win/*quitting? true)
-                                     (-> (handler/stop-all-db-workers!)
-                                         (p/finally
-                                           (fn []
-                                             (embedding-server/stop!))))))
+                                           (and mac? (not multiple-windows?))
+                                               ;; Just hiding - don't do any actual closing operation
+                                           (do (.preventDefault ^js/Event e)
+                                               (if (and mac? (.isFullScreen win))
+                                                 (do (.once win "leave-full-screen" #(.hide win))
+                                                     (.setFullScreen win false))
+                                                 (.hide win)))
+                                           :else
+                                           nil)))))
+                  (.on app' "before-quit" (fn [_e]
+                                            (reset! win/*quitting? true)
+                                            (-> (handler/stop-all-db-workers!)
+                                                (p/finally
+                                                  (fn []
+                                                    (embedding-server/stop!))))))
 
-           (.on app' "activate" #(when @*win (.show win)))))))
+                  (.on app' "activate" #(when @*win (.show win))))))
+             (p/catch (fn [error]
+                        (logger/error :electron/worker-upgrade-failed error)
+                        (.quit app')))))))
 
 (defn main []
   (if-not (.requestSingleInstanceLock app)
@@ -469,8 +480,13 @@
       (.registerSchemesAsPrivileged
        protocol (bean/->js [{:scheme     LSP_SCHEME
                              :privileges privileges}
+                            ;; the app page and its scripts load from lsp://;
+                            ;; Chromium keeps compiled script code across runs
+                            ;; only for schemes registered with :codeCache, so
+                            ;; without it the 16 MB main.js was compiled anew
+                            ;; at every app open
                             {:scheme     FILE_LSP_SCHEME
-                             :privileges privileges}
+                             :privileges (assoc privileges :codeCache true)}
                             {:scheme     FILE_ASSETS_SCHEME
                              :privileges (assoc privileges :stream true)}]))
 
@@ -496,10 +512,30 @@
                                              (.quit app))))))
       (on-app-ready! app))))
 
+(defn- <run-current-teardown!
+  []
+  (if-let [teardown! @*teardown-fn]
+    (do
+      (vreset! *teardown-fn nil)
+      (try
+        (-> (or (teardown!) (p/resolved nil))
+            (p/catch (fn [e]
+                       (logger/warn :electron/teardown-failed e)
+                       nil)))
+        (catch :default e
+          (logger/warn :electron/teardown-failed e)
+          (p/resolved nil))))
+    (p/resolved nil)))
+
 (defn start []
   (logger/debug "Main - start")
-  (when @*setup-fn (@*setup-fn)))
+  (lifecycle/enqueue!
+   *lifecycle-op
+   #(-> (<run-current-teardown!)
+        (p/then (fn [_]
+                  (when-let [setup! @*setup-fn]
+                    (setup!)))))))
 
 (defn stop []
   (logger/debug "Main - stop")
-  (when @*teardown-fn (@*teardown-fn)))
+  (lifecycle/enqueue! *lifecycle-op <run-current-teardown!))

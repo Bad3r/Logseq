@@ -4,6 +4,7 @@
             ["@modelcontextprotocol/sdk/server/streamableHttp.js" :refer [StreamableHTTPServerTransport]]
             ["@modelcontextprotocol/sdk/types.js" :refer [isInitializeRequest]]
             ["zod/v3" :as z] ;; zod 4 doesn't work w/ mcp - https://github.com/modelcontextprotocol/typescript-sdk/issues/925
+            [electron.mcp-transport :as mcp-transport]
             [promesa.core :as p]))
 
 ;; Server util fns
@@ -12,28 +13,31 @@
 (defonce ^:private transports
   (atom {}))
 
+(declare create-mcp-api-server)
+
 ;; See https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http
 ;; for how to respond to different MCP requests
-(defn handle-post-request [mcp-server {:keys [port host]} req res]
-  (let [session-id (aget (.-headers req) "mcp-session-id")]
+(defn handle-post-request [api-fn {:keys [port host]} req res]
+  (let [session-id (aget (.-headers req) "mcp-session-id")
+        existing-transport (and session-id (@transports session-id))]
     (js/console.log "POST /mcp request" session-id (pr-str (.-body req)))
     (cond
-      (and session-id (@transports session-id))
-      (let [^js transport (@transports session-id)]
-        (.handleRequest transport (.-raw req) (.-raw res) (.-body req)))
+      existing-transport
+      (mcp-transport/handle-request! existing-transport req res (.-body req))
 
       (and (not session-id)
            (isInitializeRequest (.-body req)))
       (let [transport (StreamableHTTPServerTransport.
                        #js {:sessionIdGenerator (comp str random-uuid)
                             :enableDnsRebindingProtection true
-                            :allowedHosts #js [(str host ":" port)]})]
+                            :allowedHosts #js [(str host ":" port)]})
+            mcp-server (create-mcp-api-server api-fn)]
         (set! (.-onclose transport)
               (fn []
                 (js/console.log "Transport closed" (.-sessionId transport))
                 (swap! transports dissoc (.-sessionId transport))))
         (.connect mcp-server transport)
-        (.handleRequest transport (.-raw req) (.-raw res) (.-body req))
+        (mcp-transport/handle-request! transport req res (.-body req))
         (js/console.log "Initialize sessionId" (.-sessionId transport))
         (if (.-sessionId transport)
           (swap! transports assoc (.-sessionId transport) transport)
@@ -53,7 +57,7 @@
   (let [session-id (aget (.-headers req) "mcp-session-id")]
     (js/console.log "GET /mcp" session-id)
     (if-let [transport (and session-id (@transports session-id))]
-      (.handleRequest ^js transport (.-raw req) (.-raw res))
+      (mcp-transport/handle-request! transport req res)
       (-> res (.code 400) (.send "Invalid or missing session ID")))))
 
 (defn handle-delete-request

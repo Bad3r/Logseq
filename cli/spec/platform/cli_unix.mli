@@ -26,11 +26,11 @@ val rename : string -> string -> unit
 val getpid : unit -> int
 val process_running : int -> bool
 val chmod : string -> int -> unit
-val access : string -> access_permission list -> unit
+val access : string -> access_permission Rrbvec.t -> unit
 val stat : string -> stats
 val environment : unit -> string array
 val gethostname : unit -> string
-val openfile : string -> open_flag list -> int -> file_descr
+val openfile : string -> open_flag Rrbvec.t -> int -> file_descr
 val close : file_descr -> unit
 
 val create_process_env :
@@ -43,11 +43,39 @@ val create_process_env :
   int
 
 val run_process_capture :
-  string -> string list -> string array -> process_result
+  string -> string Rrbvec.t -> string array -> process_result
 
 val start_process_capture_session_line :
-  string -> string list -> string array -> process_result
+  string -> string Rrbvec.t -> string array -> process_result
 
 val kill : int -> int -> unit
 val open_url : string -> bool
 val write_stdout : string -> unit
+
+type lifecycle_error = { code : string; message : string }
+
+val start_graph_runtime :
+  root_dir:string ->
+  repo:string ->
+  script:string ->
+  owner_source:string ->
+  create_empty_db:bool ->
+  generation:string option ->
+  (string, lifecycle_error) result Cli_effect.t
+
+val stop_graph_runtime :
+  root_dir:string ->
+  repo:string ->
+  owner_source:string ->
+  (unit, lifecycle_error) result Cli_effect.t
+
+val delete_graph :
+  root_dir:string ->
+  repo:string ->
+  on_removed:(unit -> (unit, lifecycle_error) result Cli_effect.t) ->
+  (bool, lifecycle_error) result Cli_effect.t
+
+val create_graph :
+  root_dir:string ->
+  repo:string ->
+  (string, lifecycle_error) result Cli_effect.t

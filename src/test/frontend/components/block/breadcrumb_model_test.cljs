@@ -173,6 +173,47 @@
       (is (= (str "See [[" ref-uuid "]]") (:text seg)))
       (is (= (str "See [[" ref-uuid "]]") (:full-text seg))))))
 
+(deftest breadcrumb-ref-titles-enrich-shallow-canonical-refs-test
+  (let [block-uuid #uuid "00000000-0000-0000-0000-000000000001"
+        ref-uuid #uuid "00000000-0000-0000-0000-000000000002"
+        entity {:db/id 1
+                :block/uuid block-uuid
+                :block/raw-title (str "See [[" ref-uuid "]] and #[[" ref-uuid "]]")
+                :block/refs [{:db/id 2 :block/uuid ref-uuid}]}
+        enriched (model/with-breadcrumb-ref-titles
+                  entity
+                  {ref-uuid "Referenced title"})
+        segment (model/block->breadcrumb-segment enriched)]
+    (is (= "See [[Referenced title]] and #[[Referenced title]]"
+           (:text segment)))))
+
+(deftest breadcrumb-nested-uuid-refs-resolve-test
+  (testing "[[uuid]] targets missing from :block/refs still resolve"
+    (let [ref-uuid #uuid "00000000-0000-0000-0000-000000000002"
+          entity {:db/id 1
+                  :block/uuid #uuid "00000000-0000-0000-0000-000000000001"
+                  :block/raw-title (str "[[[[" ref-uuid "]] bar]] nested")
+                  :block/refs []}
+          enriched (model/with-breadcrumb-ref-titles
+                    entity
+                    {ref-uuid "foo"})
+          segment (model/block->breadcrumb-segment enriched)]
+      (is (= "[[[[foo]] bar]] nested" (:text segment)))))
+
+  (testing "page segment titles resolve [[uuid]] refs"
+    (let [ref-uuid #uuid "00000000-0000-0000-0000-000000000002"
+          entity {:db/id 1
+                  :block/uuid #uuid "00000000-0000-0000-0000-000000000001"
+                  :block/name "nested page"
+                  :block/title (str "[[" ref-uuid "]] bar")
+                  :block/refs []}
+          enriched (model/with-breadcrumb-ref-titles
+                    entity
+                    {ref-uuid "foo"})
+          segment (model/block->breadcrumb-segment enriched)]
+      (is (= "[[foo]] bar" (:text segment)))
+      (is (= "[[foo]] bar" (:full-text segment))))))
+
 (deftest block->breadcrumb-segment-title-ref-ids-test
   (testing "returns uuid refs from the breadcrumb label line"
     (let [visible-uuid #uuid "00000000-0000-0000-0000-000000000002"
@@ -312,6 +353,32 @@
       (is (= :code (:type seg))))))
 
 ;; ---------------------------------------------------------------------------
+;; navigated-between-parents?
+;; ---------------------------------------------------------------------------
+
+(deftest navigated-between-parents-test
+  (let [initial-block {:db/id 2
+                       :block/uuid #uuid "00000000-0000-0000-0000-000000000002"
+                       :block/parent-id 1}
+        navigating-block #uuid "00000000-0000-0000-0000-000000000002"]
+    (testing "missing UI-db entity keeps the worker-pulled block list"
+      (is (false? (model/navigated-between-parents? initial-block navigating-block nil))))
+
+    (testing "same parent is not navigated"
+      (is (false? (model/navigated-between-parents?
+                   initial-block
+                   navigating-block
+                   {:db/id 2
+                    :block/parent-id 1}))))
+
+    (testing "different parent is navigated"
+      (is (true? (model/navigated-between-parents?
+                  initial-block
+                  navigating-block
+                  {:db/id 2
+                   :block/parent-id 3}))))))
+
+;; ---------------------------------------------------------------------------
 ;; segments->full-title
 ;; ---------------------------------------------------------------------------
 
@@ -366,6 +433,23 @@
       (is (false? (:overflow? result)))
       (is (= segs (:visible-prefix result)))))
 
+  (testing "the same root entity is rendered only once"
+    (let [[root parent] (make-segs 2)
+          result (model/build-breadcrumb-view [root root parent]
+                                              {:max-visible 4
+                                               :nearest-count 2
+                                               :show-page? true})]
+      (is (= [root parent] (:visible-prefix result)))))
+
+  (testing "different entities with the same title are preserved"
+    (let [[root parent] (make-segs 2)
+          parent (assoc parent :text (:text root))
+          result (model/build-breadcrumb-view [root parent]
+                                              {:max-visible 4
+                                               :nearest-count 2
+                                               :show-page? true})]
+      (is (= [root parent] (:visible-prefix result)))))
+
   (testing "5-segment path with max-visible 4: overflows"
     (let [segs (make-segs 5)
           result (model/build-breadcrumb-view segs {:max-visible 4 :nearest-count 2 :show-page? true})]
@@ -405,3 +489,18 @@
       (is (= 1 (count (:visible-prefix result))))
       (is (= 1 (count (:visible-suffix result))))
       (is (= 3 (count (:hidden result)))))))
+
+(deftest resource-ancestors-prefers-inline-payload-test
+  (testing "inline ancestors are used as-is, including an empty vector"
+    (let [breadcrumb-ancestors [{:block/uuid (random-uuid) :block/title "Parent"}]]
+      (is (= breadcrumb-ancestors
+             (model/resource-ancestors {:ancestors breadcrumb-ancestors
+                                         :ancestor-uuids [(random-uuid)]})))
+      (is (= []
+             (model/resource-ancestors {:ancestors []
+                                         :ancestor-uuids [(random-uuid)]})))))
+
+  (testing "legacy payloads fall back to UUID stubs"
+    (let [ancestor-uuid (random-uuid)]
+      (is (= [{:block/uuid ancestor-uuid}]
+             (model/resource-ancestors {:ancestor-uuids [ancestor-uuid]}))))))

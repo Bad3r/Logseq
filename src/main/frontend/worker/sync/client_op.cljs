@@ -296,11 +296,16 @@
     (sqlite-set-meta! store :local-tx 0)))
 
 (defn update-local-checksum
-  [repo checksum]
-  {:pre [(some? checksum)]}
+  "Stores the checksum together with the graph commit (:max-tx) it covers. The
+  checksum is written post-commit to the client-ops sqlite file, separate from
+  the graph store, so process death between the two writes leaves it stale; the
+  covered commit lets graph open detect that and recompute."
+  [repo checksum covered-tx]
+  {:pre [(some? checksum) (integer? covered-tx)]}
   (let [store (sqlite-store-or-throw repo)]
     (assert (some? store) repo)
-    (sqlite-set-meta! store :db-sync/checksum checksum)))
+    (sqlite-set-meta! store :db-sync/checksum checksum)
+    (sqlite-set-meta! store :db-sync/checksum-covered-tx covered-tx)))
 
 (defn get-pending-local-tx-count
   [repo]
@@ -329,6 +334,14 @@
   (let [store (sqlite-store-or-throw repo)]
     (assert (some? store) repo)
     (sqlite-get-meta store :db-sync/checksum)))
+
+(defn get-local-checksum-covered-tx
+  "The graph commit the stored checksum covers, nil when never recorded."
+  [repo]
+  (let [store (sqlite-store-or-throw repo)]
+    (assert (some? store) repo)
+    (some-> (sqlite-get-meta store :db-sync/checksum-covered-tx)
+            (js/parseInt 10))))
 
 (defn rtc-db-graph?
   "Is RTC enabled"
@@ -455,6 +468,25 @@
                             remote-t
                             now]))))))))
 
+(defn- sync-conflict-row->map
+  [row]
+  {:id (aget row "id")
+   :block-uuid (parse-uuid-str (aget row "block_uuid"))
+   :attr (str->qualified-kw (aget row "attr"))
+   :value (aget row "value")
+   :remote-t (aget row "remote_t")
+   :created-at (aget row "created_at")})
+
+(defn get-all-sync-conflicts
+  [repo]
+  (when-let [store (sqlite-store-or-throw repo)]
+    (->> (sqlite-rows store
+                      (str "select id, block_uuid, attr, value, remote_t, created_at "
+                           "from sync_conflicts order by created_at desc, id desc")
+                      [])
+         (map sync-conflict-row->map)
+         (group-by :block-uuid))))
+
 (defn get-sync-conflicts
   [repo block-uuid]
   (when (uuid? block-uuid)
@@ -464,13 +496,7 @@
                              "from sync_conflicts where block_uuid = ? "
                              "order by created_at desc, id desc")
                         [(str block-uuid)])
-           (mapv (fn [row]
-                   {:id (aget row "id")
-                    :block-uuid (parse-uuid-str (aget row "block_uuid"))
-                    :attr (str->qualified-kw (aget row "attr"))
-                    :value (aget row "value")
-                    :remote-t (aget row "remote_t")
-                    :created-at (aget row "created_at")}))))))
+           (mapv sync-conflict-row->map)))))
 
 (defn clear-sync-conflicts!
   [repo block-uuid]

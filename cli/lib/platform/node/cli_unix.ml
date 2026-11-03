@@ -5,6 +5,131 @@ type file_descr = int
 type stats = { st_size : int; st_mtime : float }
 type process_result = { status : int; stdout : string; stderr : string }
 type mkdir_result = Created | Already_exists
+type lifecycle_error = { code : string; message : string }
+
+module Lifecycle = struct
+  type start_options
+  type storage
+
+  external resolve_storage : string -> string -> storage = "resolveStorage"
+  [@@mel.module "@logseq/graph-lifecycle"]
+
+  let storage root = resolve_storage root (Filename.concat root "graphs")
+  type commit_result
+  type delete_result
+
+  external commit_result : ok:bool -> error:string -> unit -> commit_result = ""
+  [@@mel.obj]
+
+  external start_options :
+    ?generation:string ->
+    storage:storage ->
+    repo:string ->
+    script:string ->
+    owner:string ->
+    createEmpty:bool ->
+    unit ->
+    start_options = ""
+  [@@mel.obj]
+
+  external start : start_options -> Js.Json.t Js.Promise.t = "startGraph"
+  [@@mel.module "@logseq/graph-lifecycle"]
+
+  external stop : storage -> string -> string -> Js.Json.t Js.Promise.t
+    = "stopGraph"
+  [@@mel.module "@logseq/graph-lifecycle"]
+
+  external retire : storage -> string -> string -> Js.Json.t array Js.Promise.t
+    = "stopOutdatedWorkers"
+  [@@mel.module "@logseq/graph-lifecycle"]
+
+  let revision : string =
+    [%mel.raw
+      {|typeof LOGSEQ_CLI_REVISION !== "undefined" ? LOGSEQ_CLI_REVISION : "dev"|}]
+
+  external delete :
+    storage ->
+    string ->
+    (unit -> commit_result Js.Promise.t) ->
+    delete_result Js.Promise.t = "deleteGraph"
+  [@@mel.module "@logseq/graph-lifecycle"]
+
+  external create : storage -> string -> string Js.Promise.t = "createGraph"
+  [@@mel.module "@logseq/graph-lifecycle"]
+
+  external existed : delete_result -> bool = "existed" [@@mel.get]
+
+  external error_code : Js.Promise.error -> string option = "code"
+  [@@mel.get] [@@mel.return { undefined_to_opt }]
+
+  external error_message : Js.Promise.error -> string = "message" [@@mel.get]
+
+  let of_promise promise =
+    let task, resolver = Cli_effect.wait () in
+    ignore
+      (promise
+       |> Js.Promise.then_ (fun value ->
+           Cli_effect.wakeup resolver (Ok value);
+           Js.Promise.resolve ())
+       |> Js.Promise.catch (fun error ->
+           Cli_effect.wakeup resolver
+             (Error
+                {
+                  code =
+                    Option.value (error_code error)
+                      ~default:"server-stop-failed";
+                  message = error_message error;
+                });
+           Js.Promise.resolve ())
+        : unit Js.Promise.t);
+    task
+end
+
+let start_graph_runtime ~root_dir ~repo ~script ~owner_source ~create_empty_db
+    ~generation =
+  let storage = Lifecycle.storage root_dir in
+  Lifecycle.retire storage Lifecycle.revision repo
+  |> Js.Promise.then_ (fun _ ->
+      Lifecycle.start
+        (Lifecycle.start_options ?generation ~storage ~repo ~script
+           ~owner:owner_source ~createEmpty:create_empty_db ()))
+  |> Lifecycle.of_promise
+  |> Cli_effect.map (Result.map Js.Json.stringify)
+
+let stop_graph_runtime ~root_dir ~repo ~owner_source =
+  let storage = Lifecycle.storage root_dir in
+  Lifecycle.retire storage Lifecycle.revision repo
+  |> Js.Promise.then_ (fun retired ->
+      if Array.length retired > 0 then Js.Promise.resolve Js.Json.null
+      else Lifecycle.stop storage repo owner_source)
+  |> Lifecycle.of_promise
+  |> Cli_effect.map (Result.map (fun _ -> ()))
+
+let delete_graph ~root_dir ~repo ~on_removed =
+  let commit () =
+    Js.Promise.make (fun ~resolve ~reject:_ ->
+        Cli_effect.on_any (on_removed ())
+          (fun result ->
+            let value =
+              match result with
+              | Ok () -> Lifecycle.commit_result ~ok:true ~error:"" ()
+              | Error (err : lifecycle_error) ->
+                  Lifecycle.commit_result ~ok:false ~error:err.message ()
+            in
+            (resolve value [@u]))
+          (fun exn ->
+            (resolve
+               (Lifecycle.commit_result ~ok:false
+                  ~error:(Printexc.to_string exn) ()) [@u])))
+  in
+  let storage = Lifecycle.storage root_dir in
+  Lifecycle.retire storage Lifecycle.revision repo
+  |> Js.Promise.then_ (fun _ -> Lifecycle.delete storage repo commit)
+  |> Lifecycle.of_promise
+  |> Cli_effect.map (Result.map Lifecycle.existed)
+
+let create_graph ~root_dir ~repo =
+  Lifecycle.create (Lifecycle.storage root_dir) repo |> Lifecycle.of_promise
 
 exception Cli_unix_error of error * string * string
 
@@ -215,7 +340,7 @@ let chmod path perm = run_unit "chmod" path (fun () -> Fs.chmod_sync path perm)
 
 let access path permissions =
   let flag =
-    List.fold_left
+    Rrbvec.fold_left
       (fun acc -> function R_OK -> acc lor 4 | W_OK -> acc lor 2)
       0 permissions
   in
@@ -239,10 +364,16 @@ let openfile _path _flags _perm = 0
 let close _fd = ()
 
 let command_args argv =
-  match Array.to_list argv with
-  | "env" :: command :: args -> (command, args)
-  | command :: args -> (command, args)
-  | [] ->
+  let argv = Rrbvec.of_array argv in
+  match Rrbvec.pop_front argv with
+  | Some ("env", rest) -> (
+      match Rrbvec.pop_front rest with
+      | Some (command, args) -> (command, args)
+      | None ->
+          raise
+            (Cli_unix_error (EPERM, "create_process_env", "missing command")))
+  | Some (command, args) -> (command, args)
+  | None ->
       raise (Cli_unix_error (EPERM, "create_process_env", "missing command"))
 
 let copy_env env =
@@ -266,7 +397,7 @@ let stdio_ignore =
 
 let spawn_detached command args env =
   let child =
-    Child_process.spawn command (Array.of_list args)
+    Child_process.spawn command (Rrbvec.to_array args)
       (Child_process.spawn_options ~detached:true ~stdio:stdio_ignore
          ~env:(copy_env env) ~shell:false ())
   in
@@ -274,7 +405,8 @@ let spawn_detached command args env =
   Child_process.pid child |> Js.Nullable.toOption |> Option.value ~default:0
 
 let windows_verbatim_spawn_options env : Child_process.spawn_options =
-  let make : string Js.Dict.t -> Js.Json.t array -> Child_process.spawn_options =
+  let make : string Js.Dict.t -> Js.Json.t array -> Child_process.spawn_options
+      =
     [%mel.raw
       {|
 function (env, stdio) {
@@ -292,7 +424,7 @@ function (env, stdio) {
 
 let spawn_detached_windows_verbatim command args env =
   let child =
-    Child_process.spawn command (Array.of_list args)
+    Child_process.spawn command (Rrbvec.to_array args)
       (windows_verbatim_spawn_options env)
   in
   Child_process.unref child;
@@ -308,7 +440,7 @@ let nullable_string_default value =
 
 let run_process_capture command args env =
   let result =
-    Child_process.spawn_sync command (Array.of_list args)
+    Child_process.spawn_sync command (Rrbvec.to_array args)
       (Child_process.spawn_sync_options ~encoding:"utf8" ~env:(copy_env env)
          ~shell:false ())
   in
@@ -343,9 +475,21 @@ let contains_substring ~needle haystack =
   in
   loop 0
 
+let split_lines text =
+  let len = String.length text in
+  let rec loop start index acc =
+    if index = len then
+      Rrbvec.push_back acc (String.sub text start (index - start))
+    else if text.[index] = '\n' then
+      let acc = Rrbvec.push_back acc (String.sub text start (index - start)) in
+      loop (index + 1) (index + 1) acc
+    else loop start (index + 1) acc
+  in
+  loop 0 0 Rrbvec.empty
+
 let find_session_line text =
-  text |> String.split_on_char '\n'
-  |> List.find_opt (fun line ->
+  text |> split_lines
+  |> Rrbvec.find_opt (fun line ->
       let lower = String.lowercase_ascii line in
       contains_substring ~needle:"session" lower
       || contains_substring ~needle:"thread" lower)
@@ -360,7 +504,7 @@ let start_process_capture_session_line command args env =
   let stderr_fd = Fs.open_sync stderr_path "a" in
   let child =
     try
-      Child_process.spawn command (Array.of_list args)
+      Child_process.spawn command (Rrbvec.to_array args)
         (Child_process.spawn_options ~detached:true
            ~stdio:
              [|
@@ -426,9 +570,11 @@ let open_url url =
     let platform = Node.Process.process##platform in
     let command, args =
       match platform with
-      | "darwin" -> ("open", [ url ])
-      | "linux" -> ("xdg-open", [ url ])
-      | "win32" -> ("cmd.exe", [ "/d"; "/c"; windows_start_url_command url ])
+      | "darwin" -> ("open", Rrbvec.of_array [| url |])
+      | "linux" -> ("xdg-open", Rrbvec.of_array [| url |])
+      | "win32" ->
+          ( "cmd.exe",
+            Rrbvec.of_array [| "/d"; "/c"; windows_start_url_command url |] )
       | _ -> raise (Cli_unix_error (EPERM, "open", url))
     in
     ignore

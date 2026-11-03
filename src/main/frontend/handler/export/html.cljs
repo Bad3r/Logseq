@@ -4,8 +4,6 @@
             [clojure.edn :as edn]
             [clojure.string :as string]
             [clojure.zip :as z]
-            [frontend.db :as db]
-            [frontend.db.conn :as conn]
             [frontend.format.mldoc :as mldoc]
             [frontend.handler.export.common :as common]
             [frontend.handler.export.zip-helper :refer [get-level goto-last
@@ -14,7 +12,8 @@
             [hiccups.runtime :as h]
             [frontend.handler.export.common-impl :as common-impl :refer [*state*]]
             [frontend.handler.export.util :refer-macros [concatv mapcatv removev]]
-            [malli.core :as m]))
+            [malli.core :as m]
+            [promesa.core :as p]))
 
 (def ^:private hiccup-malli-schema
   [:cat :keyword [:* :any]])
@@ -88,16 +87,32 @@
   [inline-coll]
   [:a (str "#" (common/hashtag-value->string inline-coll))])
 
+(defn- image-markdown-link?
+  [full-text]
+  (boolean (and (string? full-text)
+                (string/starts-with? full-text "![")
+                (not (string/starts-with? full-text "![[")))))
+
+(defn- inline-label-text
+  [label]
+  (->> label
+       (keep (fn [inline]
+               (when (and (sequential? inline) (= "Plain" (first inline)))
+                 (second inline))))
+       (string/join)))
+
 (defn- inline-link
   [{:keys [url label full_text]}]
   (let [href (case (first url)
                "Search" (second url)
                "Complex" (str (:protocol (second url)) "://" (:link (second url)))
                nil)]
-    (cond-> [:a]
-      href (conj {:href href})
-      href (concatv (mapv inline-ast->hiccup label))
-      (not href) (conj full_text))))
+    (if (and href (image-markdown-link? full_text))
+      [:img {:src href :alt (inline-label-text label)}]
+      (cond-> [:a]
+        href (conj {:href href})
+        href (concatv (mapv inline-ast->hiccup label))
+        (not href) (conj full_text)))))
 
 (defn- inline-nested-link
   [{:keys [content]}]
@@ -375,7 +390,7 @@
 ;;; block/inline-ast -> hiccup (ends)
 
 ;;; export fns
-(defn- export-helper
+(defn export-helper
   [content format options]
   (let [remove-options (set (:remove-options options))
         other-options (:other-options options)]
@@ -421,19 +436,14 @@
   [repo root-block-uuids-or-page-uuid options]
   {:pre [(or (coll? root-block-uuids-or-page-uuid)
              (uuid? root-block-uuids-or-page-uuid))]}
-  (let [open-blocks-only? (boolean (get-in options [:other-options :open-blocks-only]))
-        content
-        (if (uuid? root-block-uuids-or-page-uuid)
-          ;; page
-          (common/get-page-content root-block-uuids-or-page-uuid
-                                   {:open-blocks-only? open-blocks-only?})
-          (common/root-block-uuids->content repo root-block-uuids-or-page-uuid
-                                            {:open-blocks-only? open-blocks-only?}))
-        first-block (and (coll? root-block-uuids-or-page-uuid)
-                         (db/entity [:block/uuid (first root-block-uuids-or-page-uuid)]))
-        format (get first-block :block/format :markdown)]
-    (binding [common-impl/*current-db* (conn/get-db repo)
-              common-impl/*content-config* (common/get-content-config)]
+  (let [remove-options (set (:remove-options options))
+        include-properties? (not (contains? remove-options :property))
+        open-blocks-only? (boolean (get-in options [:other-options :open-blocks-only]))]
+    (p/let [{:keys [content format]}
+            (common/<get-blocks-export-data repo
+                                            root-block-uuids-or-page-uuid
+                                            {:open-blocks-only? open-blocks-only?
+                                             :include-properties? include-properties?})]
       (export-helper content format options))))
 
 ;;; export fns (ends)

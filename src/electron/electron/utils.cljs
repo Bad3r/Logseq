@@ -2,11 +2,12 @@
   (:require ["electron" :refer [app BrowserWindow session]]
             ["fs-extra" :as fs]
             ["node-fetch" :default node-fetch]
-            ["open" :as open-external]
+            ["open" :as open-module]
             ["path" :as node-path]
             [cljs-bean.core :as bean]
             [clojure.string :as string]
             [electron.configs :as cfgs]
+            [electron.interop :as interop]
             [electron.logger :as logger]
             [logseq.common.config :as common-config]
             [logseq.common.graph :as common-graph]
@@ -26,6 +27,8 @@
 (defonce extract-zip (js/require "extract-zip"))
 (defonce https-proxy-agent (js/require "https-proxy-agent"))
 (defonce socks-proxy-agent (js/require "socks-proxy-agent"))
+(defonce open-external
+  (interop/default-function-or-module open-module))
 
 (declare <resolve-fetch-proxy)
 
@@ -309,13 +312,14 @@
      (send-to-renderer win kind payload))))
 
 (defn get-graph-dir
-  "required by all internal state in the electron section"
+  "Resolve a trimmed DB graph name to its directory for Electron state."
   [graph-name]
-  (when (and (string? graph-name)
-             (string/starts-with? graph-name common-config/db-version-prefix))
-    (let [repo (common-config/canonicalize-db-version-repo graph-name)]
-      (node-path/join (common-graph/get-db-graphs-dir)
-                      (graph-dir/repo->encoded-graph-dir-name repo)))))
+  (when (string? graph-name)
+    (let [trimmed (string/trim graph-name)]
+      (when (string/starts-with? trimmed common-config/db-version-prefix)
+        (when-let [repo (common-config/canonicalize-db-version-repo trimmed)]
+          (node-path/join (common-graph/get-db-graphs-dir)
+                          (graph-dir/repo->encoded-graph-dir-name repo)))))))
 
 (comment
   (defn get-graph-name
@@ -350,5 +354,6 @@
   [path]
   (let [stat (fs/statSync path)]
     {:size (.-size stat)
+     :birthtime (.-birthtime stat)
      :mtime (.-mtime stat)
      :ctime (.-ctime stat)}))

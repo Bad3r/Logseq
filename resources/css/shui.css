@@ -31,7 +31,11 @@ html[data-theme=dark] {
 }
 
 html {
-  div[data-radix-menu-content],
+  .ui__dropdown-menu-content,
+  .ui__dropdown-menu-sub-content,
+  .ui__context-menu-content,
+  .ui__context-menu-sub-content,
+  .ui__popover-content,
   .ui__select-content {
     --accent: var(--rx-gray-04-hsl);
     --accent-foreground: var(--rx-gray-12-hsl);
@@ -165,7 +169,11 @@ html[data-theme=dark] {
       }
     }
 
-    div[data-radix-menu-content],
+    .ui__dropdown-menu-content,
+    .ui__dropdown-menu-sub-content,
+    .ui__context-menu-content,
+    .ui__context-menu-sub-content,
+    .ui__popover-content,
     .ui__select-content {
       --accent: 190 100% 15%;
       --muted: 192 100% 13%;
@@ -250,7 +258,11 @@ div[data-radix-popper-content-wrapper] {
 }
 
 .ui__dialog-content {
-  @apply outline-none m-4;
+  @apply outline-none m-0;
+
+  &:not([data-auto-width]) {
+    width: calc(100% - 2rem);
+  }
 
   &[data-auto-width] {
     @apply max-w-[90vw] w-max sm:max-w-[960px];
@@ -459,6 +471,11 @@ kbd.shui-shortcut-key-pressed,
   background-color: var(--lx-accent-08-alpha, var(--color-level-4));
 }
 
+.ui__select-content,
+.ui__select-item {
+  -webkit-app-region: no-drag;
+}
+
 .ui__dropdown-menu-content, div[data-radix-menu-content],
 .ui__select-content {
   @apply overflow-y-auto;
@@ -513,81 +530,44 @@ kbd.shui-shortcut-key-pressed,
 }
 
 .ui__calendar {
-  .rdp-caption_dropdowns {
-    @apply flex items-center justify-center relative rounded opacity-80;
-
-    .rdp-vhidden {
-      @apply hidden;
-    }
-
-    .rdp-dropdown_month,
-    .rdp-dropdown_year {
-      @apply relative pr-3 mr-3;
-
-      select {
-        @apply absolute px-2 py-0 border left-0 z-[2] opacity-0 bg-none;
-      }
-
-      > .text-sm {
-        @apply w-full z-[1];
-
-        svg {
-          @apply absolute right-0 top-[6px];
-        }
-      }
-    }
-
-    .rdp-dropdown_month {
-      @apply ml-4;
-    }
-
-    & + div {
-      @apply absolute -right-1 flex gap-2;
-
-      button[name=previous-month] {
-        @apply relative;
-        svg {
-          width: 14px;
-          height: 14px;
-        }
-      }
-
-      button[name=next-month] {
-        @apply relative;
-        svg {
-            width: 14px;
-            height: 14px;
-        }
-      }
-    }
-  }
-
-  .rdp-caption_start {
-    > div {
-      @apply justify-start;
-    }
-  }
-
   .del-date-btn {
-    @apply absolute right-[4px] top-[17px] px-1 opacity-70 hover:opacity-100
-    active:opacity-80 hover:text-red-rx-09 rounded-md !h-6 !w-6;
+    @apply active:opacity-80 hover:text-red-rx-09;
   }
 
-  &.has-del-btn {
-    .rdp-caption_dropdowns {
-      & + div {
-        @apply right-5;
-      }
-    }
+  /* Day highlight must win over ghost-button focus rings. */
+  [role="gridcell"] > button:focus,
+  [role="gridcell"] > button:focus-visible {
+    box-shadow: none;
+    outline: none;
+    --tw-ring-offset-width: 0px;
+    --tw-ring-shadow: 0 0 #0000;
+  }
+
+  [role="gridcell"][data-today="true"] > button {
+    background-color: hsl(var(--accent));
+    color: hsl(var(--accent-foreground));
+  }
+
+  [role="gridcell"][data-selected="true"] > button,
+  [role="gridcell"][data-focused="true"] > button,
+  [role="gridcell"][data-selected="true"] > button:hover,
+  [role="gridcell"][data-selected="true"] > button:focus,
+  [role="gridcell"][data-selected="true"] > button:focus-visible,
+  [role="gridcell"][data-focused="true"] > button:hover,
+  [role="gridcell"][data-focused="true"] > button:focus,
+  [role="gridcell"][data-focused="true"] > button:focus-visible {
+    background-color: hsl(var(--primary));
+    color: hsl(var(--primary-foreground));
   }
 
   input[type=number] {
-    appearance: initial;
-  }
+    appearance: textfield;
+    -moz-appearance: textfield;
 
-  .rdp-button {
-    &[name=previous-month], &[name=next-month] {
-      @apply !h-6 !w-6;
+    &::-webkit-inner-spin-button,
+    &::-webkit-outer-spin-button {
+      appearance: none;
+      margin: 0;
     }
   }
 }
@@ -602,5 +582,29 @@ kbd.shui-shortcut-key-pressed,
   .popper-arrow {
     /* FIXME: set the best color for different themes */
     fill: none;
+  }
+}
+
+.ui__toaster-viewport:has(.ls-wrap-widen) {
+  width: min(680px, calc(100vw - 2rem));
+}
+
+.ui__toast-content {
+  &.untitled {
+    .ui__toast-header {
+      @apply absolute top-1 right-1 w-fit z-1;
+    }
+
+    .ui__toast-body {
+      @apply min-h-0 flex-1 overflow-y-auto overscroll-contain py-2;
+    }
+
+    .ui__toast-text {
+      @apply flex min-h-0 min-w-0 flex-1 flex-row items-start gap-2 overflow-y-auto overscroll-contain;
+    }
+
+    .ui__toast-description {
+      @apply max-h-full max-w-full min-h-0 min-w-0 flex-1 overflow-auto overscroll-contain select-text;
+    }
   }
 }

@@ -1,7 +1,7 @@
 {
   "name": "Logseq",
   "productName": "Logseq",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "packageManager": "pnpm@10.33.0",
   "main": "electron.js",
   "author": "Logseq",
@@ -22,6 +22,7 @@
     "postinstall": "install-app-deps"
   },
   "dependencies": {
+    "@logseq/graph-lifecycle": "file:../deps/graph-lifecycle",
     "@fastify/cors": "11.2.0",
     "@js-joda/core": "3.2.0",
     "@modelcontextprotocol/sdk": "^1.27.1",
@@ -51,16 +52,16 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "electron": "42.3.0",
-    "electron-builder": "26.8.2",
+    "electron": "42.11.16",
+    "electron-builder": "26.17.0",
     "electron-devtools-installer": "4.0.0"
   },
   "optionalDependencies": {
-    "@zvec/bindings-darwin-arm64": "0.4.0",
-    "@zvec/bindings-linux-arm64": "0.4.0",
-    "@zvec/bindings-linux-x64": "0.4.0",
-    "@zvec/bindings-win32-x64": "0.4.0",
-    "@zvec/zvec": "0.4.0"
+    "@zvec/bindings-darwin-arm64": "0.5.0",
+    "@zvec/bindings-linux-arm64": "0.5.0",
+    "@zvec/bindings-linux-x64": "0.5.0",
+    "@zvec/bindings-win32-x64": "0.5.0",
+    "@zvec/zvec": "0.5.0"
   },
   "resolutions": {
     "node-abi": "4.28.0"

@@ -3,9 +3,10 @@
   (:require ["@emoji-mart/data" :as emoji-data]
             ["emoji-mart" :as emoji-mart]
             ["react-intersection-observer" :as react-intersection-observer]
+            ["react" :as react]
             ["@sentry/react" :refer [ErrorBoundary]]
             ["react-textarea-autosize" :as TextareaAutosize]
-            ["react-transition-group" :refer [CSSTransition TransitionGroup]]
+            ["react-transition-group" :refer [CSSTransition]]
             ["react-virtuoso" :refer [Virtuoso VirtuosoGrid]]
             [cljs-bean.core :as bean]
             [clojure.string :as string]
@@ -20,6 +21,7 @@
             [frontend.modules.shortcut.core :as shortcut]
             [frontend.modules.shortcut.data-helper :as shortcut-dh]
             [frontend.modules.shortcut.utils :as shortcut-utils]
+            [frontend.rfx :as rfx]
             [frontend.state :as state]
             [frontend.storage :as storage]
             [frontend.util :as util]
@@ -67,13 +69,10 @@
 
 (defn- react-element
   [component opts children]
-  (apply js/React.createElement component (normalize-react-props opts) (react-children children)))
-
-(defn transition-group [opts & children]
-  (react-element TransitionGroup opts children))
+  (apply react/createElement component (normalize-react-props opts) (react-children children)))
 
 (defn css-transition [opts & children]
-  (let [node-ref (or (:node-ref opts) (js/React.createRef))
+  (let [node-ref (or (:node-ref opts) (react/createRef))
         opts (assoc opts :nodeRef node-ref)
         children (map (fn [child]
                         (if (fn? child)
@@ -85,8 +84,29 @@
 
 (defonce textarea-autosize (gobj/get TextareaAutosize "default"))
 
-(hsx/defc textarea [opts & children]
-  (into [:> textarea-autosize opts] children))
+(defonce ^:private field-sizing-supported?
+  (boolean
+   (and (exists? js/CSS)
+        (.supports js/CSS "field-sizing" "content"))))
+
+(hsx/defc textarea
+  "A textarea whose height follows its content. Where the browser supports the
+   CSS `field-sizing: content` (Chromium 123, Safari 26.2, Firefox 152) this is
+   a plain textarea and no JavaScript measures it on any keystroke; `:minRows`
+   becomes a `min-height` in line-height units. Elsewhere it is the
+   react-textarea-autosize component as before, with its `:cacheMeasurements`
+   prop passed through."
+  [{:keys [minRows] :as opts} & children]
+  (if field-sizing-supported?
+    (let [opts (-> opts
+                   (dissoc :minRows :maxRows :cacheMeasurements :onHeightChange)
+                   ;; `rows` has no effect under field-sizing: content, so the
+                   ;; minimum is a min-height in line-height units.
+                   (update :style assoc
+                           :field-sizing "content"
+                           :min-height (str (or minRows 1) "lh")))]
+      (into [:textarea opts] children))
+    (into [:> textarea-autosize opts] children)))
 
 (hsx/defc virtualized-list [opts & children]
   (into [:> Virtuoso opts] children))
@@ -107,7 +127,7 @@
 
 (defn dropdown-exists?
   []
-  (some? (js/document.querySelector "[data-radix-popper-content-wrapper]")))
+  (some? (js/document.querySelector ".ui__popover-content, .ui__dropdown-menu-content, .ui__context-menu-content")))
 
 (defn last-shui-preview-popup?
   []
@@ -151,6 +171,7 @@
        (for [color built-in-colors]
          [:a
           {:key (str "key-" color)
+           :class "inline-flex items-center justify-center w-[30px] h-[30px]"
            :title (t (keyword "color" color))
            :on-click #(add-bgcolor-fn color)}
           [:div.heading-bg {:style {:background-color (str "var(--color-" color "-500)")
@@ -158,6 +179,7 @@
                                                   active-ring)}}]])
        [:a
         {:title (t :ui/remove-background)
+         :class "inline-flex items-center justify-center w-[30px] h-[30px]"
          :on-click rm-bgcolor-fn}
         [:div.heading-bg.remove {:style {:box-shadow (when (and known-color? (nil? current-color))
                                                        active-ring)}} "-"]]]])))
@@ -165,7 +187,7 @@
 (hsx/defc ls-textarea
   [{:keys [on-change] :as props}]
   (let [*el (hooks/use-ref nil)
-        skip-composition? (state/use-sub :editor/action)
+        skip-composition? (rfx/use-sub [:editor/action])
         on-composition (fn [e]
                          (if skip-composition?
                            (on-change e)
@@ -308,97 +330,14 @@
      (when shortcut
        [:span.ml-1 (render-keyboard-shortcut shortcut)])]))
 
-(declare button)
-(hsx/defc notification-content
-  [state content status uid node-ref]
-  (when (and content status)
-    (let [svg
-          (if (keyword? status)
-            (case status
-              :success
-              (icon "circle-check" {:class "text-success" :size "20"})
-
-              :warning
-              (icon "alert-circle" {:class "text-warning" :size "20"})
-
-              :error
-              (icon "circle-x" {:class "text-error" :size "20"})
-
-              (icon "info-circle" {:class "text-indigo-500" :size "20"}))
-            status)]
-      [:div.ui__notifications-content
-       {:class (str "notification-" (name (or (when (keyword? status) status) :info)))
-        :ref node-ref
-        :style
-        (when (or (= state "exiting")
-                  (= state "exited"))
-          {:z-index -1})}
-       [:div.max-w-sm.w-full.shadow-lg.rounded-lg.pointer-events-none.notification-area
-        {:class (case state
-                  "entering" "transition ease-out duration-300 transform opacity-0 translate-y-2 sm:translate-x-0"
-                  "entered" "transition ease-out duration-300 transform translate-y-0 opacity-100 sm:translate-x-0"
-                  "exiting" "transition ease-in duration-100 opacity-100"
-                  "exited" "transition ease-in duration-100 opacity-0")}
-        [:div.rounded-lg.shadow-xs {:style {:max-height "calc(100vh - 200px)"
-                                            :overflow-y "auto"
-                                            :overflow-x "hidden"}}
-         [:div.p-4
-          [:div.flex.items-start
-           [:div.flex-shrink-0.pt-2
-            svg]
-           [:div.ml-3.w-0.flex-1.pt-2.pointer-events-auto
-
-            [:div.text-sm.leading-5.font-medium.whitespace-pre-line {:style {:margin 0}}
-             (if (keyword? content) (name content) content)]]
-           (when-not (contains? #{"exiting" "exited"} state)
-             [:div.flex-shrink-0.flex.pointer-events-auto {:style {:margin-top -9
-                                                                    :margin-right -18}}
-              (button
-               {:button-props {"aria-label" (t :ui/close)}
-                :variant :ghost
-                :class "hover:bg-transparent hover:text-foreground scale-90"
-                :on-click (fn []
-                            (notification/clear! uid))
-                :icon "x"})])]]]]])))
-
-(hsx/defc notification-clear-all
-  [node-ref]
-  [:div.ui__notifications-content
-   {:ref node-ref}
-   [:div.pointer-events-auto.notification-clear
-    (button (t :notification/clear-all)
-            :intent "logseq"
-            :on-click (fn []
-                        (notification/clear-all!)))]])
-
-(hsx/defc notification
-  []
-  (let [contents (state/use-sub :notification/contents)]
-    (transition-group
-     {:class-name "notifications ui__notifications"}
-     (let [notifications (map (fn [el]
-                                (let [k (first el)
-                                      v (second el)]
-                                  (css-transition
-                                   {:timeout 100
-                                    :key     (name k)}
-                                   (fn [state node-ref]
-                                     (notification-content state (:content v) (:status v) k node-ref)))))
-                              contents)
-           clear-all (when (> (count contents) 1)
-                       (css-transition
-                        {:timeout 100
-                         :key     "clear-all"}
-                        (fn [_state node-ref]
-                          (notification-clear-all node-ref))))
-           items (if clear-all (cons clear-all notifications) notifications)]
-       (doall items)))))
-
 (defn checkbox
   [option]
   (let [on-change' (:on-change option)
         on-click' (:on-click option)
         option (cond-> (dissoc option :on-change :on-click)
+                 (and on-click' (nil? on-change'))
+                 (assoc :data-inputless true)
+
                  (or on-change' on-click')
                  (assoc :on-click
                         (fn [^js e]
@@ -538,23 +477,25 @@
         render-f (fn [matched]
                    (for [[idx item] matched]
                      (let [react-key (str idx)
+                           choose! (fn [e]
+                                     (util/stop e)
+                                     (when-not (:disabled? item)
+                                       (if (and (gobj/get e "shiftKey") on-shift-chosen)
+                                         (on-shift-chosen item)
+                                         (on-chosen item e))))
                            item-cp
                            [:div.menu-link-wrap
                             {:key react-key
                              ;; mouse-move event to indicate that cursor moved by user
-                             :on-mouse-move  #(reset! *current-idx idx)}
+                             :on-mouse-move  #(reset! *current-idx idx)
+                             :on-click choose!}
                             (let [chosen? (= current-idx idx)]
                               (menu-link
                                {:id (str "ac-" react-key)
                                 :tab-index "0"
                                 :class (when chosen? "chosen")
                                 :on-mouse-down util/stop
-                                :on-click (fn [e]
-                                            (util/stop e)
-                                            (when-not (:disabled? item)
-                                              (if (and (gobj/get e "shiftKey") on-shift-chosen)
-                                                (on-shift-chosen item)
-                                                (on-chosen item e))))}
+                                :on-click choose!}
                                (if item-render (item-render item chosen?) item)))]
                            group-name (and (fn? get-group-name) (get-group-name item))]
                        (if (and group-name (not (contains? @*groups group-name)))
@@ -585,18 +526,10 @@
 (defn toggle
   ([on? on-click] (toggle on? on-click false))
   ([on? on-click small?]
-   [:a.ui__toggle {:on-click on-click
-                   :class (if small? "is-small" "")
-                   :tab-index "0"
-                   :on-key-down (fn [e] (when (and e (= (.-key e) "Enter"))
-                                          (util/stop e)
-                                          (on-click e)))}
-    [:span.wrapper.transition-colors.ease-in-out.duration-200
-     {:aria-checked (if on? "true" "false"), :tab-index "0", :role "checkbox"
-      :class        (if on? "ui__toggle-background-on" "ui__toggle-background-off")}
-     [:span.switcher.transform.transition.ease-in-out.duration-200
-      {:class       (if on? (if small? "translate-x-4" "translate-x-5") "translate-x-0")
-       :aria-hidden "true"}]]]))
+   (shui/switch
+    (cond-> {:checked (boolean on?)
+             :on-click on-click}
+      small? (assoc :size "sm")))))
 
 (defn keyboard-shortcut-from-config [shortcut-name & {:keys [pick-first?]}]
   (let [binding (shortcut-dh/shortcut-binding shortcut-name)]
@@ -761,7 +694,7 @@
    [:div.flex.justify-between.items-center.px-1
     [:h5.text-error.pb-1 title]
     [:a.text-xs.opacity-50.hover:opacity-80
-     {:href "https://github.com/logseq/logseq/issues/new?labels=from:in-app&template=bug_report.yaml"
+     {:href "https://github.com/logseq/db-test/issues/new?labels=from:in-app&template=bug_report.yaml"
       :target "_blank"} (t :bug-report.issue/report-link)]]
    (when content [:pre.m-0.text-sm (str content)])])
 
@@ -839,7 +772,7 @@
 
 (hsx/defc tweet-embed
   [id]
-  (let [theme (state/use-sub :ui/theme)]
+  (let [theme (rfx/use-sub [:ui/theme])]
     [:iframe
      {:class "tweet-embed"
       :src (str "https://platform.twitter.com/embed/Tweet.html?id=" id
@@ -904,9 +837,10 @@
            (dissoc opts :style :class))]))
 
 (hsx/defc with-shortcut
-  [shortcut-key _position content & [title]]
-  (let [shortcut-tooltip? (state/use-sub :ui/shortcut-tooltip?)
-        config            (state/use-sub-config)
+  [shortcut-key position content & [title tooltip-opts]]
+  (let [shortcut-tooltip? (rfx/use-sub [:ui/shortcut-tooltip?])
+        config            (state/config-for-repo (rfx/use-sub [:config])
+                                                 (state/get-current-repo))
         enabled-tooltip?  (if (state/mobile?)
                             false
                             (get config :ui/enable-tooltip? true))
@@ -920,7 +854,9 @@
                   (when first-binding
                     (shui/shortcut first-binding {:glow? false}))]
                  (keyboard-shortcut-from-config shortcut-key))
-               {:trigger-props {:as-child true}})
+               {:trigger-props (merge {:as-child true}
+                                      (:trigger-props tooltip-opts))
+                :content-props {:side position}})
       content)))
 
 (hsx/defc progress-bar
@@ -984,34 +920,52 @@
   ([add-heading-fn auto-heading-fn rm-heading-fn]
    (menu-heading nil add-heading-fn auto-heading-fn rm-heading-fn))
   ([heading add-heading-fn auto-heading-fn rm-heading-fn]
-   [:div.flex.flex-row.justify-between.pb-2.pt-1.px-2.items-center
-    [:div.flex.flex-row.justify-between.flex-1.px-1
-     (for [i (range 1 7)]
-       ^{:key (str "key-h-" i)}
-       [button
+   (let [font-icon-props {:font? true
+                          :style {:align-items "center"
+                                  :display "inline-flex"
+                                  :font-size 18
+                                  :height 18
+                                  :justify-content "center"
+                                  :line-height 1
+                                  :width 18}}
+         heading-button-style {:box-sizing "border-box"
+                               :height 30
+                               :padding 0
+                               :width 30}]
+     [:div.flex.flex-row.justify-between.pb-2.pt-1.px-2.items-center
+      [:div.flex.flex-row.items-center.justify-between.flex-1.mx-2
+       (for [i (range 1 7)]
+         ^{:key (str "key-h-" i)}
+         [button
+          ""
+          :icon (str "h-" i)
+          :title (t :editor/heading i)
+          :class (util/classnames ["to-heading-button" {:is-active (= heading i)}])
+          :icon-props font-icon-props
+          :on-click #(add-heading-fn i)
+          :style heading-button-style
+          :variant (when-not (= heading i) :ghost)
+          :size :icon])
+       (button
         ""
-        :icon (str "h-" i)
-        :title (t :editor/heading i)
-        :class (util/classnames ["to-heading-button" {:is-active (= heading i)}])
-        :on-click #(add-heading-fn i)
-        :variant (when-not (= heading i) :ghost)
-        :small? true])
-     (button
-      ""
-      :icon "h-auto"
-      :class (util/classnames ["to-heading-button" {:is-active (true? heading)}])
-      :title (t :editor/auto-heading)
-      :on-click auto-heading-fn
-      :variant (when-not (true? heading) :ghost)
-      :small? true)
-     (button
-      ""
-      :icon "heading-off"
-      :class (util/classnames ["to-heading-button" {:is-active (false? heading)}])
-      :title (t :editor/remove-heading)
-      :on-click rm-heading-fn
-      :variant (when-not (false? heading) :ghost)
-      :small? true)]]))
+        :icon "h-auto"
+        :class (util/classnames ["to-heading-button" {:is-active (true? heading)}])
+        :title (t :editor/auto-heading)
+        :icon-props {:extension? true}
+        :on-click auto-heading-fn
+        :style heading-button-style
+        :variant (when-not (true? heading) :ghost)
+        :size :icon)
+       (button
+        ""
+        :icon "heading-off"
+        :class "to-heading-button"
+        :title (t :editor/remove-heading)
+        :icon-props {:extension? true}
+        :on-click rm-heading-fn
+        :style heading-button-style
+        :variant :ghost
+        :size :icon)]])))
 
 (hsx/defc tooltip
   [trigger tooltip-content & {:keys [portal? root-props trigger-props content-props]}]
@@ -1023,10 +977,41 @@
                     (shui/tooltip-content content-props tooltip-content))
                    (shui/tooltip-content content-props tooltip-content)))))
 
+(def ^:private date-picker-root-selector
+  ".ls-editor-date-picker, .ls-property-date-picker")
+
+(def ^:private date-picker-form-control-selector
+  "input, textarea, select, [contenteditable='true']")
+
+(defn date-picker-form-target?
+  "True when Enter should stay in a date-picker form control instead of confirming the date."
+  [^js e]
+  (let [target (.-target e)]
+    (boolean
+     (and target
+          (.closest target date-picker-root-selector)
+          (or (.closest target date-picker-form-control-selector)
+              (some-> target
+                      (.closest "[role='combobox']")
+                      (.getAttribute "aria-expanded")
+                      (= "true"))
+              (and (.closest target "button")
+                   (not (.closest target "[role='gridcell']"))))))))
+
 (hsx/defc DelDateButton
   [on-delete]
-  (shui/button {:variant :outline :size :sm :class "del-date-btn" :on-click on-delete}
-               (shui/tabler-icon "trash" {:size 15})))
+  (shui/button {:variant :outline
+                :class "del-date-btn h-8 w-9 bg-transparent !p-0 !px-0 !py-0 opacity-80 hover:opacity-100"
+                :on-click on-delete}
+               (shui/tabler-icon "trash" {:size 16})))
+
+(defn- next-month-button-with-del
+  "The next-month nav button followed by the delete button, both compact items
+   in the calendar's nav row."
+  [^js props on-delete]
+  (react/createElement react/Fragment nil
+                       (react/createElement "button" props)
+                       (DelDateButton on-delete)))
 
 (defonce month-values
   [:January :February :March :April :May
@@ -1072,24 +1057,25 @@
          :on-blur (fn [_]
                     (when-not (re-matches #"\d{4}" year-value)
                       (set-year-value! (str value))))
-         :class "h-8 ml-2 !w-[5.75rem] !px-3 !py-0"
+         :class "ls-date-year-input h-8 !w-[3.25rem] !px-2 !py-0"
          :value year-value
          :type "number"
          :min 1
          :max 9999})
 
        (shui/dropdown-menu
-        (shui/dropdown-menu-trigger
-         {:as-child true}
-         (shui/button {:variant :ghost
-                       :class "!px-3 !py-0 h-8 !w-32 justify-start border border-input rounded-md"
-                       :size :sm}
-                      (get-month-label value)))
+                (shui/dropdown-menu-trigger
+                 {:as-child true}
+                 (shui/button {:variant :ghost
+                               :class "ls-date-month-select !px-3 !py-0 h-8 !w-24 justify-start border border-input rounded-md"
+                               :size :sm}
+                              (get-month-label value)))
         (shui/dropdown-menu-content
          (for [[idx _month] (medley/indexed month-values)
                :let [label (get-month-label idx)]]
-           (shui/dropdown-menu-checkbox-item
-            {:checked (= value idx)
+           (shui/dropdown-menu-item
+            {:key idx
+             :class "ls-date-month-option"
              :on-select (fn []
                           (onChange (day-picker-change-event idx)))}
             label)))))]))
@@ -1106,8 +1092,11 @@
      :formatters {:formatWeekdayName (fn [weekday _]
                                        (i18n/locale-format-date weekday {:weekday "short"}))}
      :components (cond-> {:Dropdown #(date-year-month-select (bean/bean %))}
-                   del-btn? (assoc :Head #(DelDateButton on-delete)))
-     :class-names {:root (when del-btn? "has-del-btn")}
+                   del-btn? (assoc :NextMonthButton #(next-month-button-with-del % on-delete)))
+     :class-names (when del-btn?
+                    ;; three h-8 w-9 nav buttons + gap-1 need 116px inside the 276px caption
+                    {:root "has-del-btn"
+                     :nav "absolute left-[160px] top-1 z-10 flex items-center gap-1"})
      :on-day-key-down (fn [^js d _ ^js e]
                         (when (= "Enter" (.-key e))
                           (let [on-select' (or on-select on-day-click)]
@@ -1195,7 +1184,7 @@
         (set! (.. el -style -backgroundImage)
               (util/format "conic-gradient(var(--ls-pie-fg-color) %s%, var(--ls-pie-bg-color) %s%)" percentage percentage)))
      [percentage])
-    [:span.cp__file-sync-indicator-progress-pie {:ref *el}]))
+    [:span.cp__rtc-sync-indicator-progress-pie {:ref *el}]))
 
 (comment
   (hsx/defc emoji-picker

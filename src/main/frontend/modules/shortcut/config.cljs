@@ -9,6 +9,8 @@
             [frontend.handler.config :as config-handler]
             [frontend.handler.comments :as comments-handler]
             [frontend.handler.editor :as editor-handler]
+            [frontend.handler.editor.format :as editor-format]
+            [frontend.handler.editor.quick-add :as editor-quick-add]
             [frontend.handler.export :as export-handler]
             [frontend.handler.history :as history]
             [frontend.handler.journal :as journal-handler]
@@ -117,16 +119,16 @@
                                              :fn      editor-handler/open-link-in-sidebar!}
 
    :editor/bold                             {:binding "mod+b"
-                                             :fn      editor-handler/bold-format!}
+                                             :fn      editor-format/bold-format!}
 
    :editor/italics                          {:binding "mod+i"
-                                             :fn      editor-handler/italics-format!}
+                                             :fn      editor-format/italics-format!}
 
    :editor/highlight                        {:binding "mod+shift+h"
-                                             :fn      editor-handler/highlight-format!}
+                                             :fn      editor-format/highlight-format!}
 
    :editor/strike-through                   {:binding "mod+shift+s"
-                                             :fn      editor-handler/strike-through-format!}
+                                             :fn      editor-format/strike-through-format!}
 
    :editor/clear-block                      {:binding (if mac? "ctrl+l" "alt+l")
                                              :fn      editor-handler/clear-block-content!}
@@ -239,7 +241,7 @@
                                              :fn      history/redo!}
 
    :editor/insert-link                      {:binding "mod+l"
-                                             :fn      #(editor-handler/html-link-format!)}
+                                             :fn      #(editor-format/html-link-format!)}
 
    :editor/select-all-blocks                {:binding "mod+shift+a"
                                              :fn      editor-handler/select-all-blocks!}
@@ -259,6 +261,7 @@
    :editor/add-property                     {:binding (if mac? "mod+p" "ctrl+alt+p")
                                              :fn      (fn [e]
                                                         (when e (util/stop e))
+                                                        (state/pub-event! [:editor/hide-action-bar])
                                                         (state/pub-event! [:editor/new-property {}]))}
    :editor/set-tags                         {:binding "p t"
                                              :selection? true
@@ -268,17 +271,17 @@
    :editor/add-property-deadline            {:binding "p d"
                                              :selection? true
                                              :fn      (fn []
-                                                        (state/pub-event! [:editor/new-property {:property-key "Deadline"}]))}
+                                                        (state/pub-event! [:editor/new-property {:property-key :logseq.property/deadline}]))}
 
    :editor/add-property-status              {:binding "p s"
                                              :selection? true
                                              :fn      (fn []
-                                                        (state/pub-event! [:editor/new-property {:property-key "Status"}]))}
+                                                        (state/pub-event! [:editor/new-property {:property-key :logseq.property/status}]))}
 
    :editor/add-property-priority            {:binding "p p"
                                              :selection? true
                                              :fn      (fn []
-                                                        (state/pub-event! [:editor/new-property {:property-key "Priority"}]))}
+                                                        (state/pub-event! [:editor/new-property {:property-key :logseq.property/priority}]))}
 
    :editor/add-property-icon                {:binding "p i"
                                              :selection? true
@@ -442,7 +445,7 @@
 
    :editor/quick-add                        {:binding (if mac? "mod+e" "mod+alt+e")
                                              :inactive config/publishing?
-                                             :fn      editor-handler/quick-add}
+                                             :fn      editor-quick-add/quick-add}
    :editor/jump                             {:binding "mod+j"
                                              :fn      jump-handler/jump-to}
 
@@ -691,6 +694,7 @@
           :search/re-index
           :graph/db-save
           :sidebar/open-today-page
+          :ui/toggle-contents
           :sidebar/clear
           :shell/run
           :publish/open-dialog
@@ -718,7 +722,6 @@
           :ui/toggle-left-sidebar
           :ui/toggle-help
           :ui/toggle-theme
-          :ui/toggle-contents
           :editor/copy-page-url
           :editor/set-tags
           :editor/add-property-deadline

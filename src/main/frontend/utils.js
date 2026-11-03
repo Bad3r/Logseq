@@ -189,7 +189,7 @@ const inputTypes = [
   window.HTMLTextAreaElement,
 ]
 
-export const triggerInputChange = (node, value = '', name = 'change') => {
+export const triggerInputChange = (node, value = '', caretPosition) => {
 
   // only process the change on elements we know have a value setter in their constructor
   if (inputTypes.indexOf(node.__proto__.constructor) > -1) {
@@ -200,6 +200,9 @@ export const triggerInputChange = (node, value = '', name = 'change') => {
     })
 
     setValue.call(node, value)
+    if (Number.isInteger(caretPosition)) {
+      node.setSelectionRange(caretPosition, caretPosition)
+    }
     node.dispatchEvent(event)
   }
 }
@@ -278,13 +281,11 @@ export const writeClipboard = ({text, html, blocks}, ownerWindow) => {
   copiedBlocksMemoryCache.text = text
   copiedBlocksMemoryCache.blocks = blocks || null
 
-  navigator.permissions.query({
-    name: "clipboard-write"
-  }).then((result) => {
-    if (result.state != "granted" && result.state != "prompt"){
-      console.debug("Copy without `clipboard-write` permission:", text)
-      return
-    }
+  // Write right away, within the user's click: Safari refuses a clipboard
+  // write that waits for another promise first, and Firefox and Safari have
+  // no `clipboard-write` permission to query. A refused write rejects and
+  // is logged below.
+  {
     let promise_written = null
     if (typeof ClipboardItem !== "undefined") {
       let data = [new ClipboardItem({
@@ -319,12 +320,12 @@ export const writeClipboard = ({text, html, blocks}, ownerWindow) => {
       console.debug("Degraded copy without `ClipboardItem` support:", text)
       promise_written = navigator.clipboard.writeText(text)
     }
-    promise_written.then(() => {
+    return promise_written.then(() => {
       /* success */
     }).catch(e => {
       console.log(e, "fail")
     })
-  })
+  }
 }
 
 export const toPosixPath = (input) => {
@@ -454,30 +455,6 @@ export const elementIsVisibleInViewport = (el, partiallyVisible = false) => {
     );
   }
 };
-
-export const convertToLetters = (num) => {
-  if (!+num) return false
-  let s = '', t
-
-  while (num > 0) {
-    t = (num - 1) % 26
-    s = String.fromCharCode(65 + t) + s
-    num = ((num - t) / 26) | 0
-  }
-
-  return s
-}
-
-export const convertToRoman = (num) => {
-  if (!+num) return false
-  const digits = String(+num).split('')
-  const key = ['','C','CC','CCC','CD','D','DC','DCC','DCCC','CM',
-    '','X','XX','XXX','XL','L','LX','LXX','LXXX','XC',
-    '','I','II','III','IV','V','VI','VII','VIII','IX']
-  let roman = '', i = 3
-  while (i--) roman = (key[+digits.pop() + i * 10] || '') + roman
-  return Array(+digits.join('') + 1).join('M') + roman
-}
 
 export function hsl2hex(h, s, l, alpha) {
   l /= 100

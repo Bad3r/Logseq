@@ -4,9 +4,8 @@
             [frontend.components.block.comments-model :as comments-model]
             [frontend.config :as config]
             [frontend.context.i18n :refer [t]]
-            [frontend.db :as db]
             [frontend.db.async :as db-async]
-            [frontend.db.model :as db-model]
+            [frontend.db.subs :as db-subs]
             [frontend.handler.notification :as notification]
             [frontend.handler.property.util :as pu]
             [frontend.mobile.haptics :as haptics]
@@ -14,7 +13,6 @@
             [frontend.modules.outliner.ui :as ui-outliner-tx]
             [frontend.state :as state]
             [frontend.util :as util]
-            [goog.object :as gobj]
             [logseq.db :as ldb]
             [logseq.db.frontend.block-title :as db-block-title]
             [logseq.outliner.core :as outliner-core]
@@ -29,39 +27,11 @@
     (when (seq blocks)
       (state/exit-editing-and-set-selected-blocks! blocks))))
 
-(defn get-idx-of-order-list-block
-  [block order-list-type]
-  (let [order-block-fn? (fn [block]
-                          (let [type (pu/lookup block :logseq.property/order-list-type)]
-                            (= type order-list-type)))
-        prev-block-fn   #(some-> (db/entity (:db/id %)) ldb/get-left-sibling)
-        prev-block      (prev-block-fn block)]
-    (letfn [(order-sibling-list [b]
-              (lazy-seq
-               (when (order-block-fn? b)
-                 (cons b (order-sibling-list (prev-block-fn b))))))
-            (order-parent-list [b]
-              (lazy-seq
-               (when (order-block-fn? b)
-                 (cons b (order-parent-list (db-model/get-block-parent (:block/uuid b)))))))]
-      (let [idx           (if prev-block
-                            (count (order-sibling-list block)) 1)
-            order-parents-count (dec (count (order-parent-list block)))
-            delta (if (neg? order-parents-count) 0 (mod order-parents-count 3))]
-        (cond
-          (zero? delta) idx
-
-          (= delta 1)
-          (some-> (util/convert-to-letters idx) util/safe-lower-case)
-
-          :else
-          (util/convert-to-roman idx))))))
-
 (defn attach-order-list-state
   [config block]
   (let [type (pu/lookup block :logseq.property/order-list-type)
         own-order-list-type  (some-> type str string/lower-case)
-        own-order-list-index (some->> own-order-list-type (get-idx-of-order-list-block block))]
+        own-order-list-index (:block.temp/order-list-index block)]
     (assoc config :own-order-list-type own-order-list-type
            :own-order-list-index own-order-list-index
            :own-order-number-list? (= own-order-list-type "number"))))
@@ -90,15 +60,14 @@
                            (state/get-current-editor-container-id)
                            :unknown-container)]
       (state/set-editing! (str "edit-block-" (:block/uuid block)) content block text-range
-                          {:db (db/get-db)
-                           :container-id container-id :direction direction :event event :pos pos}))
+                          {:container-id container-id :direction direction :event event :pos pos}))
     (mark-last-input-time! repo)))
 
 (defn block-unique-title
   "Multiple pages/objects may have the same `:block/title`.
    Notice: this doesn't prevent for pages/objects that have the same tag or created by different clients."
   [block & {:as opts}]
-  (db-block-title/block-unique-title (db/get-db) block opts))
+  (db-block-title/block-unique-title (:db opts) block (dissoc opts :db)))
 
 (defn block-title-with-icon
   "Used for select item"
@@ -109,77 +78,105 @@
      title]
     (or title (:block/title block))))
 
+(defn- edit-loaded-block!
+  [repo block pos {:keys [custom-content tail-len save-code-editor?] :as opts}]
+  (if (ldb/recycled? block)
+    (notification/show! (t :storage.recycle/readonly) :warning)
+    (do
+      (when save-code-editor?
+        (state/pub-event! [:editor/save-code-editor]))
+      (when (not= (:block/uuid block) (:block/uuid (state/get-edit-block)))
+        (when (:save-current-block? opts true)
+          (state/pub-event! [:editor/save-current-block]))
+        (state/clear-edit! {:clear-editing-block? false}))
+      (let [content (or custom-content (:block/title block) "")
+            content-length (count content)
+            text-range (cond
+                         (vector? pos)
+                         (text-range-by-lst-fst-line content pos)
+
+                         (and (> tail-len 0) (>= content-length tail-len))
+                         (subs content 0 (- content-length tail-len))
+
+                         (or (= :max pos) (<= content-length pos))
+                         content
+
+                         :else
+                         (subs content 0 pos))]
+        (state/clear-selection!)
+        (edit-block-aux repo block content text-range (assoc opts :pos pos))))))
+
 (defn edit-block!
-  [block pos & {:keys [_container-id custom-content tail-len save-code-editor?]
+  [block pos & {:keys [_container-id tail-len save-code-editor? skip-load?]
                 :or {tail-len 0
                      save-code-editor? true}
                 :as opts}]
   (when (and (not config/publishing?) (:block/uuid block))
-    (let [repo (state/get-current-repo)]
-      (when-let [block-id (:block/uuid block)]
-        (let [block (or (db/entity [:block/uuid block-id]) block)]
-          (if (ldb/recycled? block)
-            (notification/show! (t :storage.recycle/readonly) :warning)
-            (p/do!
-             (db-async/<get-block repo (:db/id block) {:children? false})
-             (when save-code-editor? (state/pub-event! [:editor/save-code-editor]))
-             (when (not= (:block/uuid block) (:block/uuid (state/get-edit-block)))
-               (state/clear-edit! {:clear-editing-block? false}))
-             (let [content (or custom-content (:block/title block) "")
-                   content-length (count content)
-                   text-range (cond
-                                (vector? pos)
-                                (text-range-by-lst-fst-line content pos)
+    (let [repo (state/get-current-repo)
+          opts (assoc opts
+                      :tail-len tail-len
+                      :save-code-editor? save-code-editor?)]
+      (if skip-load?
+        (edit-loaded-block! repo block pos opts)
+        (p/let [loaded-block (db-async/<get-block repo (:block/uuid block) {:children? false})]
+          (let [{:keys [status value]} (db-subs/block-snapshot (:block/uuid block))]
+            (edit-loaded-block! repo (or (when (= :ready status) value)
+                                         loaded-block
+                                         block)
+                                pos opts)))))))
 
-                                (and (> tail-len 0) (>= (count content) tail-len))
-                                (subs content 0 (- (count content) tail-len))
-
-                                (or (= :max pos) (<= content-length pos))
-                                content
-
-                                :else
-                                (subs content 0 pos))]
-               (state/clear-selection!)
-               (edit-block-aux repo block content text-range (assoc opts :pos pos))))))))))
+(defn- node-original-block
+  "Read the original (linking) block off a rendered `ls-block` node.
+  A block rendered through :block/link carries the linked block's uuid as
+  `blockid` and the linking block's own uuid as `originalblockid`."
+  [node]
+  (when-let [id (some-> node
+                        (dom/attr "originalblockid")
+                        uuid)]
+    {:block/uuid id}))
 
 (defn- get-original-block-by-dom
   [node]
-  (when-let [id (some-> node
-                        (gobj/get "parentNode")
-                        (util/rec-get-node "ls-block")
-                        (dom/attr "originalblockid")
-                        uuid)]
-    (db/entity [:block/uuid id])))
+  (some-> node
+          (.-parentNode)
+          (util/rec-get-node "ls-block")
+          node-original-block))
 
-(defn- get-original-block
-  "Get the original block from the current editing block or selected blocks"
-  [linked-block]
-  (cond
-    (and
-     (= (:block/uuid linked-block)
-        (:block/uuid (state/get-edit-block)))
-     (state/get-input)) ; editing block
-    (get-original-block-by-dom (state/get-input))
-
-    (seq (state/get-selection-blocks))
-    (->> (state/get-selection-blocks)
-         (remove nil?)
-         (keep #(when-let [id (dom/attr % "blockid")]
-                  (when (= (uuid id) (:block/uuid linked-block))
-                    (when-let [original-id (some-> (dom/attr % "originalblockid") uuid)]
-                      (db/entity [:block/uuid original-id])))))
-         ;; FIXME: what if there're multiple same blocks in the selection
-         first)))
+(defn- selected-original-blocks-by-id
+  [nodes]
+  (reduce (fn [result node]
+            (if-let [block-id (some-> (dom/attr node "blockid") uuid)]
+              (if (contains? result block-id)
+                result
+                (if-let [original-block (node-original-block node)]
+                  (assoc result block-id original-block)
+                  result))
+              result))
+          {}
+          (remove nil? nodes)))
 
 (defn get-top-level-blocks
   "Get only the top level blocks and their original blocks."
   [blocks]
   {:pre [(seq blocks)]}
-  (let [level-blocks (outliner-core/blocks-with-level blocks)]
+  (let [level-blocks (outliner-core/blocks-with-level blocks)
+        selected-ids (set (keep :db/id blocks))
+        editing-block-id (:block/uuid (state/get-edit-block))
+        input (state/get-input)
+        editing-original-block (when input
+                                 (get-original-block-by-dom input))
+        selected-original-blocks (selected-original-blocks-by-id
+                                  (state/get-selection-blocks))]
     (->> (filter (fn [b] (= 1 (:block/level b))) level-blocks)
+         (remove #(ldb/some-parent % (fn [parent]
+                                       (contains? selected-ids (:db/id parent)))))
          (map (fn [b]
-                (let [original (get-original-block b)]
-                  (or (and original (db/entity (:db/id original))) b)))))))
+                (let [block-id (:block/uuid b)
+                      original (or (:original-block b)
+                                   (if (and input (= block-id editing-block-id))
+                                     editing-original-block
+                                     (get selected-original-blocks block-id)))]
+                  (or original b)))))))
 
 (defn get-current-editing-original-block
   []
@@ -204,40 +201,46 @@
                                      last)]
        (get-original-block-by-dom last-block-node)))))
 
-(defn- indent-target-allowed?
-  [block indent?]
-  (or (not indent?)
-      (let [block (db/entity (:db/id block))
-            left (ldb/get-left-sibling block)]
-        (not (comments-model/comments-area? left)))))
+(defn outliner-tx-meta
+  ([block]
+   (outliner-tx-meta block nil))
+  ([block _config]
+   (let [page (:block/page block)
+         page-id (or (:block/uuid page) (:db/id page) page (state/get-current-page))]
+     (when page-id
+       {:ui/page-id page-id}))))
 
 (let [*timeout (atom nil)]
   (defn indent-outdent-blocks!
-    [blocks indent? save-current-block]
-    (when-let [timeout *timeout]
-      (js/clearTimeout timeout))
-    (when (seq blocks)
-      (let [blocks-container (when-let [first-selected-node (first (state/get-selection-blocks))]
-                               (util/rec-get-blocks-container first-selected-node))
-            blocks' (remove comments-model/protected-comment-block?
-                            (get-top-level-blocks blocks))]
-        (p/do!
-         (let [blocks' (filter #(indent-target-allowed? % indent?) blocks')]
-           (when (seq blocks')
-             (ui-outliner-tx/transact!
-              {:outliner-op :move-blocks
-               :source-outliner-op :indent-outdent}
-              (when save-current-block (save-current-block))
-              (outliner-op/indent-outdent-blocks! (get-top-level-blocks blocks')
-                                                  indent?
-                                                  {:parent-original (get-first-block-original)
-                                                   :logical-outdenting? (state/logical-outdenting?)}))))
-         (when blocks-container
-           ;; Update selection nodes to be the new ones
-           (reset! *timeout
-                   (js/setTimeout
-                    #(state/set-selection-blocks! (dom/sel blocks-container ".ls-block.selected") :down)
-                    100))))))))
+    ([blocks indent? save-current-block]
+     (indent-outdent-blocks! blocks indent? save-current-block nil))
+    ([blocks indent? save-current-block edit-block-fn]
+     (when-let [timeout *timeout]
+       (js/clearTimeout timeout))
+     (when (seq blocks)
+       (let [blocks-container (when-let [first-selected-node (first (state/get-selection-blocks))]
+                                (util/rec-get-blocks-container first-selected-node))
+             blocks' (remove comments-model/protected-comment-block?
+                             (get-top-level-blocks blocks))]
+         (p/do!
+          (when (seq blocks')
+            (ui-outliner-tx/transact!
+             (cond-> (merge {:outliner-op :move-blocks
+                             :source-outliner-op :indent-outdent}
+                            (outliner-tx-meta (first blocks')))
+               edit-block-fn
+               (assoc :editor/edit-block-fn edit-block-fn))
+             (when save-current-block (save-current-block))
+             (outliner-op/indent-outdent-blocks! (get-top-level-blocks blocks')
+                                                 indent?
+                                                 {:parent-original (get-first-block-original)
+                                                  :logical-outdenting? (state/logical-outdenting?)})))
+          (when blocks-container
+            ;; Update selection nodes to be the new ones
+            (reset! *timeout
+                    (js/setTimeout
+                     #(state/set-selection-blocks! (dom/sel blocks-container ".ls-block.selected") :down)
+                     100)))))))))
 
 (def *swipe (atom nil))
 (def *swiped? (atom false))
@@ -335,7 +338,7 @@
                 (state/conj-selection-block! block-container nil)))
             (if (seq (state/get-selection-blocks))
               (state/set-state! :mobile/show-action-bar? true)
-              (when (:mobile/show-action-bar? @state/state)
+              (when (:mobile/show-action-bar? (state/get-state))
                 (state/set-state! :mobile/show-action-bar? false)))
             (haptics/haptics)))
         (catch :default e

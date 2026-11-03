@@ -2,10 +2,12 @@
   "DB-based graph implementation"
   (:require [clojure.string :as string]
             [frontend.commands :as commands]
-            [frontend.db :as db]
+            [frontend.context.i18n :refer [t]]
+            [frontend.db.async :as db-async]
             [frontend.format.block :as block]
             [frontend.format.mldoc :as mldoc]
             [frontend.handler.common.config-edn :as config-edn-common-handler]
+            [frontend.handler.notification :as notification]
             [frontend.handler.property :as property-handler]
             [frontend.handler.repo-config :as repo-config-handler]
             [frontend.handler.ui :as ui-handler]
@@ -14,31 +16,29 @@
             [frontend.state :as state]
             [frontend.util :as util]
             [logseq.common.config :as common-config]
+            [logseq.common.uuid :as common-uuid]
             [logseq.db.frontend.content :as db-content]
             [logseq.graph-parser.text :as text]
             [logseq.outliner.op]
             [promesa.core :as p]))
 
-(defn- remove-non-existed-refs!
+(defn- remove-empty-refs
   [refs]
-  (remove (fn [x] (or
-                   (and (vector? x)
-                        (= :block/uuid (first x))
-                        (nil? (db/entity x)))
-                   (and (map? x)
-                        (util/uuid-string? (:block/title x))
-                        (:block/uuid x)
-                        (nil? (db/entity [:block/uuid (:block/uuid x)])))
-                   (nil? x))) refs))
+  (remove nil? refs))
 
-(defn- use-cached-refs!
-  [refs block]
+(defn- ref-summary
+  [ref]
+  (select-keys ref [:db/id :block/uuid :block/title :block/name :db/ident :block/tags]))
+
+(defn- collect-known-refs
+  [block]
+  (->> (concat (state/get-state :editor/block-refs)
+               (map ref-summary (:block/refs block)))
+       (util/distinct-by-last-wins :block/uuid)))
+
+(defn- use-cached-refs
+  [refs block cached-refs]
   (let [refs (remove #(= (:block/uuid block) (:block/uuid %)) refs)
-        cached-refs (->> @(:editor/block-refs @state/state)
-                         (concat (map (fn [ref]
-                                        (select-keys ref [:db/id :block/uuid :block/title]))
-                                      (:block/refs (db/entity (:db/id block)))))
-                         (util/distinct-by-last-wins :block/uuid))
         title->ref (zipmap (map :block/title cached-refs) cached-refs)]
     (map (fn [x]
            (if-let [ref (and (map? x) (title->ref (:block/title x)))]
@@ -85,29 +85,46 @@
     ref))
 
 (defn- existing-markdown-hashtag-link-refs
-  [ast]
-  (->> ast
-       (tree-seq coll? seq)
-       (keep (fn [form]
-               (when (and (vector? form)
-                          (= "Link" (first form))
-                          (map? (second form)))
-                 (let [[url-type target] (:url (second form))]
-                   (when (= "Search" url-type)
-                     (when-let [page (some-> target markdown-hashtag-link-target db/get-page)]
-                       (when (tag-page? page)
-                         page)))))))
-       (map #(select-keys % [:db/id :block/uuid :block/title :block/name :db/ident :block/tags]))
-       (util/distinct-by-last-wins :block/uuid)))
+  [ast cached-refs]
+  (let [title->ref (zipmap (map :block/title cached-refs) cached-refs)]
+    (->> ast
+         (tree-seq coll? seq)
+         (keep (fn [form]
+                 (when (and (vector? form)
+                            (= "Link" (first form))
+                            (map? (second form)))
+                   (let [[url-type target] (:url (second form))]
+                     (when (= "Search" url-type)
+                       (when-let [page (some-> target markdown-hashtag-link-target title->ref)]
+                         (when (tag-page? page)
+                           page)))))))
+         (map #(select-keys % [:db/id :block/uuid :block/title :block/name :db/ident :block/tags]))
+         (util/distinct-by-last-wins :block/uuid))))
+
+(defn- warn-missing-uuid-refs!
+  "Warn once per [:block/uuid id] ref that doesn't resolve to an entity."
+  [refs]
+  (when-let [uuids (seq (into #{}
+                              (keep (fn [ref]
+                                      (when (and (vector? ref)
+                                                 (= :block/uuid (first ref))
+                                                 (uuid? (second ref)))
+                                        (second ref))))
+                              refs))]
+    (when-let [repo (state/get-current-repo)]
+      (p/let [results (db-async/<get-blocks repo uuids)]
+        (doseq [{:keys [block]} results]
+          (when (nil? block)
+            (notification/show! (t :block/ref-not-exist) :warning)))))))
 
 (defn wrap-parse-block
   [{:block/keys [title level] :as block}]
-  (let [block (or (and (:db/id block) (db/entity (:db/id block)))
-                  (and (:block/uuid block) (db/entity [:block/uuid (:block/uuid block)]))
-                  block)
-        block (if (nil? title)
+  (let [block (if (nil? title)
                 block
-                (let [heading-level (when (normalize-markdown-heading? block)
+                (let [title (if (= :math (:logseq.property.node/display-type block))
+                              (or (block/math-block-formula title) title)
+                              title)
+                      heading-level (when (normalize-markdown-heading? block)
                                       (markdown-heading-level title))
                       title (if heading-level
                               (commands/clear-markdown-heading (string/triml title))
@@ -116,22 +133,29 @@
                       first-elem-type (first (ffirst ast))
                       block-with-title? (mldoc/block-with-title? first-elem-type)
                       content' (str common-config/block-pattern (if block-with-title? " " "\n") title)
-                      hashtag-link-refs (existing-markdown-hashtag-link-refs ast)
+                      cached-refs (collect-known-refs block)
+                      hashtag-link-refs (existing-markdown-hashtag-link-refs ast cached-refs)
                       parsed-block (block/parse-block (assoc block :block/title content'))
+                      new-display-block? (and (nil? (:logseq.property.node/display-type block))
+                                              (contains? #{:code :math}
+                                                         (:logseq.property.node/display-type parsed-block)))
                       block' (-> (merge block
                                         parsed-block
-                                        {:block/title title}
+                                        {:block/title (if new-display-block?
+                                                        (:block/title parsed-block)
+                                                        title)}
                                         (when heading-level
                                           {:logseq.property/heading heading-level}))
                                  (dissoc :block/format))]
                   (update block' :block/refs
                           (fn [refs]
                             (->> (concat (-> refs
-                                             remove-non-existed-refs!
-                                             (use-cached-refs! block))
+                                             remove-empty-refs
+                                             (use-cached-refs block cached-refs))
                                          hashtag-link-refs)
                                  (remove nil?)
                                  (util/distinct-by-last-wins ref-dedupe-key))))))
+        _ (warn-missing-uuid-refs! (:block/refs block))
         title' (db-content/title-ref->id-ref (or (get block :block/title) title) (:block/refs block))
         result (-> block
                    (merge (if level {:block/level level} {}))
@@ -147,26 +171,35 @@
                       true)]
 
     (when file-valid?
-      (p/do!
-       (db/transact! [{:file/path path
-                       :file/content content
-                       :file/created-at (js/Date.)
-                       :file/last-modified-at (js/Date.)}])
-      ;; Post save
-       (cond (= path "logseq/config.edn")
-             (p/let [_ (repo-config-handler/restore-repo-config! (state/get-current-repo) content)]
-               (state/pub-event! [:shortcut/refresh]))
-             (= path "logseq/custom.css")
-             (ui-handler/add-style-if-exists!))))))
+      (p/let [repo (state/get-current-repo)
+              file-entity (state/<invoke-db-worker :thread-api/pull repo [:db/id] [:file/path path])]
+        (p/do!
+         (state/<invoke-db-worker :thread-api/transact
+                                  repo
+                                  [(cond-> {:file/path path
+                                            :file/content content
+                                            :file/created-at (js/Date.)
+                                            :file/last-modified-at (js/Date.)}
+                                     (nil? file-entity)
+                                     (assoc :block/uuid (common-uuid/gen-uuid :builtin-block-uuid path)))]
+                                  nil
+                                  nil)
+        ;; Post save
+         (cond (= path "logseq/config.edn")
+               (p/let [_ (repo-config-handler/restore-repo-config! repo content)]
+                 (state/pub-event! [:shortcut/refresh]))
+               (= path "logseq/custom.css")
+               (ui-handler/add-style-if-exists!)))))))
 
 (defn batch-set-heading!
   [block-ids heading]
-  (ui-outliner-tx/transact!
-   {:outliner-op :save-block}
-   (doseq [id block-ids]
-     (let [e (db/entity [:block/uuid id])
-           raw-title (:block/raw-title e)
-           new-raw-title (commands/clear-markdown-heading raw-title)]
-       (when (not= new-raw-title raw-title)
-         (property-handler/set-block-property! id :block/title new-raw-title))))
-   (property-handler/batch-set-block-property! block-ids :logseq.property/heading heading)))
+  (let [repo (state/get-current-repo)]
+    (p/let [results (db-async/<get-blocks repo block-ids)
+            blocks (keep :block results)]
+      (ui-outliner-tx/transact!
+       {:outliner-op :save-block}
+       (doseq [{:block/keys [uuid raw-title]} blocks]
+         (let [new-raw-title (commands/clear-markdown-heading raw-title)]
+           (when (not= new-raw-title raw-title)
+             (property-handler/set-block-property! uuid :block/title new-raw-title))))
+       (property-handler/batch-set-block-property! block-ids :logseq.property/heading heading)))))

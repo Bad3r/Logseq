@@ -2,6 +2,7 @@
   "Fns to handle block content e.g. internal ids"
   (:require [clojure.string :as string]
             [datascript.core :as d]
+            [datascript.impl.entity :as de]
             [logseq.common.util :as common-util]
             [logseq.common.util.page-ref :as page-ref]
             [logseq.db.frontend.entity-util :as entity-util]))
@@ -81,10 +82,15 @@
 
 (defn get-matched-ids
   [content]
-  (->> (re-seq id-ref-pattern content)
-       (distinct)
-       (map second)
-       (map uuid)))
+  (some->> (re-seq id-ref-pattern content)
+           (distinct)
+           (map second)
+           (filter common-util/uuid-string?)
+           (map uuid)))
+
+(defn title-has-id-ref?
+  [title]
+  (boolean (some->> title (re-find id-ref-pattern))))
 
 (defn- replace-tag-ref
   [content page-name id]
@@ -119,6 +125,13 @@
       (replace-tag-ref content' page-name id)
       content')))
 
+(defn- ref-replacement-title
+  [{:block/keys [title] original-page-name :block.temp/original-page-name}]
+  (or (when (and (string? original-page-name)
+                 (not (common-util/uuid-string? original-page-name)))
+        original-page-name)
+      title))
+
 (defn title-ref->id-ref
   "Convert ref to id refs e.g. `[[page name]] -> [[uuid]]."
   [title refs & {:keys [replace-tag?]
@@ -139,10 +152,10 @@
                         ref)))
                    sort-refs)]
     (reduce
-     (fn [content {uuid' :block/uuid :block/keys [title]}]
-       (replace-page-ref-with-id content title uuid' replace-tag?))
+     (fn [content {uuid' :block/uuid :as ref}]
+       (replace-page-ref-with-id content (ref-replacement-title ref) uuid' replace-tag?))
      title
-     (filter :block/title refs'))))
+     (filter #(and (:block/title %) (:block/uuid %)) refs'))))
 
 (defn update-block-content
   "Replace `[[internal-id]]` with `[[page name]]`"
@@ -213,16 +226,26 @@
                  (entity-util/page? ref)))
     [(str block-uuid) title]))
 
+(defn- title-ref-entities
+  "Id refs are self-contained in the title, so their targets can be resolved
+   directly without relying on :block/refs being up to date."
+  [ent]
+  (when (de/entity? ent)
+    (keep #(d/entity (.-db ent) [:block/uuid %])
+          (get-matched-ids (:block/title ent)))))
+
 (defn- block-ref-id->title
   [ent max-depth replace-block-refs?]
-  (loop [frontier (set (:block/refs ent))
+  (loop [frontier (into (set (:block/refs ent))
+                        (title-ref-entities ent))
          seen-ids #{}
          id->title {}
          depth 0]
     (if (or (>= depth max-depth)
             (empty? frontier))
       id->title
-      (let [refs (filter map? frontier)
+      (let [ref-entity? (fn [ref] (or (map? ref) (de/entity? ref)))
+            refs (filter ref-entity? frontier)
             new-refs (remove (fn [ref]
                                (contains? seen-ids (:block/uuid ref)))
                              refs)
@@ -231,8 +254,10 @@
                              (keep #(ref->title-entry replace-block-refs? %))
                              new-refs)
             next-frontier (->> new-refs
-                               (mapcat :block/refs)
-                               (filter map?)
+                               (mapcat (fn [ref]
+                                         (concat (:block/refs ref)
+                                                 (title-ref-entities ref))))
+                               (filter ref-entity?)
                                set)]
         (recur next-frontier seen-ids' id->title' (inc depth))))))
 

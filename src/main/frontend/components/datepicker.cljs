@@ -4,6 +4,7 @@
             [frontend.commands :as commands]
             [frontend.date :as date]
             [frontend.handler.editor :as editor-handler]
+            [frontend.rfx :as rfx]
             [frontend.state :as state]
             [frontend.ui :as ui]
             [frontend.util :as util]
@@ -13,6 +14,14 @@
 
 (def ^:private focused-day-selector
   "[role='gridcell'][aria-selected='true'] button, [role='gridcell'] button[tabindex='0']")
+
+(defn- same-calendar-day?
+  [a b]
+  (boolean
+   (and a b
+        (= (.getFullYear a) (.getFullYear b))
+        (= (.getMonth a) (.getMonth b))
+        (= (.getDate a) (.getDate b)))))
 
 (defn- focus-calendar-day!
   [root-id remaining]
@@ -27,10 +36,10 @@
   [dom-id format]
   (hooks/use-effect!
    (fn []
-     (when-not (:date-picker/date @state/state)
+     (when-not (state/get-state :date-picker/date)
        (state/set-state! :date-picker/date (t/today))))
    [])
-  (let [selected-date (state/use-sub :date-picker/date)
+  (let [selected-date (rfx/use-sub [:date-picker/date])
         select-handler! (hooks/use-callback
                          (fn [^js d]
                            (when-let [d (or d selected-date)]
@@ -44,7 +53,12 @@
                                (state/clear-editor-action!)
                                (reset! commands/*current-command nil)
                                (state/set-state! :date-picker/date d))))
-                         [dom-id format selected-date])]
+                         [dom-id format selected-date])
+        focus-handler! (hooks/use-callback
+                        (fn [^js d]
+                          (when (and d (not (same-calendar-day? d selected-date)))
+                            (state/set-state! :date-picker/date d)))
+                        [selected-date])]
     (hooks/use-effect!
      (fn []
        (js/setTimeout #(focus-calendar-day! "date-time-picker" 10) 16)
@@ -53,8 +67,7 @@
     (hooks/use-window-keydown
      (fn [^js e]
        (when (and (= "Enter" (.-key e))
-                  (not (some-> (.-target e)
-                               (.closest ".ls-nlp-calendar input"))))
+                  (not (ui/date-picker-form-target? e)))
          (select-handler! selected-date)
          (util/stop e)))
      [selected-date select-handler!])
@@ -67,6 +80,7 @@
         :show-week-number false
         :selected selected-date
         :on-select select-handler!
+        :on-day-focus focus-handler!
         :on-day-key-down (fn [^js d _ ^js e]
                            (when (= "Enter" (.-key e))
                              (select-handler! d)

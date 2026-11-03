@@ -10,8 +10,10 @@
    [frontend.handler.assets :as assets-handler]
    [frontend.handler.db-based.property :as db-property-handler]
    [frontend.handler.editor :as editor-handler]
+   [frontend.handler.editor.assets :as editor-assets]
    [frontend.handler.notification :as notification]
    [frontend.handler.route :as route-handler]
+   [frontend.rfx :as rfx]
    [frontend.state :as state]
    [frontend.ui :as ui]
    [frontend.util :as util]
@@ -103,7 +105,7 @@
 (hsx/defc ^:large-vars/data-var alias-directories
   []
   (let [[ext-editing-dir set-ext-editing-dir!] (hooks/use-state nil)
-        directories      (into [] (state/use-sub :assets/alias-dirs))
+        directories      (into [] (rfx/use-sub [:assets/alias-dirs]))
         pick-exist       assets-handler/get-alias-by-dir
         set-dir!         (fn [name dir exts]
                            (when (and name dir)
@@ -201,7 +203,7 @@
 
 (hsx/defc settings-content
   []
-  (let [alias-enabled?         (state/use-sub :assets/alias-enabled?)
+  (let [alias-enabled?         (rfx/use-sub [:assets/alias-enabled?])
         [pre-alias-enabled?]   (hooks/use-state alias-enabled?)
         alias-enabled-changed? (not= pre-alias-enabled? alias-enabled?)]
 
@@ -237,7 +239,7 @@
                                       (notification/show! (str e)))]
                      (if create?
                        (-> (do (set-saving? true)
-                               (editor-handler/db-based-save-assets! repo [{:title title :src src}]))
+                               (editor-assets/db-based-save-assets! repo [{:title title :src src}]))
                            (p/then (fn [res]
                                      (when-let [asset-block (some-> (seq res) (first))]
                                        (when on-saved (on-saved asset-block)))))

@@ -1,11 +1,15 @@
 (ns frontend.handler.config
   "Fns for setting repo config"
   (:require [borkdude.rewrite-edn :as rewrite]
-            [clojure.string :as string]
-            [frontend.db :as db]
+            [frontend.config :as config]
             [frontend.handler.db-based.editor :as db-editor-handler]
             [frontend.handler.repo-config :as repo-config-handler]
-            [frontend.state :as state]))
+            [frontend.state :as state]
+            [promesa.core :as p]))
+
+(defn <get-file-content
+  [repo path]
+  (state/<invoke-db-worker :thread-api/get-file-content repo path))
 
 (defn parse-repo-config
   "Parse repo configuration file content"
@@ -14,17 +18,20 @@
 
 (defn- repo-config-set-key-value
   [path k v]
-  (when (state/get-current-repo)
-    (when-let [content (db/get-file path)]
-      (repo-config-handler/read-repo-config content)
-      (let [result (parse-repo-config (if (string/blank? content) "{}" content))
-            ks (if (vector? k) k [k])
-            v (cond->> v
-                (map? v)
-                (reduce-kv (fn [a k v] (rewrite/assoc a k v)) (rewrite/parse-string "{}")))
-            new-result (rewrite/assoc-in result ks v)
-            new-content (str new-result)]
-        (db-editor-handler/save-file! path new-content) nil))))
+  (when-let [repo (state/get-current-repo)]
+    (p/let [content (<get-file-content repo path)]
+      ;; An unparsable file is rewritten from the default config so a settings
+      ;; change repairs the file instead of failing
+      (let [result (parse-repo-config (if (repo-config-handler/readable-config-content? content)
+                                        content
+                                        config/config-default-content))
+              ks (if (vector? k) k [k])
+              v (cond->> v
+                  (map? v)
+                  (reduce-kv (fn [a k v] (rewrite/assoc a k v)) (rewrite/parse-string "{}")))
+              new-result (rewrite/assoc-in result ks v)
+              new-content (str new-result)]
+          (db-editor-handler/save-file! path new-content)))))
 
 (defn set-config!
   [k v]

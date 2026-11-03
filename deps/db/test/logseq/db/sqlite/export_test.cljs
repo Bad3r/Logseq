@@ -593,7 +593,7 @@
            (get-in export-edn [:classes :user.class/MyClass :build/class-properties])))
     (is (not (contains? (:properties export-edn) legacy-property)))))
 
-(deftest graph-export-omits-legacy-plugin-property-schema-attrs
+(deftest graph-datom-import-drops-legacy-plugin-property-schema-attrs
   (let [plugin-property :plugin.property.degrande-colors/mugpet_degrande_colors_controls
         conn (db-test/create-conn-with-import-map
               {:properties {plugin-property {:logseq.property/type :json}}
@@ -604,10 +604,17 @@
                               :hide? true
                               :public? false}])
         export-edn (sqlite-export/build-export @conn {:export-type :graph})
-        validation (sqlite-export/validate-export export-edn)]
+        import-conn (sqlite-export/create-conn)
+        validation (sqlite-export/validate-import-txs
+                    (sqlite-export/build-import export-edn @import-conn {})
+                    @import-conn
+                    {:edn-label "exported EDN"})
+        tx-data (:tx-data validation)]
     (is (nil? (:error validation)))
     (is (has-datom? (:datoms export-edn) (:db/id plugin-property-ent) :hide? true))
-    (is (has-datom? (:datoms export-edn) (:db/id plugin-property-ent) :public? false))))
+    (is (has-datom? (:datoms export-edn) (:db/id plugin-property-ent) :public? false))
+    (is (not (some #{[:db/add (:db/id plugin-property-ent) :hide? true]} tx-data)))
+    (is (not (some #{[:db/add (:db/id plugin-property-ent) :public? false]} tx-data)))))
 
 (deftest graph-export-keeps-referenced-recycled-closed-value-config
   (let [property-id :plugin.property.degrande-colors/tldraw
@@ -727,7 +734,9 @@
 
 (deftest graph-datom-import-replaces-seeded-data
   (let [source-conn (d/create-conn db-schema/schema)
-        _ (d/transact! source-conn [{:block/uuid (random-uuid)}])
+        ;; Shift subsequent built-in eids without leaving invalid datoms in the export.
+        _ (d/transact! source-conn [{:db/id 1 :block/uuid (random-uuid)}])
+        _ (d/transact! source-conn [[:db/retractEntity 1]])
         _ (d/transact! source-conn (sqlite-create-graph/build-db-initial-data "{}"))
         export-edn (sqlite-export/build-export @source-conn {:export-type :graph})
         valid-result (sqlite-export/validate-export export-edn)
@@ -767,6 +776,25 @@
     (is (has-datom? (mapv (juxt :e :a :v) (d/datoms @conn :eavt))
                     1 :block/refs 2)
         "Datom import should apply lookup-ref targets before values that use them")))
+
+(deftest validate-export-rejects-invalid-graph-datoms
+  (let [validation (sqlite-export/validate-export
+                    {::sqlite-export/export-type :graph
+                     ::sqlite-export/graph-format :datoms
+                     :datoms [[1 :block/title "Orphan Page"]
+                              [1 :block/name "orphan page"]
+                              [1 :block/uuid #uuid "33333333-3333-4333-8333-000000000001"]
+                              [1 :block/tags 2]
+                              [2 :block/title "Page"]
+                              [2 :block/name "page"]
+                              [2 :db/ident :logseq.class/Page]
+                              [2 :block/uuid #uuid "33333333-3333-4333-8333-000000000002"]]})]
+    (is (string? (:error validation))
+        "Datom import validation should reject invalid graph datoms")
+    (is (re-find #"Exported EDN" (:error validation))
+        "Export validation error should describe exported EDN")
+    (is (not (contains? validation :db))
+        "Invalid export validation should not return a transient DB snapshot")))
 
 (deftest graph-datom-export-resolves-lookup-ref-values
   (let [conn (d/create-conn db-schema/schema)
@@ -828,6 +856,26 @@
     (is (= (expand-properties (:properties original-data)) (:properties imported-nodes)))
     (is (= (expand-classes (:classes original-data)) (:classes imported-nodes)))))
 
+(deftest export-grouped-view-nodes-by-uuid
+  (let [conn (db-test/create-conn-with-blocks
+              {:pages-and-blocks
+               [{:page {:block/title "page"}
+                 :blocks [{:block/title "Alpha"}
+                          {:block/title "Beta"}]}]})
+        block-uuids (mapv :block/uuid
+                          [(db-test/find-block-by-content @conn "Alpha")
+                           (db-test/find-block-by-content @conn "Beta")])
+        exported (sqlite-export/build-export
+                  @conn
+                  {:export-type :view-nodes
+                   :rows [["group" block-uuids]]
+                   :group-by? true})]
+    (is (= #{"Alpha" "Beta"}
+           (->> (:pages-and-blocks exported)
+                (mapcat :blocks)
+                (map :block/title)
+                set)))))
+
 (deftest import-selected-nodes
   (let [original-data
         ;; Test a mix of pages and blocks
@@ -859,6 +907,26 @@
            (:pages-and-blocks imported-nodes)))
     (is (= (expand-properties (:properties original-data)) (:properties imported-nodes)))
     (is (= (expand-classes (:classes original-data)) (:classes imported-nodes)))))
+
+(deftest export-selected-nodes-with-missing-node
+  (let [conn (db-test/create-conn-with-blocks
+              {:pages-and-blocks [{:page {:block/title "page1"}
+                                   :blocks [{:block/title "b1"}]}]})
+        block (db-test/find-block-by-content @conn "b1")
+        result (try
+                 {:export (sqlite-export/build-export
+                           @conn
+                           {:export-type :selected-nodes
+                            :node-ids [[:block/uuid (:block/uuid block)]
+                                       [:block/uuid (random-uuid)]]})}
+                 (catch :default e
+                   {:error (ex-message e)}))]
+    (is (nil? (:error result)) (:error result))
+    (is (some? (:export result)) "Selected nodes export is present")
+    (when-let [export (:export result)]
+      (is (= ["b1"]
+             (mapv :block/title (mapcat :blocks (:pages-and-blocks export)))))
+      (is (nil? (:error (sqlite-export/validate-export export)))))))
 
 (defn- build-original-graph-data
   [& {:keys [exclude-namespaces? add-built-in-pages?]
@@ -1399,3 +1467,63 @@
     (is (= [:block/uuid asset2-uuid]
            [:block/uuid (:block/uuid (:logseq.property.pdf/hl-image annotation-image))])
         ":logseq.property.pdf/hl-image should preserve the asset ref")))
+
+(defn- call-validate-local-db
+  [orig-validate db opts]
+  (if (seq opts)
+    (apply orig-validate db (apply concat opts))
+    (orig-validate db)))
+
+(deftest validate-import-txs-tx-scope-validates-only-touched-entities
+  (let [conn (db-test/create-conn-with-blocks
+              {:pages-and-blocks [{:page {:block/title "existing-page"}
+                                   :blocks [{:block/title "existing-block"}]}]})
+        existing-page (db-test/find-page-by-title @conn "existing-page")
+        _ (d/transact! conn [{:db/id (:db/id existing-page)
+                              :not-a-real-attr true}])
+        export-map {:pages-and-blocks [{:page {:block/title "imported-page"}
+                                        :blocks [{:block/title "imported-block"}]}]}
+        txs (sqlite-export/build-import export-map @conn {})
+        orig-validate db-validate/validate-local-db!]
+    (testing "tx scope ignores untouched invalid entities and passes entity-ids"
+      (let [tx-calls (atom [])]
+        (with-redefs [db-validate/validate-local-db!
+                      (fn [db & {:as opts}]
+                        (swap! tx-calls conj opts)
+                        (call-validate-local-db orig-validate db opts))]
+          (let [result (sqlite-export/validate-import-txs txs @conn {:validate-scope :tx
+                                                                    :edn-label "tx-scope EDN"})
+                entity-ids (set (:entity-ids (first @tx-calls)))
+                graph-eids (set (map :e (d/datoms @conn :eavt)))]
+            (is (nil? (:error result)))
+            (is (= 1 (count @tx-calls)))
+            (is (seq entity-ids))
+            (is (not (contains? entity-ids (:db/id existing-page))))
+            (is (< (count entity-ids) (count graph-eids)))))))
+    (testing "graph scope still validates the whole db"
+      (let [graph-calls (atom [])]
+        (with-redefs [db-validate/validate-local-db!
+                      (fn [db & {:as opts}]
+                        (swap! graph-calls conj opts)
+                        (call-validate-local-db orig-validate db opts))]
+          (let [result (db-test/silence-stderr
+                        (sqlite-export/validate-import-txs txs @conn {:edn-label "graph-scope EDN"}))]
+            (is (some? (:error result)))
+            (is (re-find #"validation error" (:error result)))
+            (is (= 1 (count @graph-calls)))
+            (is (nil? (:entity-ids (first @graph-calls))))))))))
+
+(deftest validate-import-txs-tx-scope-rejects-invalid-tx
+  (let [conn (db-test/create-conn)
+        txs {:init-tx [{:db/id -1
+                        :block/uuid (random-uuid)
+                        :block/title 123
+                        :block/name "invalid-imported-page"
+                        :block/created-at 1
+                        :block/updated-at 1
+                        :block/tags :logseq.class/Page}]}]
+    (db-test/silence-stderr
+     (let [result (sqlite-export/validate-import-txs txs @conn {:validate-scope :tx
+                                                               :edn-label "invalid tx EDN"})]
+       (is (some? (:error result)))
+       (is (re-find #"validation error" (:error result)))))))

@@ -5,6 +5,7 @@
             [electron.ipc :as ipc]
             [electron.listener :as el]
             [frontend.components.block :as block]
+            [frontend.components.block.breadcrumb :as block-breadcrumb]
             [frontend.components.content :as cp-content]
             [frontend.components.editor :as editor]
             [frontend.components.page :as page]
@@ -12,7 +13,6 @@
             [frontend.components.user.login :as user.login]
             [frontend.config :as config]
             [frontend.context.i18n :as i18n]
-            [frontend.db.react :as react]
             [frontend.db.restore :as db-restore]
             [frontend.error :as error]
             [frontend.handler.command-palette :as command-palette]
@@ -50,17 +50,11 @@
           (when-not (error/ignored? message)
             (log/error :exception error)))))
 
-(defn- watch-for-date!
-  []
-  (let [f (fn []
-            (page-handler/create-today-journal!))]
-    (f)
-    (js/setInterval f 3000)))
-
 (defn restore-and-setup!
   [repo]
   (when repo
     (-> (p/let [_ (db-restore/restore-graph! repo)
+                _ (repo-handler/<restore-date-formatter! repo)
                 _ (graph-handler/<upsert-current-graph-registry!)]
           (graph-handler/remember-current-graph-id-in-tab!)
           (repo-config-handler/start {:repo repo}))
@@ -87,7 +81,7 @@
 
            (page-handler/init-commands!)
 
-           (watch-for-date!)))
+           (page-handler/watch-for-date!)))
         (p/catch (fn [error]
                    (log/error :exception error))))))
 
@@ -108,7 +102,7 @@
   (state/set-component! :block/linked-references reference/references)
   (state/set-component! :block/container block/block-container)
   (state/set-component! :block/inline-title block/inline-title)
-  (state/set-component! :block/breadcrumb block/breadcrumb)
+  (state/set-component! :block/breadcrumb block-breadcrumb/breadcrumb)
   (state/set-component! :block/reference block/block-reference)
   (state/set-component! :block/blocks-container block/blocks-container)
   (state/set-component! :block/properties-cp block/db-properties-cp)
@@ -147,6 +141,7 @@
 
 (defn start!
   [render]
+  (state/set-db-restoring! true)
   (let [t1 (util/time-ms)
         ui-ready (p/do!
                   (idb/start)
@@ -159,14 +154,11 @@
       (register-components-fns!)
       (user-handler/restore-tokens-from-localstorage)
       (user.login/setup-configure!)
-      (state/set-db-restoring! true)
       (when (util/electron?)
         (el/listen!))
 
       (i18n/start)
       (instrument/init)
-
-      (react/run-custom-queries-when-idle!)
 
       (events/run!)
 

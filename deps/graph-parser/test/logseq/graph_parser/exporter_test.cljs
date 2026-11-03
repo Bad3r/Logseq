@@ -15,6 +15,7 @@
             [logseq.common.uuid :as common-uuid]
             [logseq.db :as ldb]
             [logseq.db.common.entity-plus :as entity-plus]
+            [logseq.db.common.order :as db-order]
             [logseq.db.frontend.asset :as db-asset]
             [logseq.db.frontend.content :as db-content]
             [logseq.db.frontend.malli-schema :as db-malli-schema]
@@ -24,9 +25,12 @@
             [logseq.db.test.helper :as db-test]
             [logseq.graph-parser.block :as gp-block]
             [logseq.graph-parser.exporter :as gp-exporter]
+            [logseq.graph-parser.exporter.finalize :as gp-exporter-finalize]
             [logseq.graph-parser.test.docs-graph-helper :as docs-graph-helper]
             [logseq.graph-parser.test.helper :as test-helper :include-macros true :refer [deftest-async]]
             [logseq.outliner.db-pipeline :as db-pipeline]
+            [logseq.outliner.page :as outliner-page]
+            [logseq.outliner.pipeline :as outliner-pipeline]
             [promesa.core :as p]))
 
 ;; Helpers
@@ -111,6 +115,17 @@
             db title)
        (map #(d/entity db %))))
 
+(defn- task-blocks-by-title
+  [db title]
+  (->> (d/q '[:find [?b ...]
+              :in $ ?title
+              :where
+              [?b :block/page]
+              [?b :block/title ?title]
+              [?b :block/tags :logseq.class/Task]]
+            db title)
+       (map #(d/entity db %))))
+
 (defn- report-retracts-block-uuid?
   [tx-report block-uuid]
   (boolean
@@ -120,6 +135,12 @@
                 (false? (:added datom))))
          (:tx-data tx-report))))
 
+(defn- imported-favorite-titles
+  [db]
+  (->> (ldb/get-page-blocks db (:db/id (ldb/get-page db common-config/favorites-page-name)))
+       (keep :block/link)
+       (map #(d/entity db (:db/id %)))
+       (map ldb/get-title-with-parents)))
 
 (defn- build-graph-files
   "Given a file graph directory, return all files including assets and adds relative paths
@@ -207,7 +228,7 @@
                                              (.stat (js/require "fs/promises") abs-path)))
                          :<read-and-copy-asset (fn [file *assets buffer-handler]
                                                  (<read-and-copy-asset file *assets buffer-handler assets))}
-                        (select-keys options [:verbose]))]
+                        (select-keys options [:verbose :import-timeout-ms :import-heartbeat-ms :log-fn]))]
     (gp-exporter/export-file-graph conn conn config-file *files options')))
 
 (defn- import-files-to-db
@@ -232,7 +253,181 @@
         file-path (node-path/join dir relative-path)]
     (fs/mkdirSync (node-path/dirname file-path) #js {:recursive true})
     (fs/writeFileSync file-path content)
-    file-path))
+    (path/path-normalize file-path)))
+
+(defn- write-temp-file-graph
+  [files]
+  (let [dir (fs/mkdtempSync (node-path/join (os/tmpdir) "logseq-graph-parser-test-"))]
+    (doseq [[relative-path content] files]
+      (let [file-path (node-path/join dir relative-path)]
+        (fs/mkdirSync (node-path/dirname file-path) #js {:recursive true})
+        (fs/writeFileSync file-path content)))
+    dir))
+
+(defn- next-random!
+  [*seed n]
+  (let [next-seed (mod (* 48271 @*seed) 2147483647)]
+    (reset! *seed next-seed)
+    (mod next-seed n)))
+
+(defn- random-choice!
+  [*seed choices]
+  (nth choices (next-random! *seed (count choices))))
+
+(defn- generated-uuid
+  [n]
+  (str "10000000-0000-4000-8000-" (.padStart (.toString n 16) 12 "0")))
+
+(def generated-file-graph-page-names
+  ["Generated Alpha"
+   "Generated Beta"
+   "Generated Gamma"
+   "Generated Delta"
+   "Generated Epsilon"
+   "Generated Zeta"])
+
+(def generated-file-graph-ref-page-names
+  (into generated-file-graph-page-names
+        ["Generated/Missing Namespace"
+         "Generated Nested/Child"
+         "Missing Alias Target"
+         "Missing Tag Target"
+         "Generated PDF"]))
+
+(def generated-file-graph-task-markers
+  [nil "TODO" "DOING" "DONE" "LATER" "NOW" "WAITING"])
+
+(def generated-file-graph-tags
+  ["generated"
+   "import"
+   "file-graph"
+   "edge-case"
+   "db-test"])
+
+(def generated-file-graph-test-seeds
+  [1309 42 8675309])
+
+(defn- generated-page-preamble
+  [*seed page-name]
+  (let [alias-name (str page-name " Alias " (next-random! *seed 30))
+        tag-page (random-choice! *seed generated-file-graph-ref-page-names)]
+    (case (next-random! *seed 5)
+      0 (str "alias:: [[" alias-name "]], [[Missing Alias Target]]\n"
+             "tags:: [[" tag-page "]], #generated-page\n"
+             "generated-page-rank:: " (next-random! *seed 100) "\n\n")
+      1 (str "title:: " page-name "\n"
+             "public:: true\n\n")
+      "")))
+
+(defn- generated-title-suffix
+  [*seed]
+  (case (next-random! *seed 8)
+    0 (str " [missing asset](../assets/missing-" (next-random! *seed 50) ".pdf)")
+    1 (str " ![missing image](../assets/missing-" (next-random! *seed 50) ".png)")
+    2 (str " [[" (random-choice! *seed generated-file-graph-ref-page-names) "]]")
+    3 " #[[generated multi tag]]"
+    ""))
+
+(defn- generated-extra-lines
+  [*seed index]
+  (case (next-random! *seed 8)
+    0 (str "  collapsed:: true\n"
+           "  background-color:: yellow\n")
+    1 (str "  alias:: [[Generated Block Alias " (next-random! *seed 100) "]]\n")
+    2 (str "  | generated | table |\n"
+           "  | row | " index " |\n")
+    3 (str "  ```clojure\n"
+           "  (def generated-" index " " (next-random! *seed 100) ")\n"
+           "  ```\n")
+    ""))
+
+(defn- generated-md-block
+  [*seed index]
+  (let [block-id (generated-uuid (inc index))
+        duplicate-id (generated-uuid 1)
+        missing-ref-id (generated-uuid (+ 2000 index))
+        task-marker (random-choice! *seed generated-file-graph-task-markers)
+        page-name (random-choice! *seed generated-file-graph-ref-page-names)
+        missing-page-name (str "Generated Missing " (next-random! *seed 1000))
+        tag (random-choice! *seed generated-file-graph-tags)
+        ref-id (case (next-random! *seed 5)
+                 0 block-id
+                 1 duplicate-id
+                 2 missing-ref-id
+                 (generated-uuid (inc (next-random! *seed 90))))
+        id-value (case (next-random! *seed 11)
+                   0 "broken-generated-id"
+                   1 duplicate-id
+                   block-id)
+        page-ref (if (zero? (next-random! *seed 3))
+                   missing-page-name
+                   page-name)
+        title-prefix (if task-marker (str task-marker " ") "")
+        title-suffix (generated-title-suffix *seed)
+        temporal-line (case (next-random! *seed 6)
+                        0 "  SCHEDULED: <2026-01-05 Mon .+1w>\n"
+                        1 "  DEADLINE: <2026-01-09 Fri +2d>\n"
+                        "")
+        extra-lines (generated-extra-lines *seed index)
+        nested-line (when (zero? (next-random! *seed 3))
+                      (str "  - nested generated block " index
+                           " [[Generated Nested " (next-random! *seed 30) "]]\n"))]
+    (str "- " title-prefix "generated block " index
+         " [[" page-ref "]] ((" ref-id ")) #" tag title-suffix "\n"
+         temporal-line
+         "  id:: " id-value "\n"
+         "  generated-ref:: [[" page-name "]]\n"
+         "  generated-rank:: " (next-random! *seed 100) "\n"
+         extra-lines
+         nested-line)))
+
+(defn- generated-md-file-content
+  [*seed file-index page-name block-count]
+  (str (generated-page-preamble *seed page-name)
+       (apply str
+              (map #(generated-md-block *seed (+ (* file-index 100) %))
+                   (range block-count)))))
+
+(defn- generated-md-file-graph
+  [seed]
+  (let [*seed (atom seed)
+        pages (map-indexed
+               (fn [index page-name]
+                 [(str "pages/" (string/replace (string/lower-case page-name) " " "_") ".md")
+                  (generated-md-file-content *seed index page-name (+ 8 (next-random! *seed 8)))])
+               generated-file-graph-page-names)
+        journals [["journals/2026_01_05.md"
+                   (generated-md-file-content *seed 20 "2026_01_05" (+ 8 (next-random! *seed 8)))]
+                  ["journals/2026_01_06.md"
+                   (generated-md-file-content *seed 21 "2026_01_06" (+ 8 (next-random! *seed 8)))]
+                  ["assets/generated.md"
+                   "Generated asset content\n"]]]
+    (into {"logseq/config.edn" "{:preferred-format :markdown\n :journal/page-title-format \"yyyy_MM_dd\"}\n"}
+          (concat pages journals))))
+
+(defn- assert-generated-md-file-graph-imports
+  [seed]
+  (let [graph-dir (write-temp-file-graph (generated-md-file-graph seed))]
+    (p/let [conn (db-test/create-conn)
+            _ (db-pipeline/add-listener conn)
+            _ (import-file-graph-to-db graph-dir conn {})
+            generated-block-count (->> (d/q '[:find [?title ...]
+                                              :where [?b :block/title ?title]]
+                                            @conn)
+                                       (filter #(string/includes? % "generated block"))
+                                       count)
+            validation-errors (map :entity (:errors (db-validate/validate-local-db! @conn)))]
+      (is (<= 60 generated-block-count)
+          (str "Seed " seed " imports the generated block corpus"))
+      (is (empty? validation-errors)
+          (str "Seed " seed " generated Markdown file graph validates")))))
+
+(defn- assert-generated-md-file-graphs-import
+  [seeds]
+  (p/loop [remaining-seeds (seq seeds)]
+    (when remaining-seeds
+      (p/let [_ (assert-generated-md-file-graph-imports (first remaining-seeds))]
+        (p/recur (next remaining-seeds))))))
 
 ;; Tests
 ;; =====
@@ -262,20 +457,88 @@
     (is (empty? (map :entity (:errors (db-validate/validate-local-db! @conn))))
         "Imported graph validates")))
 
+(deftest-async import-page-with-property-and-tag-of-same-name-convert-all-tags
+  (p/let [file (write-temp-graph-file
+                 "pages/source.md"
+                 "tags:: [[topic]]\ntopic:: sample value\n\n- Example block\n")
+          conn (db-test/create-conn)
+          _ (db-pipeline/add-listener conn)
+          _ (import-files-to-db [file] conn {:convert-all-tags? true})
+          db @conn
+          entities-titled (fn [class-ident]
+                            (d/q '[:find [?e ...] :in $ ?title ?class
+                                   :where [?e :block/title ?title] [?c :db/ident ?class] [?e :block/tags ?c]]
+                                 db "topic" class-ident))
+          [tag-id] (entities-titled :logseq.class/Tag)
+          [property-id] (entities-titled :logseq.class/Property)
+          property (some->> property-id (d/entity db))
+          page (db-test/find-page-by-title db "source")]
+    (is (some? (db-test/find-block-by-content db #"Example block"))
+        "Page content is imported")
+    (is (some? property-id) "The property is imported")
+    (is (= "sample value"
+           (some-> (get page (:db/ident property)) db-property/property-value-content))
+        "The page keeps its property value")
+    (is (some? tag-id) "The tag is imported")
+    (is (not= tag-id property-id) "The tag and property are distinct entities")
+    (is (contains? (set (map :db/id (:block/tags page))) tag-id)
+        "The page references the imported tag")
+    (is (empty? (:errors (db-validate/validate-local-db! db)))
+        "Imported graph validates")))
+
+(deftest-async import-org-page-title-when-property-appears-in-middle
+  (p/let [file (write-temp-graph-file
+                "pages/20230410145300-end_to_end_note.org"
+                ":PROPERTIES:
+:ID:       c537c812-1ec9-4f13-adaf-1a39fd7da967
+:END:
+#+title: end_to_end_note
+#+date: <2023-04-10 Mon 14:53>
+#+filetags: :PUBLIC:
+
+abc
+
+#+hugo: more
+
+123
+")
+          conn (db-test/create-conn)
+          _ (db-pipeline/add-listener conn)
+          _ (import-files-to-db [file] conn {})]
+    (is (some? (db-test/find-page-by-title @conn "end_to_end_note"))
+        "Org #+title is imported when another property appears in the middle of the file")
+    (is (nil? (db-test/find-page-by-title @conn "20230410145300-end_to_end_note"))
+        "Importer should not fall back to the org-roam file stem")
+    (is (empty? (map :entity (:errors (db-validate/validate-local-db! @conn))))
+        "Imported graph validates")))
+
+(deftest-async import-empty-journal-file
+  (p/let [file (write-temp-graph-file "journals/2025_11_11.md" "\n")
+          conn (db-test/create-conn)
+          _ (db-pipeline/add-listener conn)
+          _ (import-files-to-db [file] conn {})]
+    (is (empty? (map :entity (:errors (db-validate/validate-local-db! @conn))))
+        "Empty imported files do not transact nil block refs")))
+
 (deftest-async import-repeated-deadline-and-scheduled
   (p/let [file (write-temp-graph-file
                  "pages/repeated-tasks.md"
                  (str "- TODO wish [[name]] a happy birthday\n"
                       "  SCHEDULED: <2025-11-01 Sat 08:00 .+1y>\n"
                       "- TODO prepare weekly report\n"
-                      "  DEADLINE: <2025-11-07 Fri +2w>\n"))
+                      "  DEADLINE: <2025-11-07 Fri +2w>\n"
+                      "- TODO plan release\n"
+                      "  DEADLINE: <2025-11-08 Sat>\n"
+                      "  SCHEDULED: <2025-11-07 Fri .+1w>\n"))
           conn (db-test/create-conn)
           _ (db-pipeline/add-listener conn)
           _ (import-files-to-db [file] conn {})]
     (let [birthday-properties (db-test/readable-properties
-                               (db-test/find-block-by-content @conn #"happy birthday"))
+                             (db-test/find-block-by-content @conn #"happy birthday"))
           report-properties (db-test/readable-properties
                              (db-test/find-block-by-content @conn #"weekly report"))
+          mixed-properties (db-test/readable-properties
+                            (db-test/find-block-by-content @conn #"plan release"))
           birthday-scheduled (:logseq.property/scheduled birthday-properties)
           birthday-date (js/Date. birthday-scheduled)]
       (is (= 20251101 (date-time-util/ms->journal-day birthday-scheduled))
@@ -309,13 +572,42 @@
                                :logseq.property.repeat/recur-frequency
                                :logseq.property.repeat/recur-unit])))
           "Repeated deadline timestamp keeps its repeat properties including the `+` cookie kind")
+      (is (= {:logseq.property/deadline 20251108
+              :logseq.property/scheduled 20251107
+              :logseq.property.repeat/repeated? true
+              :logseq.property.repeat/temporal-property :logseq.property/scheduled
+              :logseq.property.repeat/repeat-type :logseq.property.repeat/repeat-type.dotted-plus
+              :logseq.property.repeat/recur-frequency 1
+              :logseq.property.repeat/recur-unit :logseq.property.repeat/recur-unit.week}
+             (-> mixed-properties
+                 (update :logseq.property/deadline date-time-util/ms->journal-day)
+                 (update :logseq.property/scheduled date-time-util/ms->journal-day)
+                 (select-keys [:logseq.property/deadline
+                               :logseq.property/scheduled
+                               :logseq.property.repeat/repeated?
+                               :logseq.property.repeat/temporal-property
+                               :logseq.property.repeat/repeat-type
+                               :logseq.property.repeat/recur-frequency
+                               :logseq.property.repeat/recur-unit])))
+          "Mixed deadline and scheduled timestamps keep both dates and the repeated temporal property")
       (is (empty? (map :entity (:errors (db-validate/validate-local-db! @conn))))
           "Imported graph validates"))))
 
 (deftest-async import-preserves-legacy-task-markers-as-status-choices
   (p/let [file (write-temp-graph-file
                  "pages/tasks.md"
-                 "- TODO todo item\n- LATER later item\n- NOW now item\n- DOING doing item\n- WAIT waiting item\n- WAITING waiting full item\n- IN-PROGRESS in-progress item\n- DONE done item\n")
+                 (str "- TODO\n"
+                      "- DONE\n"
+                      "- I recorded a [[voice note]].\n"
+                      "  - TODO\n"
+                      "- TODO todo item\n"
+                      "- LATER later item\n"
+                      "- NOW now item\n"
+                      "- DOING doing item\n"
+                      "- WAIT waiting item\n"
+                      "- WAITING waiting full item\n"
+                      "- IN-PROGRESS in-progress item\n"
+                      "- DONE done item\n"))
           conn (db-test/create-conn)
           _ (db-pipeline/add-listener conn)
           _ (import-files-to-db [file] conn {})]
@@ -328,6 +620,19 @@
     (is (= :logseq.property/status.done
            (:db/ident (block-status @conn "done item")))
         "DONE still imports to the built-in Done status")
+    (is (= {:logseq.property/status.todo 2
+            :logseq.property/status.done 1}
+           (frequencies (map #(-> % db-test/readable-properties :logseq.property/status)
+                             (task-blocks-by-title @conn ""))))
+        "Built-in task markers without titles still import as tasks")
+    (let [nested-empty-task (first (ordered-children (db-test/find-block-by-content @conn #"recorded")))]
+      (is (= "" (:block/title nested-empty-task))
+          "Nested nameless task keeps an empty title")
+      (is (= {:logseq.property/status :logseq.property/status.todo
+              :block/tags [:logseq.class/Task]}
+             (select-keys (db-test/readable-properties nested-empty-task)
+                          [:logseq.property/status :block/tags]))
+          "Nested nameless TODO keeps its task properties"))
     (is (= :logseq.property/status.todo
            (:db/ident (block-status @conn "later item")))
         "LATER imports to the built-in Todo status")
@@ -365,8 +670,221 @@
     (is (empty? (map :entity (:errors (db-validate/validate-local-db! @conn))))
         "Imported graph validates")))
 
+(deftest-async import-repairs-duplicated-block-ids
+  (let [duplicated-uuid #uuid "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"]
+    (p/let [file (write-temp-graph-file
+                  "pages/duplicated-ids.md"
+                  (str "- First duplicated id\n"
+                       "  id:: " duplicated-uuid "\n"
+                       "- Second duplicated id\n"
+                       "  id:: " duplicated-uuid "\n"))
+            conn (db-test/create-conn)
+            _ (db-pipeline/add-listener conn)
+            _ (import-files-to-db [file] conn {})
+            first-block (db-test/find-block-by-content @conn "First duplicated id")
+            second-block (db-test/find-block-by-content @conn "Second duplicated id")]
+      (is (= duplicated-uuid (:block/uuid first-block))
+          "The first imported block keeps the original id")
+      (is (some? (:block/uuid second-block))
+          "The duplicate imported block gets a replacement id")
+      (is (not= duplicated-uuid (:block/uuid second-block))
+          "The duplicate imported block does not keep the conflicting id")
+      (is (empty? (map :entity (:errors (db-validate/validate-local-db! @conn))))
+          "Imported graph validates"))))
+
+(deftest-async import-block-with-namespaced-tag-keeps-its-other-tags
+  (p/doseq [[content expected-tags]
+            [["- item #[[ns/child]] note #idea #research\n" #{"child" "idea" "research"}]
+             ["- item #[[ns/child]] note #ns #idea #research\n" #{"ns" "child" "idea" "research"}]]]
+    (p/let [file (write-temp-graph-file "pages/sample.md" content)
+            conn (db-test/create-conn)
+            _ (db-pipeline/add-listener conn)
+            _ (import-files-to-db [file] conn {:convert-all-tags? true})
+            block (db-test/find-block-by-content @conn #"item")]
+      (testing content
+        (is (= expected-tags (set (map :block/title (:block/tags block))))
+            "All explicit tags are preserved")))))
+
+(deftest-async import-fenced-blocks-with-properties-after-their-fence
+  (p/doseq [[opening title closing display-type language]
+            [["```clojure" "(x 1)" "```" :code "clojure"]
+             ["TODO ```clojure" "(x 1)" "```" :code "clojure"]
+             ["$$" "E = mc^2" "$$" :math nil]
+             ["DONE $$" "E = mc^2" "$$" :math nil]]]
+    (let [block-uuid #uuid "11111111-1111-4111-8111-111111111112"]
+      (p/let [file (write-temp-graph-file
+                    "pages/C.md"
+                    (str "- " opening "\n"
+                         "  " title "\n"
+                         "  " closing "\n"
+                         "  id:: " block-uuid "\n"
+                         "  rating:: 5\n"
+                         "- {{embed ((" block-uuid "))}}\n"))
+              conn (db-test/create-conn)
+              _ (db-pipeline/add-listener conn)
+              _ (import-files-to-db [file] conn {})
+              block (d/entity @conn [:block/uuid block-uuid])]
+        (testing opening
+          (is (= title (:block/title block))
+              "Property lines after the closing fence are not part of the title")
+          (is (= display-type (:logseq.property.node/display-type block)))
+          (is (= language (:logseq.property.code/lang block)))
+          (is (some? (get block :user.property/rating))
+              "The property after the fence is the block's property"))))))
+
+(deftest-async import-code-and-math-blocks-keep-task-and-tags
+  (p/let [file (write-temp-graph-file
+                "pages/T.md"
+                (str "- TODO ```clojure\n"
+                     "  (x 1)\n"
+                     "  ```\n"
+                     "- DONE $$\n"
+                     "  E = mc^2\n"
+                     "  $$\n"))
+          conn (db-test/create-conn)
+          _ (db-pipeline/add-listener conn)
+          _ (import-files-to-db [file] conn {})
+          [code math] (->> (:block/_page (db-test/find-page-by-title @conn "T")) (sort-by :block/order))
+          tag-idents (fn [b] (set (map :db/ident (:block/tags b))))]
+    (is (= :code (:logseq.property.node/display-type code)))
+    (is (= #{:logseq.class/Task :logseq.class/Code-block} (tag-idents code))
+        "a code block that is a task keeps its Task tag")
+    (is (= "E = mc^2" (:block/title math)))
+    (is (= :math (:logseq.property.node/display-type math))
+        "a math block that is a task is a math block")
+    (is (= #{:logseq.class/Task :logseq.class/Math-block} (tag-idents math))
+        "a math block that is a task keeps its Task tag")))
+(deftest-async import-keeps-text-around-embeds-unknown-embeds-and-multiline-math
+  (p/let [source-file (write-temp-graph-file
+                       "pages/A.md"
+                       (str "- Beta {{embed [[Alpha]]}} after\n"
+                            "- {{embed [[Gamma]]}}\n"
+                            "- b {{embed [[10307562-adaf-4557-89c4-bc8bbcd0d20e]]}}\n"
+                            "- $$\n"
+                            "  E = mc^2\n"
+                            "  $$\n"
+                            "- last\n"))
+          alpha-file (write-temp-graph-file "pages/Alpha.md" "- alpha\n")
+          gamma-file (write-temp-graph-file "pages/Gamma.md" "- gamma\n")
+          conn (db-test/create-conn)
+          _ (db-pipeline/add-listener conn)
+          _ (import-files-to-db [source-file alpha-file gamma-file] conn {})
+          page-a (db-test/find-page-by-title @conn "A")
+          blocks (->> (:block/_parent page-a) (sort-by :block/order) vec)]
+    (is (= 5 (count blocks))
+        "The whole file imports")
+    (is (= "Beta after" (:block/title (nth blocks 0)))
+        "Text around an embed is kept")
+    (is (= ["Alpha"] (map (comp :block/title :block/link) (:block/_parent (nth blocks 0))))
+        "The embed of a block with text is its child block")
+    (is (= "Gamma" (:block/title (:block/link (nth blocks 1))))
+        "A block that is only an embed links its target")
+    (is (string/starts-with? (:block/title (nth blocks 2)) "b")
+        "An embed of an unknown page keeps the block")
+    (is (= "E = mc^2" (:block/title (nth blocks 3)))
+        "A multi-line display math block keeps its formula")
+    (is (= :math (:logseq.property.node/display-type (nth blocks 3)))
+        "A multi-line display math block is a math block")
+    (is (= "last" (:block/title (nth blocks 4))))))
+
+(deftest-async import-embed-with-heading-or-status
+  (p/let [source-file (write-temp-graph-file
+                       "pages/E.md"
+                       (str "- ### {{embed [[Alpha]]}}\n"
+                            "- DONE {{embed [[Alpha]]}}\n"
+                            "- DONE UNDONE {{embed [[Alpha]]}}\n"
+                            "- DONE DONE {{embed [[Alpha]]}}\n"))
+          alpha-file (write-temp-graph-file "pages/Alpha.md" "- alpha\n")
+          conn (db-test/create-conn)
+          _ (db-pipeline/add-listener conn)
+          _ (import-files-to-db [source-file alpha-file] conn {})
+          [heading-embed done-embed undone-text done-text :as blocks] (->> (:block/_parent (db-test/find-page-by-title @conn "E")) (sort-by :block/order))]
+    (is (= 4 (count blocks)) "All source blocks are retained")
+    (is (= ["UNDONE" "DONE"] (mapv :block/title [undone-text done-text])))
+    (is (every? #(= :logseq.property/status.done (:db/ident (:logseq.property/status %)))
+                [undone-text done-text]))
+    (is (= "Alpha" (:block/title (:block/link heading-embed))) "an embed with a heading is an embed block")
+    (is (= 3 (:logseq.property/heading heading-embed)))
+    (is (= "Alpha" (:block/title (:block/link done-embed))) "an embed with a status is an embed block")
+    (is (= :logseq.property/status.done (:db/ident (:logseq.property/status done-embed))))))
+
+(deftest-async import-preserves-literal-embed-macros
+  (p/doseq [literal ["`{{embed [[Beta]]}}`"
+                    "``{{embed [[Beta]]}}``"
+                    "\n```text\n{{embed [[Beta]]}}\n```"]]
+    (p/let [source (write-temp-graph-file "pages/Literal.md"
+                                        (str "- " (string/replace (str "示例 " literal "\n{{embed [[Alpha]]}} after")
+                                                                  "\n" "\n  ") "\n"))
+            target (write-temp-graph-file "pages/Alpha.md" "- target\n")
+            conn (db-test/create-conn)
+            _ (db-pipeline/add-listener conn)
+            _ (import-files-to-db [source target] conn {})
+            block (first (:block/_parent (db-test/find-page-by-title @conn "Literal")))]
+      (is (= (str "示例 " literal "\n after") (:block/title block)))
+      (is (= ["Alpha"] (mapv (comp :block/title :block/link) (ordered-children block)))))))
+
+(deftest-async import-preserves-multiple-embeds
+  (p/let [source (write-temp-graph-file "pages/Embeds.md"
+                                      (str "- before {{embed [[Alpha]]}} middle {{embed [[Beta]]}} after\n"
+                                           "- {{embed [[Alpha]]}} {{embed [[Beta]]}}\n"))
+          alpha (write-temp-graph-file "pages/Alpha.md" "- alpha\n")
+          beta (write-temp-graph-file "pages/Beta.md" "- beta\n")
+          conn (db-test/create-conn)
+          _ (db-pipeline/add-listener conn)
+          _ (import-files-to-db [source alpha beta] conn {})
+          blocks (ordered-children (db-test/find-page-by-title @conn "Embeds"))]
+    (is (= ["before middle after" ""] (mapv :block/title blocks)))
+    (is (= [["Alpha" "Beta"] ["Alpha" "Beta"]]
+           (mapv #(mapv (comp :block/title :block/link) (ordered-children %)) blocks)))))
+
+(deftest-async import-thematic-break-block
+  (p/let [source-file (write-temp-graph-file "pages/H.md" "- a\n- ---\n- b\n")
+          conn (db-test/create-conn)
+          _ (db-pipeline/add-listener conn)
+          _ (import-files-to-db [source-file] conn {})
+          blocks (->> (:block/_page (db-test/find-page-by-title @conn "H")) (sort-by :block/order))]
+    (is (= ["a" "---" "b"] (mapv :block/title blocks))
+        "a block whose text is a thematic break keeps it")))
+
+(deftest-async import-multiline-math-as-first-block
+  (p/let [source-file (write-temp-graph-file
+                       "pages/M.md"
+                       (str "- $$\n"
+                            "  E = mc^2\n"
+                            "  $$\n"))
+          conn (db-test/create-conn)
+          _ (db-pipeline/add-listener conn)
+          _ (import-files-to-db [source-file] conn {})
+          block (first (:block/_page (db-test/find-page-by-title @conn "M")))]
+    (is (= "E = mc^2" (:block/title block)))
+    (is (= :math (:logseq.property.node/display-type block)))))
+
+(deftest-async import-keeps-numeric-looking-text-a-number-would-change
+  (p/let [file (write-temp-graph-file
+                "pages/paper.md"
+                (str "arxiv:: 0000.00000\n"
+                     "version:: 2401.10000\n"
+                     "code:: 007\n"
+                     "price:: 3.14\n"
+                     "count:: 42\n\n"
+                     "- note\n"))
+          conn (db-test/create-conn)
+          _ (db-pipeline/add-listener conn)
+          _ (import-files-to-db [file] conn {})
+          page (db-test/find-page-by-title @conn "paper")
+          value (fn [k] (some-> (get page (keyword "user.property" k)) db-property/property-value-content))]
+    (is (= "0000.00000" (value "arxiv")) "a value a number would turn into 0 stays text")
+    (is (= "2401.10000" (value "version")) "trailing zeros are kept")
+    (is (= "007" (str (value "code"))) "leading zeros are kept")
+    (is (= 3.14 (value "price")) "a float that prints the same is a number")
+    (is (= 42 (value "count")) "an integer is a number")
+    (is (empty? (map :entity (:errors (db-validate/validate-local-db! @conn))))
+        "Imported graph validates")))
+
 (deftest-async import-removes-pre-block-marker-and-missing-block-refs
   (let [missing-uuid #uuid "11111111-1111-1111-1111-111111111111"
+        missing-embed-uuid #uuid "55555555-5555-5555-5555-555555555555"
+        missing-mixed-embed-uuid #uuid "66666666-6666-4666-8666-666666666666"
         target-uuid #uuid "22222222-2222-2222-2222-222222222222"
         empty-title-property-uuid #uuid "33333333-3333-3333-3333-333333333333"
         empty-title-parent-uuid #uuid "44444444-4444-4444-4444-444444444444"]
@@ -374,6 +892,10 @@
                          "pages/A.md"
                          (str "Plain pre-block\n"
                               "- Missing ref ((" missing-uuid "))\n"
+                              "- {{embed ((" missing-embed-uuid "))}}\n"
+                              "- Missing mixed {{embed [[" missing-mixed-embed-uuid "]]}}\n"
+                              "  - Original child\n"
+                              "- Forward embed {{embed [[" target-uuid "]]}}\n"
                               "- Existing ref ((" target-uuid "))\n"
                               "- ((" empty-title-property-uuid "))\n"
                               "  heading:: true\n"
@@ -390,6 +912,8 @@
             missing-block (db-test/find-block-by-content @conn #"Missing ref")
             existing-block (db-test/find-block-by-content @conn #"Existing ref")
             target-block (db-test/find-block-by-content @conn "Target block")
+            missing-mixed-block (db-test/find-block-by-content @conn "Missing mixed")
+            forward-embed-block (db-test/find-block-by-content @conn "Forward embed")
             empty-title-blocks (blocks-by-title @conn "")
             empty-title-property-block (some #(when (:logseq.property/heading %) %) empty-title-blocks)
             empty-title-parent-block (some #(when (some (fn [child]
@@ -400,17 +924,34 @@
       (is (empty? (filter #(= :block/pre-block? (:a %))
                           (d/datoms @conn :eavt)))
           "Legacy pre-block markers are never transacted")
+      (is (= "Plain pre-block"
+             (:block/title (db-test/find-block-by-content @conn "Plain pre-block")))
+          "Non-property content before the first outline block is imported")
       (is (= "Missing ref" (:block/title missing-block))
           "Missing OG block refs are removed from imported content")
       (is (empty? (:block/refs missing-block))
           "Missing OG block refs are removed from imported refs")
       (is (nil? (d/entity @conn [:block/uuid missing-uuid]))
           "Missing OG block refs do not leave placeholder entities")
+      (is (nil? (d/entity @conn [:block/uuid missing-mixed-embed-uuid]))
+          "Missing UUID embeds do not leave placeholder entities")
+      (is (= ["Original child"] (mapv :block/title (ordered-children missing-mixed-block)))
+          "Only generated children for missing embeds are removed")
+      (is (= [(:db/id target-block)]
+             (mapv (comp :db/id :block/link) (ordered-children forward-embed-block)))
+          "Embeds of targets imported later are retained")
+      (is (nil? (d/entity @conn [:block/uuid missing-embed-uuid]))
+          "Missing OG block embeds do not leave placeholder entities")
+      (is (empty? (d/q '[:find ?b
+                         :where [?b :block/link ?target]
+                         [(missing? $ ?target :block/uuid)]]
+                       @conn))
+          "Missing OG block embeds do not leave dangling block links")
       (is (nil? (d/entity @conn [:block/uuid empty-title-property-uuid]))
           "Missing OG block refs in empty-title property blocks do not leave placeholder entities")
       (is (nil? (d/entity @conn [:block/uuid empty-title-parent-uuid]))
           "Missing OG block refs in empty-title parent blocks do not leave placeholder entities")
-      (is (= 2 (count empty-title-blocks))
+      (is (= 3 (count (remove :block/link empty-title-blocks)))
           "Blocks whose titles become empty after cleanup are preserved")
       (is (true? (:logseq.property/heading empty-title-property-block))
           "Empty-title blocks keep imported heading properties")
@@ -423,6 +964,209 @@
           "Existing block refs are preserved, including forward refs from later files")
       (is (empty? (map :entity (:errors (db-validate/validate-local-db! @conn))))
           "Imported graph validates"))))
+
+(deftest-async import-preserves-non-outline-pre-block-content
+  (p/do
+    (testing "plain paragraphs and code with no bullets or headings"
+      (p/let [file (write-temp-graph-file
+                    "pages/winsock.md"
+                    (str "This is a paragraph about winsock.\n\n"
+                         "Another paragraph.\n\n"
+                         "```javascript\n"
+                         "console.log('hi')\n"
+                         "```\n"))
+              conn (db-test/create-conn)
+              _ (db-pipeline/add-listener conn)
+              _ (import-files-to-db [file] conn {})
+              page (db-test/find-page-by-title @conn "winsock")
+              children (ordered-children page)
+              titles (mapv :block/title children)
+              nested-titles (mapv :block/title (mapcat ordered-children children))]
+        (is (seq children)
+            "A file with no outline bullets or headings still imports content")
+        (is (some #(string/includes? % "This is a paragraph about winsock.") titles)
+            "Paragraph content is imported")
+        (is (or (some #(string/includes? % "console.log") titles)
+                (some #(string/includes? % "console.log") nested-titles))
+            "Fenced code content is imported")
+        (is (empty? (filter #(= :block/pre-block? (:a %))
+                            (d/datoms @conn :eavt)))
+            "Legacy pre-block markers are never transacted")
+        (is (empty? (map :entity (:errors (db-validate/validate-local-db! @conn))))
+            "Imported graph validates")))
+
+    (testing "page properties plus non-bullet body"
+      (p/let [file (write-temp-graph-file
+                    "pages/notes.md"
+                    (str "note-type:: draft\n"
+                         "topic:: networking\n\n"
+                         "Winsock is a Windows API.\n"))
+              conn (db-test/create-conn)
+              _ (db-pipeline/add-listener conn)
+              _ (import-files-to-db [file] conn {})
+              page (db-test/find-page-by-title @conn "notes")
+              children (ordered-children page)
+              titles (mapv :block/title children)]
+        (is (= {:user.property/note-type "draft"
+                :user.property/topic "networking"
+                :block/tags [:logseq.class/Page]}
+               (db-test/readable-properties page))
+            "Page-level properties are imported onto the page")
+        (is (some #(string/includes? % "Winsock is a Windows API.") titles)
+            "Non-property body is imported as block content")
+        (is (not-any? #(or (string/includes? % "note-type::")
+                           (string/includes? % "topic::"))
+                      titles)
+            "Page property text is not duplicated into the block title")
+        (is (empty? (filter #(= :block/pre-block? (:a %))
+                            (d/datoms @conn :eavt)))
+            "Legacy pre-block markers are never transacted")
+        (is (empty? (map :entity (:errors (db-validate/validate-local-db! @conn))))
+            "Imported graph validates")))
+
+    (testing "property-only page does not create an empty block"
+      (p/let [file (write-temp-graph-file
+                    "pages/only-props.md"
+                    "note-type:: draft\n")
+              conn (db-test/create-conn)
+              _ (db-pipeline/add-listener conn)
+              _ (import-files-to-db [file] conn {})
+              page (db-test/find-page-by-title @conn "only-props")]
+        (is (= {:user.property/note-type "draft"
+                :block/tags [:logseq.class/Page]}
+               (db-test/readable-properties page))
+            "Property-only files still import page properties")
+        (is (empty? (ordered-children page))
+            "Property-only pre-blocks are omitted as empty blocks")
+        (is (empty? (filter #(= :block/pre-block? (:a %))
+                            (d/datoms @conn :eavt)))
+            "Legacy pre-block markers are never transacted")
+        (is (empty? (map :entity (:errors (db-validate/validate-local-db! @conn))))
+            "Imported graph validates")))
+
+    (testing "non-property content before the first outline block"
+      (p/let [file (write-temp-graph-file
+                    "pages/intro.md"
+                    (str "note-type:: open\n\n"
+                         "Intro paragraph before any outline.\n\n"
+                         "- first bullet\n"
+                         "- second bullet\n"))
+              conn (db-test/create-conn)
+              _ (db-pipeline/add-listener conn)
+              _ (import-files-to-db [file] conn {})
+              page (db-test/find-page-by-title @conn "intro")
+              titles (mapv :block/title (ordered-children page))]
+        (is (= {:user.property/note-type "open"
+                :block/tags [:logseq.class/Page]}
+               (db-test/readable-properties page))
+            "Page-level properties are imported onto the page")
+        (is (= ["Intro paragraph before any outline." "first bullet" "second bullet"] titles)
+            "Intro content is imported as a sibling of later outline blocks")
+        (is (empty? (filter #(= :block/pre-block? (:a %))
+                            (d/datoms @conn :eavt)))
+            "Legacy pre-block markers are never transacted")
+        (is (empty? (map :entity (:errors (db-validate/validate-local-db! @conn))))
+            "Imported graph validates")))))
+
+(deftest-async import-converts-markdown-headings-to-db-heading-metadata
+  (p/let [file (write-temp-graph-file
+                "pages/headings.md"
+                (str "# Top H1\n"
+                     "## Top H2\n"
+                     "### Top H3\n"
+                     "#### Top H4\n"
+                     "##### Top H5\n"
+                     "###### Top H6\n"
+                     "- # List H1\n"
+                     "- ## List H2\n"
+                     "- ### List H3\n"
+                     "- #### List H4\n"
+                     "- ##### List H5\n"
+                     "- ###### List H6\n"
+                     "- ####### Too many hashes\n"
+                     "- #hashtag-not-heading remains text\n"
+                     "- regular block\n"
+                     "- Auto heading\n"
+                     "  heading:: true\n"
+                     "- Numbered heading property\n"
+                     "  heading:: 3\n"
+                     "- ## TODO task heading\n"
+                     "- ## Parent heading\n"
+                     "  - child of heading\n"))
+          conn (db-test/create-conn)
+          _ (db-pipeline/add-listener conn)
+          _ (import-files-to-db [file] conn {})]
+    (doseq [[pattern title level]
+            [[#"Top H1$" "Top H1" 1]
+             [#"Top H2$" "Top H2" 2]
+             [#"Top H3$" "Top H3" 3]
+             [#"Top H4$" "Top H4" 4]
+             [#"Top H5$" "Top H5" 5]
+             [#"Top H6$" "Top H6" 6]
+             [#"List H1$" "List H1" 1]
+             [#"List H2$" "List H2" 2]
+             [#"List H3$" "List H3" 3]
+             [#"List H4$" "List H4" 4]
+             [#"List H5$" "List H5" 5]
+             [#"List H6$" "List H6" 6]]]
+      (let [block (db-test/find-block-by-content @conn pattern)]
+        (is (some? block)
+            (str "imported markdown heading " title))
+        (is (= title (:block/title block))
+            (str title " is stored without markdown heading markers"))
+        (is (not (string/starts-with? (or (:block/title block) "") "#"))
+            (str title " does not start with #"))
+        (is (= level (:logseq.property/heading block))
+            (str title " heading level is " level))))
+    (let [too-many (db-test/find-block-by-content @conn #"Too many hashes")
+          hashtag (db-test/find-block-by-content @conn #"remains text")
+          regular (db-test/find-block-by-content @conn "regular block")
+          auto (db-test/find-block-by-content @conn "Auto heading")
+          numbered (db-test/find-block-by-content @conn "Numbered heading property")
+          task (db-test/find-block-by-content @conn #"task heading$")
+          parent (db-test/find-block-by-content @conn #"Parent heading$")
+          child (db-test/find-block-by-content @conn "child of heading")]
+      (is (= "Too many hashes" (:block/title too-many))
+          "Seven-hash titles still drop literal heading markers")
+      (is (some? (:logseq.property/heading too-many))
+          "Parser-assigned heading metadata is kept for seven-hash titles")
+      (is (string/includes? (or (:block/title hashtag) "") "remains text")
+          "Hashtags without a space are not treated as headings")
+      (is (nil? (:logseq.property/heading hashtag))
+          "Hashtag blocks do not get heading metadata")
+      (is (nil? (:logseq.property/heading regular))
+          "Regular blocks are not headings")
+      (is (true? (:logseq.property/heading auto))
+          "heading:: true imports as auto heading metadata")
+      (is (= "Auto heading" (:block/title auto))
+          "heading:: true keeps the title without markdown markers")
+      (is (= 3 (:logseq.property/heading numbered))
+          "heading:: 3 imports as heading level 3")
+      (is (= "Numbered heading property" (:block/title numbered))
+          "heading:: 3 keeps the title without markdown markers")
+      (is (= "task heading" (:block/title task))
+          "Task heading titles are stored without markdown heading markers")
+      (is (= 2 (:logseq.property/heading task))
+          "Task heading keeps heading level from markdown syntax")
+      (is (= :logseq.property/status.todo
+             (:logseq.property/status (db-test/readable-properties task)))
+          "Task heading still imports as a TODO task")
+      (is (= "Parent heading" (:block/title parent))
+          "Parent heading title is stored without markdown heading markers")
+      (is (= 2 (:logseq.property/heading parent))
+          "Parent heading level is imported")
+      (is (= ["child of heading"] (mapv :block/title (ordered-children parent)))
+          "Heading parent keeps its children")
+      (is (nil? (:logseq.property/heading child))
+          "Child of a heading is not itself a heading"))
+    (is (empty? (map :entity (:errors (db-validate/validate-local-db! @conn))))
+        "Imported graph validates")))
+
+(deftest-async import-generated-markdown-file-graph
+  (assert-generated-md-file-graphs-import generated-file-graph-test-seeds))
+
+(deftest-async ^:integration import-generated-markdown-file-graph-fuzz
+  (assert-generated-md-file-graphs-import (range 1 101)))
 
 (deftest-async export-doc-files-propagates-missing-block-ref-cleanup-report
   (let [missing-uuid #uuid "55555555-5555-5555-5555-555555555555"
@@ -443,6 +1187,256 @@
       (is (nil? (d/entity @conn [:block/uuid missing-uuid]))
           "Missing OG block ref placeholder is removed"))))
 
+(deftest export-doc-files-continues-after-export-file-failure
+  (cljs.test/async
+   done
+   (let [attempted-paths (atom [])
+         failed-error (ex-info "worker transact failed" {:code :worker-transact-failed})
+         graph-dir (write-temp-file-graph [["pages/A.md" "- first\n"]
+                                           ["pages/B.md" "- second\n"]])
+         first-file (node-path/join graph-dir "pages/A.md")
+         second-file (node-path/join graph-dir "pages/B.md")
+         conn (db-test/create-conn)
+         notifications (atom [])
+         doc-options (gp-exporter/build-doc-options
+                      {:macros {} :file/name-format :triple-lowbar}
+                      (merge default-export-options
+                             {:notify-user #(swap! notifications conj %)
+                              :user-options {:convert-all-tags? false}
+                              :<export-file (fn [conn' {:file/keys [path content]} opts]
+                                              (swap! attempted-paths conj path)
+                                              (if (= path first-file)
+                                                (p/rejected failed-error)
+                                                (gp-exporter/<add-file-to-db-graph conn' path content opts)))}))]
+     (-> (gp-exporter/export-doc-files
+          conn
+          [{:path first-file} {:path second-file}]
+          <read-file
+          doc-options)
+         (p/then (fn [_]
+                   (is (= [first-file second-file] @attempted-paths)
+                       "Import continues with later files after one export failure")
+                   (is (= [first-file]
+                          (map :path @(:ignored-files (:import-state doc-options))))
+                       "Failed files are recorded in import state")
+                   (is (some #(= :error (:level %)) @notifications)
+                       "The failed file is reported to the user")
+                   (is (some? (db-test/find-block-by-content @conn "second"))
+                       "Later files are still imported")
+                   (is (nil? (db-test/find-block-by-content @conn "first"))
+                       "The failed file is not imported")
+                   (done)))
+         (p/catch (fn [error]
+                    (is false (str "Single file failure should not abort import: " error))
+                    (done)))))))
+
+(defn- <export-in-memory-doc-files
+  "Import in-memory file maps. `path->stat` is a path-> {:birthtime :mtime} map.
+   Pass `:file-created-at` / `:file-updated-at` on a file map to simulate the UI
+   worker path, where `<get-file-stat` is unavailable.
+   Pass an existing `conn` to import more files into the same graph."
+  ([files path->stat]
+   (<export-in-memory-doc-files files path->stat nil))
+  ([files path->stat conn]
+   (p/let [existing-conn? (some? conn)
+           conn (or conn (db-test/create-conn))
+           _ (when-not existing-conn?
+               (db-pipeline/add-listener conn))
+           doc-options (gp-exporter/build-doc-options
+                        {:macros {} :file/name-format :triple-lowbar}
+                        (merge default-export-options
+                               {:user-options {:convert-all-tags? false}
+                                :<get-file-stat (fn [path] (get path->stat path))
+                                :<export-file (fn [conn' file-map opts]
+                                                (gp-exporter/<add-file-to-db-graph
+                                                 conn' (:file/path file-map) (:file/content file-map) opts))}))
+           _ (gp-exporter/export-doc-files conn files
+                                           #(p/resolved (:content %))
+                                           doc-options)]
+     conn)))
+
+(deftest-async export-doc-files-preserves-filesystem-timestamps
+  (let [created-at (js/Date. "2020-01-02T03:04:05.000Z")
+        modified-at (js/Date. "2021-06-07T08:09:10.000Z")
+        source-file {:path "pages/A.md" :content "- [[Timestamps]]\n"}
+        file {:path "pages/timestamps.md" :content "- timestamped\n"}]
+    (p/let [conn (<export-in-memory-doc-files
+                  [source-file file]
+                  {(:path file) {:birthtime created-at :mtime modified-at}})
+            page (ldb/get-page @conn "timestamps")
+            block (db-test/find-block-by-content @conn "timestamped")]
+      (is (= (.getTime created-at) (:block/created-at page) (:block/created-at block)))
+      (is (= (.getTime modified-at) (:block/updated-at page) (:block/updated-at block)))
+      (is (empty? (:errors (db-validate/validate-local-db! @conn)))))))
+
+(deftest-async export-doc-files-uses-serialized-file-timestamps-without-stat
+  (let [created-at (.getTime (js/Date. "2020-01-02T03:04:05.000Z"))
+        modified-at (.getTime (js/Date. "2021-06-07T08:09:10.000Z"))
+        file {:path "pages/sport.md"
+              :content "alias:: sportlich\n"
+              :file-created-at created-at
+              :file-updated-at modified-at}]
+    (p/let [conn (<export-in-memory-doc-files [file] {})
+            page (ldb/get-page @conn "sport")]
+      (is (= created-at (:block/created-at page)))
+      (is (= modified-at (:block/updated-at page)))
+      (is (empty? (:errors (db-validate/validate-local-db! @conn)))))))
+
+(deftest-async export-doc-files-preserves-alias-only-page-file-timestamps
+  (let [created-at (js/Date. "2024-03-09T19:03:41.000Z")
+        modified-at (js/Date. "2024-03-08T21:19:12.000Z")
+        mention {:path "journals/2024_01_01.md" :content "- [[Sport]]\n"}
+        file {:path "pages/Sport.md" :content "alias:: sportlich\n"}]
+    (p/let [conn (<export-in-memory-doc-files
+                  [mention file]
+                  {(:path file) {:birthtime created-at :mtime modified-at}})
+            page (ldb/get-page @conn "sport")]
+      (is (= (.getTime created-at) (:block/created-at page)))
+      (is (= (.getTime modified-at) (:block/updated-at page)))
+      (is (empty? (:errors (db-validate/validate-local-db! @conn)))))))
+
+(deftest-async export-doc-files-preserves-multi-alias-page-file-timestamps
+  (let [created-at (js/Date. "2025-01-03T13:45:32.000Z")
+        modified-at (js/Date. "2025-03-02T03:31:18.000Z")
+        mention {:path "journals/2024_01_01.md" :content "- [[schlafe]]\n"}
+        file {:path "pages/Schlaf.md"
+              :content "alias:: schlafe, schlafen, geschlafen, Schlafrhythmus, wach\n\n- ## Problems\n"}]
+    (p/let [conn (<export-in-memory-doc-files
+                  [mention file]
+                  {(:path file) {:birthtime created-at :mtime modified-at}})
+            page (ldb/get-page @conn "schlaf")
+            alias-page (ldb/get-page @conn "schlafe")]
+      (is (= (.getTime created-at) (:block/created-at page)))
+      (is (= (.getTime modified-at) (:block/updated-at page)))
+      (is (= #{"schlafe" "schlafen" "geschlafen" "schlafrhythmus" "wach"}
+             (set (map :block/name (:block/alias page)))))
+      (is (= (:db/id page) (:db/id (ldb/get-alias-source-page @conn (:db/id alias-page)))))
+      (is (empty? (:errors (db-validate/validate-local-db! @conn)))))))
+
+(deftest-async export-doc-files-uses-first-journal-mention-for-fileless-pages
+  (let [journal-day 20240308
+        expected (date-time-util/journal-day->ms journal-day)
+        journal {:path "journals/2024_03_08.md" :content "- first mention [[Referenced Only]]\n"}
+        later {:path "journals/2024_06_01.md" :content "- later mention [[Referenced Only]]\n"}]
+    (p/let [conn (<export-in-memory-doc-files [journal later] {})
+            page (ldb/get-page @conn "referenced only")]
+      (is (= expected (:block/created-at page)))
+      (is (= expected (:block/updated-at page)))
+      (is (empty? (:errors (db-validate/validate-local-db! @conn)))))))
+
+(deftest-async export-doc-files-keeps-journal-day-when-journal-has-file-stats
+  (let [expected (date-time-util/journal-day->ms 20240308)
+        file-created-at (js/Date. "2025-08-01T00:00:00.000Z")
+        file-updated-at (js/Date. "2025-08-02T00:00:00.000Z")
+        journal {:path "journals/2024_03_08.md" :content "- first mention [[Referenced Only]]\n"}]
+    (p/let [conn (<export-in-memory-doc-files
+                  [journal]
+                  {(:path journal) {:birthtime file-created-at :mtime file-updated-at}})
+            page (ldb/get-page @conn "referenced only")]
+      (is (= expected (:block/created-at page) (:block/updated-at page)))
+      (is (empty? (:errors (db-validate/validate-local-db! @conn)))))))
+
+(deftest-async export-doc-files-keeps-journal-page-created-at-on-journal-day
+  (let [expected (date-time-util/journal-day->ms 20240308)
+        modified-at (js/Date. "2025-08-02T00:00:00.000Z")
+        journal {:path "journals/2024_03_08.md" :content "- journal block\n"}]
+    (p/let [conn (<export-in-memory-doc-files
+                  [journal]
+                  {(:path journal) {:mtime modified-at}})
+            page (db-test/find-page-by-title @conn "Mar 8th, 2024")
+            block (db-test/find-block-by-content @conn "journal block")]
+      (is (= expected (:block/created-at page)))
+      (is (= expected (:block/created-at block)))
+      (is (not= (.getTime modified-at) (:block/created-at page)))
+      (is (empty? (:errors (db-validate/validate-local-db! @conn)))))))
+
+(deftest-async export-doc-files-keeps-journal-day-when-journal-mentions-another-date
+  (let [expected (date-time-util/journal-day->ms 20240308)
+        journal {:path "journals/2024_03_08.md"
+                 :content "- first mention [[Referenced Only]] [[Mar 9th, 2024]]\n"}]
+    (p/let [conn (<export-in-memory-doc-files [journal] {})
+            page (ldb/get-page @conn "referenced only")]
+      (is (= expected (:block/created-at page) (:block/updated-at page)))
+      (is (empty? (:errors (db-validate/validate-local-db! @conn)))))))
+
+(deftest-async export-doc-files-keeps-file-timestamps-when-page-mentions-one-journal
+  (let [created-at (js/Date. "2020-01-02T03:04:05.000Z")
+        modified-at (js/Date. "2021-06-07T08:09:10.000Z")
+        file {:path "pages/foo.md" :content "- [[Mar 8th, 2024]]\n"}]
+    (p/let [conn (<export-in-memory-doc-files
+                  [file]
+                  {(:path file) {:birthtime created-at :mtime modified-at}})
+            page (ldb/get-page @conn "foo")]
+      (is (= (.getTime created-at) (:block/created-at page)))
+      (is (= (.getTime modified-at) (:block/updated-at page)))
+      (is (empty? (:errors (db-validate/validate-local-db! @conn)))))))
+
+(deftest-async export-doc-files-keeps-journal-mention-when-later-file-has-no-stats
+  (let [expected (date-time-util/journal-day->ms 20240308)
+        mention {:path "journals/2024_03_08.md" :content "- [[Later File]]\n"}
+        file {:path "pages/Later File.md" :content "- later file\n"}]
+    (p/let [conn (<export-in-memory-doc-files [mention file] {})
+            page (ldb/get-page @conn "later file")]
+      (is (= expected (:block/created-at page) (:block/updated-at page)))
+      (is (empty? (:errors (db-validate/validate-local-db! @conn)))))))
+
+(deftest-async export-doc-file-ignores-epoch-zero-birthtime
+  (let [modified-at (js/Date. "2021-06-07T08:09:10.000Z")
+        file {:path "pages/epoch.md" :content "- epoch birth\n"}]
+    (p/let [conn (<export-in-memory-doc-files
+                  [file]
+                  {(:path file) {:birthtime (js/Date. 0) :mtime modified-at}})
+            page (ldb/get-page @conn "epoch")]
+      (is (= (.getTime modified-at) (:block/created-at page) (:block/updated-at page)))
+      (is (empty? (:errors (db-validate/validate-local-db! @conn)))))))
+
+(deftest-async export-doc-file-uses-mtime-when-birthtime-missing
+  (let [modified-at (js/Date. "2021-06-07T08:09:10.000Z")
+        file {:path "pages/mtime-only.md" :content "- mtime only\n"}]
+    (p/let [conn (<export-in-memory-doc-files
+                  [file]
+                  {(:path file) {:mtime modified-at}})
+            page (ldb/get-page @conn "mtime-only")]
+      (is (= (.getTime modified-at) (:block/created-at page) (:block/updated-at page)))
+      (is (empty? (:errors (db-validate/validate-local-db! @conn)))))))
+
+(deftest-async export-doc-files-uses-file-mtime-when-journal-mentions-page
+  (let [journal-day-ms (date-time-util/journal-day->ms 20240308)
+        modified-at (js/Date. "2021-06-07T08:09:10.000Z")
+        mention {:path "journals/2024_03_08.md" :content "- [[Mtime Page]]\n"}
+        file {:path "pages/Mtime Page.md" :content "- see [[Mtime Page]]\n"}]
+    (p/let [conn (<export-in-memory-doc-files
+                  [mention file]
+                  {(:path file) {:mtime modified-at}})
+            page (ldb/get-page @conn "mtime page")]
+      (is (= (.getTime modified-at) (:block/created-at page) (:block/updated-at page)))
+      (is (not= journal-day-ms (:block/created-at page)))
+      (is (empty? (:errors (db-validate/validate-local-db! @conn)))))))
+
+(deftest-async export-doc-files-keeps-existing-file-timestamps-when-journal-mentions-page
+  (let [created-at (js/Date. "2020-01-02T03:04:05.000Z")
+        modified-at (js/Date. "2021-06-07T08:09:10.000Z")
+        file {:path "pages/Existing File.md" :content "- existing file\n"}
+        mention {:path "journals/2024_03_08.md" :content "- [[Existing File]]\n"}]
+    (p/let [conn (<export-in-memory-doc-files
+                  [file]
+                  {(:path file) {:birthtime created-at :mtime modified-at}})
+            _ (<export-in-memory-doc-files [mention] {} conn)
+            page (ldb/get-page @conn "existing file")]
+      (is (= (.getTime created-at) (:block/created-at page)))
+      (is (= (.getTime modified-at) (:block/updated-at page)))
+      (is (empty? (:errors (db-validate/validate-local-db! @conn)))))))
+
+(deftest-async export-doc-file-accepts-numeric-last-modified-at
+  (let [modified-at (.getTime (js/Date. "2021-06-07T08:09:10.000Z"))
+        file {:path "pages/numeric.md"
+              :content "- numeric mtime\n"
+              :last-modified-at modified-at}]
+    (p/let [conn (<export-in-memory-doc-files [file] {})
+            page (ldb/get-page @conn "numeric")]
+      (is (= modified-at (:block/created-at page) (:block/updated-at page)))
+      (is (empty? (:errors (db-validate/validate-local-db! @conn)))))))
+
 (deftest update-asset-links-in-block-title
   (are [x y]
        (= y (@#'gp-exporter/update-asset-links-in-block-title (first x) {(second x) "UUID"} (atom {})))
@@ -460,6 +1454,78 @@
     ["[[FIRST UUID]] and ![dino!](assets/subdir/partydino.gif)"
      "assets/subdir/partydino.gif"]
     "[[FIRST UUID]] and [[UUID]]"))
+
+(deftest-async import-missing-local-pdf-asset-link-is-ignored-quietly
+  (let [graph-dir (write-temp-file-graph
+                   {"logseq/config.edn" "{}"
+                    "pages/missing-asset.md" "- Missing local PDF [paper](../assets/missing-paper.pdf)\n"})
+        console-errors (atom [])
+        original-stderr-write (.-write (.-stderr js/process))]
+    (set! (.-write (.-stderr js/process))
+          (fn [& args]
+            (swap! console-errors conj (first args))
+            true))
+    (-> (p/let [conn (db-test/create-conn)
+                assets (atom [])
+                {:keys [import-state]} (import-file-graph-to-db graph-dir conn {:assets assets})]
+          (is (= [{:reason "No asset data found for this asset path"
+                   :path "../assets/missing-paper.pdf"
+                   :location {:block "Missing local PDF [paper](../assets/missing-paper.pdf)"}}]
+                 @(:ignored-assets import-state))
+              "Missing local PDF asset links are reported through ignored assets")
+          (is (empty? @console-errors)
+              "Missing local PDF asset links are ignored without noisy console errors")
+          (is (empty? (map :entity (:errors (db-validate/validate-local-db! @conn))))
+              "Imported graph validates"))
+        (p/finally (fn [_]
+                     (set! (.-write (.-stderr js/process)) original-stderr-write))))))
+
+(deftest-async import-asset-links-in-page-and-block-property-values
+  (let [pdf-bytes "%PDF-1.1\n%%EOF\n"
+        graph-dir (write-temp-file-graph
+                   {"logseq/config.edn" "{:meta/version 1 :file/name-format :triple-lowbar}"
+                    "pages/Vertrag.md"
+                    (str "url:: ![Anlage 1.pdf](../assets/Anlage_1_1700757846845_0.pdf)\n\n"
+                         "- page with asset in property\n"
+                         "- body link ![Body.pdf](../assets/Body_1700757846845_0.pdf)\n")
+                    "pages/Block_Prop.md" "- block\n  Link:: ![x.pdf](../assets/x.pdf)\n"
+                    "assets/Anlage_1_1700757846845_0.pdf" pdf-bytes
+                    "assets/Body_1700757846845_0.pdf" pdf-bytes
+                    "assets/x.pdf" pdf-bytes})]
+    (p/let [conn (db-test/create-conn)
+            assets (atom [])
+            {:keys [import-state]} (import-file-graph-to-db graph-dir conn {:assets assets})
+            page-asset (db-test/find-block-by-content @conn "Anlage_1_1700757846845_0")
+            block-asset (db-test/find-block-by-content @conn "x")
+            body-asset (db-test/find-block-by-content @conn "Body_1700757846845_0")
+            page (db-test/find-page-by-title @conn "Vertrag")
+            block (db-test/find-block-by-content @conn "block")
+            body-block (db-test/find-block-by-content @conn #"body link")]
+      (is (some? page-asset) "Page property PDF becomes an Asset")
+      (is (some? block-asset) "Block property PDF becomes an Asset")
+      (is (some? body-asset) "Body PDF still becomes an Asset")
+      (is (= {:block/tags [:logseq.class/Asset]
+              :logseq.property.asset/type "pdf"}
+             (select-keys (db-test/readable-properties page-asset)
+                          [:block/tags :logseq.property.asset/type]))
+          "Page property asset has correct type")
+      (is (= {:block/tags [:logseq.class/Asset]
+              :logseq.property.asset/type "pdf"}
+             (select-keys (db-test/readable-properties block-asset)
+                          [:block/tags :logseq.property.asset/type]))
+          "Block property asset has correct type")
+      (is (= (page-ref/->page-ref (:block/uuid page-asset))
+             (:user.property/url (db-test/readable-properties page)))
+          "Page property value references the imported asset")
+      (is (= (page-ref/->page-ref (:block/uuid block-asset))
+             (:user.property/link (db-test/readable-properties block)))
+          "Block property value references the imported asset")
+      (is (= (str "body link " (page-ref/->page-ref (:block/uuid body-asset)))
+             (:block/title body-block))
+          "Body asset links are unchanged")
+      (is (= 0 (count @(:ignored-assets import-state))) "No ignored assets")
+      (is (empty? (map :entity (:errors (db-validate/validate-local-db! @conn))))
+          "Imported graph validates"))))
 
 (deftest extract-template-blocks
   (let [page-uuid (random-uuid)
@@ -546,7 +1612,9 @@
           conn (db-test/create-conn)
           _ (db-pipeline/add-listener conn)
           {:keys [import-state]}
-          (import-file-graph-to-db file-graph-dir conn {:convert-all-tags? true})
+          (import-file-graph-to-db file-graph-dir conn {:convert-all-tags? true
+                                                       :import-timeout-ms (if js/process.env.CI 60000 30000)
+                                                       :import-heartbeat-ms 5000})
           end-time (cljs.core/system-time)]
 
     ;; Add multiplicative factor for CI as it runs about twice as slow
@@ -565,6 +1633,296 @@
                 (map first)
                 (remove #(= [{:db/ident :logseq.class/Tag}] (:block/tags %)))))
         "All classes only have :logseq.class/Tag as their tag (and don't have Page)")))
+
+(deftest-async import-linked-file-pdf-annotations
+  (let [annotation-id #uuid "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        area-annotation-id #uuid "cccccccc-cccc-cccc-cccc-cccccccccccc"
+        dir (fs/mkdtempSync (node-path/join (os/tmpdir) "logseq-graph-parser-test-"))
+        external-pdf-path (node-path/join dir "external/Linked Paper.pdf")
+        graph-dir (node-path/join dir "graph")
+        area-image-stamp "area-stamp"
+        encoded-pdf-uri (str "file://" (string/replace external-pdf-path " " "%20"))]
+    (fs/mkdirSync (node-path/dirname external-pdf-path) #js {:recursive true})
+    (fs/writeFileSync external-pdf-path "pdf")
+    (doseq [[relative-path content]
+            {"logseq/config.edn" "{}"
+             "pages/source.md" (str "- ![Linked Paper.pdf](" encoded-pdf-uri ")\n")
+             "pages/hls__Linked Paper.md" (str "file:: [Linked Paper.pdf](" encoded-pdf-uri ")\n"
+                                               "file-path:: " encoded-pdf-uri "\n\n"
+                                               "- External highlight from linked pdf\n"
+                                               "  ls-type:: annotation\n"
+                                               "  hl-page:: 3\n"
+                                               "  hl-color:: yellow\n"
+                                               "  id:: " annotation-id "\n"
+                                               "- External area highlight from linked pdf\n"
+                                               "  ls-type:: annotation\n"
+                                               "  hl-page:: 4\n"
+                                               "  hl-color:: yellow\n"
+                                               "  id:: " area-annotation-id "\n")
+             "assets/Linked Paper.edn" (str "{:highlights [{:id #uuid \"" annotation-id "\","
+                                            " :page 3,"
+                                            " :position {:bounding {:x1 1 :y1 2 :x2 3 :y2 4 :width 10 :height 20},"
+                                            "            :rects (),"
+                                            "            :page 3},"
+                                            " :content {:text \"External highlight from linked pdf\"},"
+                                            " :properties {:color \"yellow\"}}"
+                                            " {:id #uuid \"" area-annotation-id "\","
+                                            " :page 4,"
+                                            " :position {:bounding {:x1 11 :y1 12 :x2 13 :y2 14 :width 10 :height 20},"
+                                            "            :rects (),"
+                                            "            :page 4},"
+                                            " :content {:image \"" area-image-stamp "\"},"
+                                            " :properties {:color \"yellow\"}}]}")
+             (str "assets/Linked Paper/4_" area-annotation-id "_" area-image-stamp ".png") "png"}]
+      (let [file-path (node-path/join graph-dir relative-path)]
+        (fs/mkdirSync (node-path/dirname file-path) #js {:recursive true})
+        (fs/writeFileSync file-path content)))
+    (p/let [conn (db-test/create-conn)
+            assets (atom [])
+            {:keys [import-state]} (import-file-graph-to-db graph-dir conn {:assets assets})
+            asset (db-test/find-block-by-content @conn "Linked Paper")
+            annotation (db-test/find-block-by-content @conn "External highlight from linked pdf")
+            area-annotation (db-test/find-block-by-content @conn "External area highlight from linked pdf")]
+      (is (some? asset)
+          "Linked file PDF imports as an external Asset")
+      (is (= {:block/tags [:logseq.class/Asset]
+              :logseq.property.asset/type "pdf"
+              :logseq.property.asset/external-url encoded-pdf-uri}
+             (select-keys (db-test/readable-properties asset)
+                          [:block/tags
+                           :logseq.property.asset/type
+                           :logseq.property.asset/external-url]))
+          "Linked file PDF keeps the file URI as external asset metadata")
+      (is (= {:block/tags [:logseq.class/Pdf-annotation]
+              :logseq.property/asset "Linked Paper"
+              :logseq.property.pdf/hl-page 3}
+             (select-keys (db-test/readable-properties annotation)
+                          [:block/tags
+                           :logseq.property/asset
+                           :logseq.property.pdf/hl-page]))
+          "Linked file PDF annotations import and point at the external Asset")
+      (is (= {:block/tags [:logseq.class/Pdf-annotation]
+              :logseq.property/asset "Linked Paper"
+              :logseq.property.pdf/hl-page 4
+              :logseq.property.pdf/hl-image "pdf area highlight"
+              :logseq.property.pdf/hl-type :area}
+             (select-keys (db-test/readable-properties area-annotation)
+                          [:block/tags
+                           :logseq.property/asset
+                           :logseq.property.pdf/hl-page
+                           :logseq.property.pdf/hl-image
+                           :logseq.property.pdf/hl-type]))
+          "Linked file PDF area highlights import their image assets")
+      (is (= 0 (count @(:ignored-assets import-state))) "No ignored assets"))))
+
+(deftest-async import-linked-file-pdf-annotations-with-uppercase-extension
+  (let [annotation-id #uuid "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        dir (fs/mkdtempSync (node-path/join (os/tmpdir) "logseq-graph-parser-test-"))
+        external-pdf-path (node-path/join dir "external/Linked Paper.PDF")
+        graph-dir (node-path/join dir "graph")
+        encoded-pdf-uri (str "file://" (string/replace external-pdf-path " " "%20"))]
+    (fs/mkdirSync (node-path/dirname external-pdf-path) #js {:recursive true})
+    (fs/writeFileSync external-pdf-path "pdf")
+    (doseq [[relative-path content]
+            {"logseq/config.edn" "{}"
+             "pages/source.md" (str "- ![Linked Paper.PDF](" encoded-pdf-uri ")\n")
+             "pages/hls__Linked Paper.md" (str "file:: [Linked Paper.PDF](" encoded-pdf-uri ")\n"
+                                               "file-path:: " encoded-pdf-uri "\n\n"
+                                               "- External highlight from linked pdf\n"
+                                               "  ls-type:: annotation\n"
+                                               "  hl-page:: 3\n"
+                                               "  hl-color:: yellow\n"
+                                               "  id:: " annotation-id "\n")
+             "assets/Linked Paper.edn" (str "{:highlights [{:id #uuid \"" annotation-id "\","
+                                            " :page 3,"
+                                            " :position {:bounding {:x1 1 :y1 2 :x2 3 :y2 4 :width 10 :height 20},"
+                                            "            :rects (),"
+                                            "            :page 3},"
+                                            " :content {:text \"External highlight from linked pdf\"},"
+                                            " :properties {:color \"yellow\"}}]}")}]
+      (let [file-path (node-path/join graph-dir relative-path)]
+        (fs/mkdirSync (node-path/dirname file-path) #js {:recursive true})
+        (fs/writeFileSync file-path content)))
+    (p/let [conn (db-test/create-conn)
+            assets (atom [])
+            {:keys [import-state]} (import-file-graph-to-db graph-dir conn {:assets assets})
+            asset (db-test/find-block-by-content @conn "Linked Paper")
+            annotation (db-test/find-block-by-content @conn "External highlight from linked pdf")]
+      (is (some? asset)
+          "Linked file PDF imports as an external Asset")
+      (is (= {:block/tags [:logseq.class/Asset]
+              :logseq.property.asset/type "pdf"
+              :logseq.property.asset/external-url encoded-pdf-uri}
+             (select-keys (db-test/readable-properties asset)
+                          [:block/tags
+                           :logseq.property.asset/type
+                           :logseq.property.asset/external-url]))
+          "Linked file PDF keeps the file URI as external asset metadata")
+      (is (= {:block/tags [:logseq.class/Pdf-annotation]
+              :logseq.property/asset "Linked Paper"
+              :logseq.property.pdf/hl-page 3}
+             (select-keys (db-test/readable-properties annotation)
+                          [:block/tags
+                           :logseq.property/asset
+                           :logseq.property.pdf/hl-page]))
+          "Linked file PDF annotations import and keep highlight positions from the EDN file")
+      (is (= 0 (count @(:ignored-assets import-state))) "No ignored assets"))))
+
+(deftest-async import-linked-pdf-annotations-with-missing-attributes-without-log-fn
+  (let [annotation-id #uuid "dddddddd-dddd-dddd-dddd-dddddddddddd"
+        dir (fs/mkdtempSync (node-path/join (os/tmpdir) "logseq-graph-parser-test-"))
+        external-pdf-path (node-path/join dir "external/Sparse Paper.pdf")
+        graph-dir (node-path/join dir "graph")
+        encoded-pdf-uri (str "file://" (string/replace external-pdf-path " " "%20"))]
+    (fs/mkdirSync (node-path/dirname external-pdf-path) #js {:recursive true})
+    (fs/writeFileSync external-pdf-path "pdf")
+    (doseq [[relative-path content]
+            {"logseq/config.edn" "{}"
+             "pages/source.md" (str "- ![Sparse Paper.pdf](" encoded-pdf-uri ")\n")
+             "pages/hls__Sparse Paper.md" (str "file:: [Sparse Paper.pdf](" encoded-pdf-uri ")\n"
+                                               "file-path:: " encoded-pdf-uri "\n\n"
+                                               "- Sparse highlight\n"
+                                               "  ls-type:: annotation\n"
+                                               "  id:: " annotation-id "\n")
+             "assets/Sparse Paper.edn" (str "{:highlights [{:id #uuid \"" annotation-id "\","
+                                            " :position {:bounding {:x1 1 :y1 2 :x2 3 :y2 4 :width 10 :height 20},"
+                                            "            :rects ()},"
+                                            " :content {},"
+                                            " :properties {}}]}")}]
+      (let [file-path (node-path/join graph-dir relative-path)]
+        (fs/mkdirSync (node-path/dirname file-path) #js {:recursive true})
+        (fs/writeFileSync file-path content)))
+    (p/let [conn (db-test/create-conn)
+            {:keys [import-state]} (import-file-graph-to-db graph-dir conn {})
+            asset (db-test/find-block-by-content @conn "Sparse Paper")
+            annotation (d/entity @conn [:block/uuid annotation-id])]
+      (is (some? asset)
+          "Linked file PDF imports as an external Asset")
+      (is (some? annotation)
+          "Highlights missing color, page, and text still import")
+      (is (= "Sparse highlight" (:block/title annotation))
+          "Annotation title comes from the markdown highlight when EDN text is missing")
+      (is (= {:block/tags [:logseq.class/Pdf-annotation]
+              :logseq.property/asset "Sparse Paper"
+              :logseq.property.pdf/hl-page 1}
+             (select-keys (db-test/readable-properties annotation)
+                          [:block/tags
+                           :logseq.property/asset
+                           :logseq.property.pdf/hl-page]))
+          "Missing annotation attributes fall back to import defaults")
+      (is (= 0 (count @(:ignored-assets import-state))) "No ignored assets"))))
+
+(defn- write-linked-pdf-annotation-graph
+  "Write a hermetic file-graph fixture for linked-PDF import tests."
+  [graph-dir {:keys [pdf-uri pdf-label source-line annotation-id highlight-text hl-page]}]
+  (doseq [[relative-path content]
+          {"logseq/config.edn" "{}"
+           "pages/source.md" (str source-line "\n")
+           (str "pages/hls__" pdf-label ".md") (str "file:: [" pdf-label ".pdf](" pdf-uri ")\n"
+                                                    "file-path:: " pdf-uri "\n\n"
+                                                    "- " highlight-text "\n"
+                                                    "  ls-type:: annotation\n"
+                                                    "  hl-page:: " hl-page "\n"
+                                                    "  hl-color:: yellow\n"
+                                                    "  id:: " annotation-id "\n")
+           (str "assets/" pdf-label ".edn") (str "{:highlights [{:id #uuid \"" annotation-id "\","
+                                                 " :page " hl-page ","
+                                                 " :position {:bounding {:x1 1 :y1 2 :x2 3 :y2 4 :width 10 :height 20},"
+                                                 "            :rects (),"
+                                                 "            :page " hl-page "},"
+                                                 " :content {:text \"" highlight-text "\"},"
+                                                 " :properties {:color \"yellow\"}}]}")}]
+    (let [file-path (node-path/join graph-dir relative-path)]
+      (fs/mkdirSync (node-path/dirname file-path) #js {:recursive true})
+      (fs/writeFileSync file-path content))))
+
+(deftest-async import-external-pdf-annotations
+  (p/loop [remaining-cases
+            [["file://D:\\assets\\LocalDoc.pdf" true]
+             ["https://example.com/LocalDoc.pdf" true]
+             ["https://example.com/LocalDoc.pdf?token=sample#page=2" true]
+             ["https://example.com/LocalDoc.pdf?token=sample#page=2" false]]]
+    (when-let [[pdf-uri image-link?] (first remaining-cases)]
+      (let [annotation-id #uuid "11111111-1111-1111-1111-111111111111"
+            dir (fs/mkdtempSync (node-path/join (os/tmpdir) "logseq-graph-parser-test-"))
+            graph-dir (node-path/join dir "graph")]
+        (write-linked-pdf-annotation-graph
+         graph-dir
+         {:pdf-uri pdf-uri
+          :pdf-label "LocalDoc"
+          :source-line (str "- Source " (if image-link?
+                                          (str "![LocalDoc.pdf](" pdf-uri ")")
+                                          (str "((" annotation-id "))")))
+          :annotation-id annotation-id
+          :highlight-text "Sample highlight"
+          :hl-page 2})
+        (p/let [conn (db-test/create-conn)
+                {:keys [import-state]} (import-file-graph-to-db graph-dir conn {})
+                asset (db-test/find-block-by-content @conn "LocalDoc")
+                annotation (d/entity @conn [:block/uuid annotation-id])]
+          (is (= {:block/tags [:logseq.class/Asset]
+                  :logseq.property.asset/type "pdf"
+                  :logseq.property.asset/external-url pdf-uri}
+                 (select-keys (db-test/readable-properties asset)
+                              [:block/tags :logseq.property.asset/type
+                               :logseq.property.asset/external-url]))
+              (str "External PDF preserves its complete URI: " pdf-uri))
+          (is (= {:block/tags [:logseq.class/Pdf-annotation]
+                  :logseq.property/asset "LocalDoc"
+                  :logseq.property.pdf/hl-page 2}
+                 (select-keys (db-test/readable-properties annotation)
+                              [:block/tags :logseq.property/asset :logseq.property.pdf/hl-page]))
+              "Annotation binds to the external Asset, including without an image link")
+          (when image-link?
+            (is (= (str "Source " (page-ref/->page-ref (:block/uuid asset)))
+                   (:block/title (db-test/find-block-by-content @conn #"^Source ")))
+                "Source image link becomes an Asset reference"))
+          (is (empty? @(:ignored-assets import-state)) "No ignored assets")
+          (p/recur (rest remaining-cases)))))))
+
+(deftest-async import-hls-pdfs-uses-annotation-file-identities
+  (let [dir (fs/mkdtempSync (node-path/join (os/tmpdir) "logseq-hls-identities-"))
+        graph-dir (node-path/join dir "graph")
+        first-id #uuid "11111111-1111-1111-1111-111111111111"
+        second-id #uuid "22222222-2222-2222-2222-222222222222"
+        first-url "https://example.com/Alpha.pdf"
+        first-key (str "Alpha__" (hash first-url))]
+    (doseq [[label url annotation-id] [["Alpha" first-url first-id]
+                                      ["Beta" "https://example.com/Beta.pdf" second-id]]]
+      (write-linked-pdf-annotation-graph
+       graph-dir {:pdf-uri url :pdf-label label
+                  :source-line (str "- ((" annotation-id "))")
+                  :annotation-id annotation-id :highlight-text "Original highlight" :hl-page 2}))
+    (fs/appendFileSync (node-path/join graph-dir "pages/hls__Alpha.md")
+                       "- ![Beta](https://example.com/Beta.pdf)\n")
+    (fs/appendFileSync (node-path/join graph-dir "pages/hls__Beta.md") "  - Child note\n")
+    (doseq [[before after] [["pages/hls__Alpha.md" (str "pages/hls__" first-key ".md")]
+                            ["assets/Alpha.edn" (str "assets/" first-key ".edn")]]]
+      (fs/renameSync (node-path/join graph-dir before) (node-path/join graph-dir after)))
+    (p/let [conn (db-test/create-conn)
+            _ (import-file-graph-to-db graph-dir conn {})
+            annotation (d/entity @conn [:block/uuid first-id])
+            second-annotation (d/entity @conn [:block/uuid second-id])]
+      (is (= "Original highlight" (:block/title annotation)))
+      (is (= "Alpha" (:block/title (:logseq.property/asset annotation))))
+      (is (= ["Child note"] (mapv :block/title (ordered-children second-annotation)))))))
+
+(deftest-async ^:integration import-large-flat-file-without-stack-overflow
+  (p/let [file (write-temp-graph-file
+                "pages/large.md"
+                (apply str (map #(str "- large line " % " #tag\n") (range 45000))))
+          conn (db-test/create-conn)
+          _ (db-pipeline/add-listener conn)
+          _ (import-files-to-db [file] conn {:convert-all-tags? true})]
+    (is (= 45000
+           (->> (d/q '[:find [?title ...]
+                       :where [?b :block/title ?title]]
+                     @conn)
+                (filter #(string/starts-with? % "large line "))
+                count))
+        "Large flat files import without overflowing the stack")
+    (is (empty? (map :entity (:errors (db-validate/validate-local-db! @conn))))
+        "Imported graph validates")))
 
 (deftest-async export-basic-graph-with-convert-all-tags
   ;; This graph will contain basic examples of different features to import
@@ -585,7 +1943,7 @@
       (is (= 34 (count (d/q '[:find ?b :where [?b :block/tags :logseq.class/Journal]] @conn))))
 
       (is (= 9 (count (d/q '[:find ?b :where [?b :block/tags :logseq.class/Asset]] @conn))))
-      (is (= 5 (count (d/q '[:find ?b :where [?b :block/tags :logseq.class/Task]] @conn))))
+      (is (= 6 (count (d/q '[:find ?b :where [?b :block/tags :logseq.class/Task]] @conn))))
       (is (= 4 (count (d/q '[:find ?b :where [?b :block/tags :logseq.class/Query]] @conn))))
       (is (= 2 (count (d/q '[:find ?b :where [?b :block/tags :logseq.class/Card]] @conn))))
       (is (= 1 (count (d/q '[:find ?b :where [?b :block/tags :logseq.class/Cards]] @conn))))
@@ -593,7 +1951,7 @@
       (is (= 1 (count (d/q '[:find ?b :where [?b :block/tags :logseq.class/Math-block]] @conn))))
       (is (= 9 (count (d/q '[:find ?b :where [?b :block/tags :logseq.class/Template]] @conn))))
       (is (= 6 (count (d/q '[:find ?b :where [?b :block/tags :logseq.class/Quote-block]] @conn))))
-      (is (= 7 (count (d/q '[:find ?b :where [?b :block/tags :logseq.class/Pdf-annotation]] @conn))))
+      (is (= 8 (count (d/q '[:find ?b :where [?b :block/tags :logseq.class/Pdf-annotation]] @conn))))
 
       ;; Properties and tags aren't included in this count as they aren't a Page
       (is (= 13
@@ -614,7 +1972,14 @@
           "Correct number of user classes")
       (is (= 0 (count @(:ignored-properties import-state))) "No ignored properties")
       (is (= 0 (count @(:ignored-assets import-state))) "No ignored assets")
-      (is (= 1 (count @(:ignored-files import-state))) "Ignore .edn for now")
+      (is (= 4 (count @(:ignored-files import-state)))
+          "Unsupported .edn, whiteboard and :hidden-excluded files are reported as ignored")
+      (is (= #{:unsupported-file-format :whiteboard-not-supported :hidden}
+             (set (map :reason @(:ignored-files import-state)))))
+      (is (= #{"ignored/about.org" "ignored/icon-page.md"}
+             (set (map :path (filter #(= :hidden (:reason %))
+                                     @(:ignored-files import-state)))))
+          "Files excluded by :hidden are reported with their paths")
       ;; 2 zotero pdf are external files so not counted here
       (is (= 7 (count @assets))))
 
@@ -625,13 +1990,8 @@
              (ffirst (d/q '[:find ?content :where [?b :file/path "logseq/custom.js"] [?b :file/content ?content]] @conn)))))
 
     (testing "favorites"
-      (is (= #{"Interstellar" "some page"}
-             (->>
-              (ldb/get-page-blocks @conn
-                                   (:db/id (ldb/get-page @conn common-config/favorites-page-name))
-                                   {:pull-keys '[* {:block/link [:block/title]}]})
-              (map #(get-in % [:block/link :block/title]))
-              set))))
+      (is (= #{"Interstellar" "some page" "new page" "n1/x/y"}
+             (set (imported-favorite-titles @conn)))))
 
     (testing "user properties"
       (is (= 23
@@ -733,6 +2093,12 @@
               :block/tags [:logseq.class/Task]}
              (db-test/readable-properties (db-test/find-block-by-content @conn "status test")))
           "status block has correct task properties and class")
+      (let [empty-title-task (first (task-blocks-by-title @conn ""))]
+        (is (= {:logseq.property/status :logseq.property/status.todo
+                :block/tags [:logseq.class/Task]}
+               (select-keys (db-test/readable-properties empty-title-task)
+                            [:logseq.property/status :block/tags]))
+            "Empty-title TODO from file graph imports as a task"))
 
       (is (= #{:logseq.property/status :block/tags}
              (set (keys (db-test/readable-properties (db-test/find-block-by-content @conn "old todo block")))))
@@ -941,6 +2307,10 @@
                           db-test/readable-properties)
                      :logseq.property.pdf/hl-value :logseq.property/ls-type))
           "Pdf area highlight has correct properties")
+      (is (= ""
+             (:block/title
+              (d/entity @conn [:block/uuid #uuid "68702499-159a-4a14-a0cf-cf5f015535c2"])))
+          "Pdf annotation without text imports with an empty title")
       (is (= {:block/tags [:logseq.class/Pdf-annotation]
               :logseq.property/asset "Understanding EXPLAIN"
               :logseq.property.pdf/hl-color :logseq.property/color.yellow
@@ -1243,6 +2613,64 @@
                   set))
             "Block has correct task tag and property :block/refs")))))
 
+(deftest finalize-imported-graph-avoids-unchanged-ref-writes
+  (let [conn (db-test/create-conn)
+        target-uuid (random-uuid)
+        block-uuid (random-uuid)
+        skipped-uuid (random-uuid)
+        reaction-uuid (random-uuid)
+        _ (d/transact! conn [{:db/id -1 :block/uuid target-uuid :block/title "target"}
+                             {:db/id -2 :block/uuid block-uuid
+                              :block/title (page-ref/->page-ref target-uuid)
+                              :block/refs [-1]}
+                             {:db/id -3 :block/uuid skipped-uuid :block/title "already stamped"
+                              :block/tx-id 42 :block/refs [-1]}
+                             {:db/id -4 :block/uuid reaction-uuid
+                              :block/title (page-ref/->page-ref target-uuid)
+                              :logseq.property.reaction/target -2}])
+        block-id (:db/id (d/entity @conn [:block/uuid block-uuid]))
+        tx-id (inc (:max-tx @conn))
+        reports (atom [])]
+    (d/listen! conn ::finalize-test #(swap! reports conj %))
+    (gp-exporter-finalize/finalize-imported-graph! conn)
+    (is (= tx-id (:block/tx-id (d/entity @conn block-id))))
+    (is (= #{(:db/id (d/entity @conn [:block/uuid target-uuid]))}
+           (set (map :db/id (:block/refs (d/entity @conn block-id))))))
+    (is (empty? (filter #(and (= block-id (:e %)) (= :block/refs (:a %)))
+                       (mapcat :tx-data @reports)))
+        "Finalization must not retract and re-add refs that already match")
+    (is (= 42 (:block/tx-id (d/entity @conn [:block/uuid skipped-uuid]))))
+    (is (empty? (:block/refs (d/entity @conn [:block/uuid reaction-uuid]))))
+    (is (= 1 (count @reports)))
+    (gp-exporter-finalize/finalize-imported-graph! conn)
+    (is (= 1 (count @reports)) "Repeated finalization is a no-op")))
+
+(deftest-async import-file-graph-rebuilds-refs-without-per-file-listener
+  (p/let [file-graph-dir "test/resources/exporter-test-graph"
+          conn (db-test/create-conn)
+          _ (import-file-graph-to-db file-graph-dir conn {})
+          block (db-test/find-block-by-content @conn "old todo block")]
+    (is (some? (:block/tx-id block))
+        "Finalize stamps :block/tx-id")
+    (is (set/subset?
+         #{:logseq.property/status :logseq.class/Task}
+         (->> block
+              :block/refs
+              (map #(:db/ident (d/entity @conn (:db/id %))))
+              set))
+        "One-shot rebuild writes property and class :block/refs without a per-file listener")))
+
+(deftest-async bulk-import-refs-match-single-block-refs
+  (p/let [conn (db-test/create-conn)
+          _ (import-file-graph-to-db "test/resources/exporter-test-graph" conn {})
+          db @conn
+          rebuild-refs (outliner-pipeline/db-rebuild-block-refs-fn db)]
+    (doseq [datom (d/datoms db :avet :block/uuid)]
+      (let [block (d/entity db (:e datom))]
+        (is (= (set (outliner-pipeline/db-rebuild-block-refs db block))
+               (set (rebuild-refs block)))
+            (str "Bulk refs match for " (:block/uuid block)))))))
+
 (deftest-async export-basic-graph-with-convert-all-tags-option-disabled
   (p/let [file-graph-dir "test/resources/exporter-test-graph"
           conn (db-test/create-conn)
@@ -1258,7 +2686,7 @@
                   count))
         "Correct number of user classes")
 
-    (is (= 5 (count (d/q '[:find ?b :where [?b :block/tags :logseq.class/Task]] @conn))))
+    (is (= 6 (count (d/q '[:find ?b :where [?b :block/tags :logseq.class/Task]] @conn))))
     (is (= 4 (count (d/q '[:find ?b :where [?b :block/tags :logseq.class/Query]] @conn))))
     (is (= 2 (count (d/q '[:find ?b :where [?b :block/tags :logseq.class/Card]] @conn))))
 
@@ -1358,6 +2786,250 @@
     (is (nil? (db-test/find-page-by-title @conn "05"))
         "Journal reference is not split into a child namespace page")))
 
+(deftest-async import-legacy-journal-file-name-refs-as-journals
+  (p/let [source-file (write-temp-graph-file
+                       "journals/2026_04_01.md"
+                       "- legacy journal ref [[2026_04_02]]\n")
+          target-file (write-temp-graph-file
+                       "journals/2026_04_02.md"
+                       "- target journal\n")
+          conn (db-test/create-conn)
+          _ (import-files-to-db [source-file target-file] conn {})
+          legacy-journal (db-test/find-journal-by-journal-day @conn 20260402)
+          legacy-ref-block (db-test/find-block-by-content @conn #"legacy journal ref")]
+    (is (some? legacy-journal)
+        "Legacy yyyy_MM_dd journal page refs resolve imported journal files")
+    (is (= #{(:block/uuid legacy-journal)}
+           (set (map :block/uuid (:block/refs legacy-ref-block))))
+        "Legacy journal page ref points at the journal page")
+    (is (nil? (db-test/find-page-by-title @conn "2026_04_02"))
+        "Legacy journal page ref does not create an ordinary page")))
+
+(deftest-async import-default-format-journal-refs-with-custom-title-format
+  (p/let [dir (write-temp-file-graph
+               {"pages/source.md"
+                "- existing journal [[May 18th, 2021]]\n- missing journal [[May 19th, 2021]]\n"
+                "journals/2021_05_18.md"
+                "- journal entry\n"
+                "pages/2021_05_19.md"
+                "- ordinary date-named page\n"})
+          source-file (-> (node-path/join dir "pages/source.md")
+                          (string/replace "\\" "/"))
+          journal-file (-> (node-path/join dir "journals/2021_05_18.md")
+                           (string/replace "\\" "/"))
+          ordinary-date-file (-> (node-path/join dir "pages/2021_05_19.md")
+                                 (string/replace "\\" "/"))
+          conn (db-test/create-conn)
+          _ (import-files-to-db [source-file journal-file ordinary-date-file] conn
+                                {:user-config {:journal/page-title-format "EEEE, dd-MM-yyyy"}})
+          existing-journal (db-test/find-journal-by-journal-day @conn 20210518)
+          missing-page (db-test/find-page-by-title @conn "May 19th, 2021")
+          existing-ref-block (db-test/find-block-by-content @conn #"existing journal")
+          missing-ref-block (db-test/find-block-by-content @conn #"missing journal")]
+    (is (= "Tuesday, 18-05-2021" (:block/title existing-journal))
+        "Default-format ref resolves the journal file using the configured title")
+    (is (= #{:logseq.class/Journal}
+           (set (map :db/ident (:block/tags existing-journal))))
+        "Existing journal does not retain the ordinary page tag")
+    (is (= #{(:block/uuid existing-journal)}
+           (set (map :block/uuid (:block/refs existing-ref-block))))
+        "Existing journal ref points at the journal page")
+    (is (= #{:logseq.class/Page}
+           (set (map :db/ident (:block/tags missing-page))))
+        "Default-format ref without a file under journals remains an ordinary page")
+    (is (nil? (db-test/find-journal-by-journal-day @conn 20210519))
+        "Date-named file outside journals does not create a journal")
+    (is (= #{(:block/uuid missing-page)}
+           (set (map :block/uuid (:block/refs missing-ref-block))))
+        "Missing journal ref points at the ordinary page")))
+
+(deftest-async import-creates-missing-ordinary-page-refs
+  (p/let [file (write-temp-graph-file
+                "pages/source.md"
+                "- missing page ref [[Missing Page]]\n")
+          conn (db-test/create-conn)
+          _ (import-files-to-db [file] conn {})
+          missing-page (db-test/find-page-by-title @conn "Missing Page")
+          source-block (db-test/find-block-by-content @conn #"missing page ref")]
+    (is (some? missing-page)
+        "Missing ordinary page refs create ordinary pages")
+    (is (= #{(:block/uuid missing-page)}
+           (set (map :block/uuid (:block/refs source-block))))
+        "Missing ordinary page ref points at the created page")))
+
+(deftest-async import-page-drawer-properties-write-refs-on-the-page
+  (p/let [file (write-temp-graph-file
+                "pages/Zorba the Greek (1964).md"
+                (str "tags:: movies\n"
+                     "title:: Zorba the Greek (1964)\n"
+                     "genre:: [[Comedy]], [[Drama]]\n"
+                     "actors:: [[Anthony Quinn]], [[Alan Bates]]\n"))
+          conn (db-test/create-conn)
+          _ (import-files-to-db [file] conn {:convert-all-tags? true})
+          page (db-test/find-page-by-title @conn "Zorba the Greek (1964)")
+          comedy (db-test/find-page-by-title @conn "Comedy")
+          drama (db-test/find-page-by-title @conn "Drama")
+          quinn (db-test/find-page-by-title @conn "Anthony Quinn")
+          bates (db-test/find-page-by-title @conn "Alan Bates")
+          props (db-test/readable-properties page)
+          ref-titles (set (map :block/title (:block/refs page)))]
+    (is (some? page) "Movie page is imported")
+    (is (= #{"Comedy" "Drama"} (:user.property/genre props))
+        "Genre page refs are stored on the movie page")
+    (is (= #{"Anthony Quinn" "Alan Bates"} (:user.property/actors props))
+        "Actor page refs are stored on the movie page")
+    (is (set/subset? #{"Comedy" "Drama" "Anthony Quinn" "Alan Bates"} ref-titles)
+        "Page drawer refs are written onto the page :block/refs")
+    (is (= 1 (count (d/datoms @conn :avet :block/refs (:db/id comedy))))
+        "Comedy linked references include the movie page")
+    (is (= 1 (count (d/datoms @conn :avet :block/refs (:db/id drama))))
+        "Drama linked references include the movie page")
+    (is (= 1 (count (d/datoms @conn :avet :block/refs (:db/id quinn))))
+        "Actor linked references include the movie page")
+    (is (= 1 (count (d/datoms @conn :avet :block/refs (:db/id bates))))
+        "Actor linked references include the movie page")))
+
+(deftest-async import-favorites-from-og-config-edn
+  (p/let [dir (write-temp-file-graph
+               {"logseq/config.edn"
+                (str "{:favorites [\"Projects\" \"[[Projects]]\" \"foo/bar\"]\n"
+                     " :file/name-format :triple-lowbar}\n")
+                "pages/Projects.md" "- project work\n- [[foo/bar]]\n"})
+          conn (db-test/create-conn)
+          _ (db-pipeline/add-listener conn)
+          _ (import-file-graph-to-db dir conn {})
+          favorite-titles (imported-favorite-titles @conn)]
+    (is (= 3 (count favorite-titles))
+        "Bare names, bracketed page refs, and namespaced pages each become a favorite link")
+    (is (= #{"Projects" "foo/bar"}
+           (set favorite-titles))
+        "Imported favorites resolve to the original pages including flattened namespaces")))
+
+(deftest-async import-namespaced-pages-assign-block-order
+  (let [files {"pages/Country___Australia.md" "- Sydney\n"
+               "pages/Country___Canada.md" "- Ottawa\n"
+               "pages/Continent___Asia___Japan.md" "- Tokyo\n"}
+        dir (write-temp-file-graph
+             (assoc files "logseq/config.edn" "{:file/name-format :triple-lowbar}\n"))]
+    (p/doseq [import-mode [:file-graph :doc-files]]
+      (p/let [conn (db-test/create-conn)
+              _ (case import-mode
+                  :file-graph (import-file-graph-to-db dir conn {})
+                  :doc-files (import-files-to-db (mapv #(path/path-normalize (node-path/join dir %)) (keys files)) conn {}))
+              library (ldb/get-built-in-page @conn common-config/library-page-name)
+              country (db-test/find-page-by-title @conn "Country")
+              australia (db-test/find-page-by-title @conn "Australia")
+              canada (db-test/find-page-by-title @conn "Canada")
+              continent (db-test/find-page-by-title @conn "Continent")
+              asia (db-test/find-page-by-title @conn "Asia")
+              japan (db-test/find-page-by-title @conn "Japan")
+              nested-pages [australia canada asia japan]
+              ordered-pages (cond-> nested-pages
+                              (= :file-graph import-mode) (into [country continent]))]
+        (testing (name import-mode)
+          (is (= ["Country" "Country" "Continent" "Asia"]
+                 (mapv #(-> % :block/parent :block/title) nested-pages))
+              "Imported pages preserve their namespace parents")
+          (is (every? #(string? (:block/order %)) ordered-pages)
+              "Every imported hierarchy child has a string order")
+          (is (not= (:block/order australia) (:block/order canada))
+              "Sibling imported pages get distinct orders")
+          (when (= :file-graph import-mode)
+            (is (= [(:db/id library) (:db/id library)]
+                   (mapv #(-> % :block/parent :db/id) [country continent]))
+                "Top-level hierarchy parents are moved under Library")))))))
+
+(deftest-async import-skips-class-and-property-namespace-roots-when-moving-to-library
+  ;; Same shape as https://github.com/logseq/db-test/issues/1401:
+  ;; a class namespace root (used as tags::) and a property namespace root
+  ;; (used as x:: value) must not be parented under Library.
+  (p/let [dir (write-temp-file-graph
+               {"logseq/config.edn" "{:meta/version 1 :file/name-format :triple-lowbar}\n"
+                "pages/Vehicle___Car.md" "- a car\n"
+                "pages/Garage.md" "tags:: [[Vehicle]]\n- garage page tagged Vehicle\n"
+                "pages/City___Berlin.md" "- Berlin city child\n"
+                "pages/Trip.md" "city:: Berlin\n- page with city property\n"
+                "pages/Country___Australia.md" "- Sydney\n"})
+          conn (db-test/create-conn)
+          _ (import-file-graph-to-db dir conn {:convert-all-tags? true})
+          library (ldb/get-built-in-page @conn common-config/library-page-name)
+          vehicle (db-test/find-page-by-title @conn "Vehicle")
+          car (db-test/find-page-by-title @conn "Car")
+          city (d/entity @conn :user.property/city)
+          berlin (db-test/find-page-by-title @conn "Berlin")
+          country (db-test/find-page-by-title @conn "Country")]
+    (is (empty? (map :entity (:errors (db-validate/validate-local-db! @conn))))
+        "Created graph has no validation errors")
+    (is (ldb/class? vehicle)
+        "Namespace root used as a tag is imported as a class")
+    (is (nil? (:block/parent vehicle))
+        "Class namespace roots are not moved under Library")
+    (is (nil? (:block/order vehicle))
+        "Class namespace roots do not get a Library order")
+    (is (ldb/property? city)
+        "Namespace root used as a property is imported as a property")
+    (is (nil? (:block/parent city))
+        "Property namespace roots are not moved under Library")
+    (is (= (:db/id vehicle) (:db/id (:block/parent car)))
+        "Class namespace children keep their class parent")
+    (is (= (:db/id city) (:db/id (:block/parent berlin)))
+        "Property namespace children keep their property parent")
+    (is (= (:db/id library) (:db/id (:block/parent country)))
+        "Non-class/non-property namespace roots still move under Library")))
+
+(deftest-async import-namespaced-pages-order-after-parent-content-blocks
+  (p/let [dir (write-temp-file-graph
+               {"logseq/config.edn" "{:file/name-format :triple-lowbar}\n"
+                "pages/Country.md" "- Overview\n"
+                "pages/Country___Australia.md" "- Sydney\n"})
+          conn (db-test/create-conn)
+          _ (import-file-graph-to-db dir conn {})
+          country (db-test/find-page-by-title @conn "Country")
+          australia (db-test/find-page-by-title @conn "Australia")
+          overview (db-test/find-block-by-content @conn "Overview")
+          page-order (:block/order australia)
+          content-order (:block/order overview)]
+    (is (= (:db/id country)
+           (:db/id (:block/parent australia))
+           (:db/id (:block/parent overview)))
+        "The imported page and existing content share a parent")
+    (is (and (string? page-order)
+             (string? content-order)
+             (pos? (compare page-order content-order)))
+        "The imported page is ordered after existing parent content")))
+
+(deftest repaired-page-orders-advance-namespace-page-allocator
+  (let [conn (db-test/create-conn-with-blocks
+              {:pages-and-blocks
+               [{:page {:block/title "Country"}
+                 :blocks [{:block/title "Overview"}]}]})
+        country (db-test/find-page-by-title @conn "Country")
+        overview (db-test/find-block-by-content @conn "Overview")
+        initial-max (db-order/get-max-order @conn)
+        now (.now js/Date)]
+    (with-redefs [db-order/*max-key (atom initial-max)]
+      (d/transact! conn
+                   [{:db/id (:db/id overview) :block/order initial-max}
+                    {:block/uuid (random-uuid)
+                     :block/title "Australia"
+                     :block/name "australia"
+                     :block/tags :logseq.class/Page
+                     :block/parent (:db/id country)
+                     :block/created-at now
+                     :block/updated-at now}])
+      (let [report (gp-exporter-finalize/ensure-imported-page-parent-orders! conn)
+            australia (db-test/find-page-by-title @conn "Australia")
+            repaired-order (:block/order australia)]
+        (is (= repaired-order @db-order/*max-key))
+        (is (= @conn (:db-after report)))
+        (outliner-page/create! conn "Country/New" {:split-namespace? true})
+        (let [new-page (db-test/find-page-by-title @conn "New")]
+          (is (pos? (compare (:block/order new-page) repaired-order)))
+          (is (= (:db/id australia) (:db/id (ldb/get-left-sibling new-page)))))
+        (let [allocator-max @db-order/*max-key]
+          (is (nil? (gp-exporter-finalize/ensure-imported-page-parent-orders! conn)))
+          (is (= allocator-max @db-order/*max-key)))))))
+
 (deftest-async import-normalizes-existing-random-journal-uuid-and-text-refs
   (let [old-journal-uuid (random-uuid)
         standard-journal-uuid (common-uuid/gen-uuid :journal-page-uuid 20260127)
@@ -1383,6 +3055,51 @@
           "Text references are rewritten to the standard journal uuid")
       (is (= (:db/id journal) (get-in ref-block [:block/page :db/id]))
           "Structured block page reference still points to the same journal entity"))))
+
+(defn- assert-rolle-property-and-class-are-distinct
+  [conn]
+  (let [klass (d/entity @conn :user.class/Rolle)
+        prop (d/entity @conn :user.property/rolle)
+        alice (or (db-test/find-page-by-title @conn "A_Alice")
+                  (db-test/find-page-by-title @conn "Alice"))
+        tagged-page-id (ffirst (d/q '[:find ?p
+                                      :where
+                                      [?p :block/tags :user.class/Rolle]
+                                      [?p :block/name]]
+                                    @conn))]
+    (is (empty? (map :entity (:errors (db-validate/validate-local-db! @conn))))
+        "Created graph has no validation errors")
+    (is (and (some? klass) (ldb/class? klass) (not (ldb/property? klass)))
+        "Rolle tag is a class, not a property")
+    (is (and (some? prop) (ldb/property? prop) (not (ldb/class? prop)))
+        "rolle is a property, not a class")
+    (is (not= (:block/uuid klass) (:block/uuid prop))
+        "Class and property are distinct entities")
+    (is (some? tagged-page-id)
+        "A page tagged Rolle references the class")
+    (is (some? (:user.property/rolle alice))
+        "Alice's rolle value is on the property")))
+
+(deftest-async import-property-and-class-same-title-property-first
+  ;; https://github.com/logseq/db-test/issues/1402
+  ;; Property page is created first; later tags:: [[Rolle]] must not reuse it.
+  (p/let [dir (write-temp-file-graph
+               {"logseq/config.edn" "{:meta/version 1 :file/name-format :triple-lowbar}\n"
+                "pages/A_Alice.md" "rolle:: Admin\n\n- Alice has a rolle property\n"
+                "pages/B_Admin.md" "tags:: [[Rolle]]\n\n- Admin is tagged Rolle\n"})
+          conn (db-test/create-conn)
+          _ (import-file-graph-to-db dir conn {:convert-all-tags? true})]
+    (assert-rolle-property-and-class-are-distinct conn)))
+
+(deftest-async import-property-and-class-same-title-class-first
+  ;; Inverse file order of import-property-and-class-same-title-property-first.
+  (p/let [dir (write-temp-file-graph
+               {"logseq/config.edn" "{:meta/version 1 :file/name-format :triple-lowbar}\n"
+                "pages/Admin.md" "tags:: [[Rolle]]\n\n- Admin is tagged Rolle\n"
+                "pages/Alice.md" "rolle:: Admin\n\n- Alice has a rolle property\n"})
+          conn (db-test/create-conn)
+          _ (import-file-graph-to-db dir conn {:convert-all-tags? true})]
+    (assert-rolle-property-and-class-are-distinct conn)))
 
 (deftest-async export-files-with-tag-classes-option
   (p/let [file-graph-dir "test/resources/exporter-test-graph"
@@ -1495,14 +3212,57 @@
         (is (ldb/inline-tag? raw-title tag)
             "first-line namespaced tag is stored as an inline tag")))))
 
-(deftest-async export-files-with-ignored-properties
+(deftest-async export-files-with-icon-properties
   (p/let [file-graph-dir "test/resources/exporter-test-graph"
           files (mapv #(path/path-join file-graph-dir %) ["ignored/icon-page.md"])
           conn (db-test/create-conn)
-          {:keys [import-state]} (import-files-to-db files conn {})]
+          {:keys [import-state]} (import-files-to-db files conn {})
+          page (db-test/find-page-by-title @conn "icon-page")
+          block (db-test/find-block-by-content @conn "has some content")
+          expected-icon {:type :emoji :id "😆"}]
+    (is (empty? (map :entity (:errors (db-validate/validate-local-db! @conn))))
+        "Created graph has no validation errors")
+    (is (some? page)
+        "imported icon page")
+    (is (some? block)
+        "imported icon block")
+    (is (= expected-icon (:logseq.property/icon (db-test/readable-properties page)))
+        "page emoji icon is imported")
+    (is (= expected-icon (:logseq.property/icon (db-test/readable-properties block)))
+        "block emoji icon is imported")
+    (is (= 0
+           (count (filter #(= :icon (:property %)) @(:ignored-properties import-state))))
+        "importable emoji icons are not ignored")))
+
+(deftest-async export-files-preserves-icon-skin-tone
+  (p/let [file (write-temp-graph-file "pages/skin-tone.md" "icon:: 👍🏽\n\n- note\n")
+          conn (db-test/create-conn)
+          _ (import-files-to-db [(path/path-normalize file)] conn {})
+          page (db-test/find-page-by-title @conn "skin-tone")]
+    (is (= {:type :emoji :id "👍🏽" :skin 4}
+           (:logseq.property/icon (db-test/readable-properties page))))))
+
+(deftest-async export-files-with-unmappable-icon-properties
+  (p/let [file (write-temp-graph-file
+                "pages/bad-icon.md"
+                "icon:: not-an-emoji\n\n- block with file icon\n  icon:: ./assets/ghost.png\n")
+          conn (db-test/create-conn)
+          {:keys [import-state]} (import-files-to-db [(path/path-normalize file)] conn {})
+          page (db-test/find-page-by-title @conn "bad-icon")
+          block (db-test/find-block-by-content @conn "block with file icon")]
+    (is (empty? (map :entity (:errors (db-validate/validate-local-db! @conn))))
+        "Created graph has no validation errors")
+    (is (some? page)
+        "imported page with unmappable icon")
+    (is (some? block)
+        "imported block with unmappable icon")
+    (is (nil? (:logseq.property/icon (db-test/readable-properties page)))
+        "unmappable page icon is not imported")
+    (is (nil? (:logseq.property/icon (db-test/readable-properties block)))
+        "unmappable block icon is not imported")
     (is (= 2
            (count (filter #(= :icon (:property %)) @(:ignored-properties import-state))))
-        "icon properties are visibly ignored in order to not fail import")))
+        "unmappable icon properties are still ignored")))
 
 (deftest-async export-files-with-property-parent-classes-option
   (p/let [file-graph-dir "test/resources/exporter-test-graph"

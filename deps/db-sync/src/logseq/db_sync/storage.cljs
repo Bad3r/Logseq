@@ -10,9 +10,6 @@
    [logseq.db.common.sqlite :as common-sqlite]
    [logseq.db.frontend.schema :as db-schema]))
 
-(def ^:private tx-log-outliner-op-migration-sql
-  "alter table tx_log add column outliner_op TEXT")
-
 (defn- duplicate-column-error?
   [error column-name]
   (let [message (-> (or (ex-message error) (some-> error .-message) (str error))
@@ -20,12 +17,12 @@
     (and (string/includes? message "duplicate column")
          (string/includes? message (string/lower-case column-name)))))
 
-(defn- ensure-tx-log-outliner-op-column!
-  [sql]
+(defn- ensure-tx-log-column!
+  [sql column-name]
   (try
-    (common/sql-exec sql tx-log-outliner-op-migration-sql)
+    (common/sql-exec sql (str "alter table tx_log add column " column-name " TEXT"))
     (catch :default error
-      (when-not (duplicate-column-error? error "outliner_op")
+      (when-not (duplicate-column-error? error column-name)
         (throw error)))))
 
 ;; TODO: GC kvs table
@@ -38,7 +35,8 @@
                         "tx TEXT not null,"
                         "created_at INTEGER"
                         ");"))
-  (ensure-tx-log-outliner-op-column! sql)
+  (ensure-tx-log-column! sql "outliner_op")
+  (ensure-tx-log-column! sql "tx_id")
   (common/sql-exec sql
                    (str "create table if not exists sync_meta ("
                         "key TEXT primary key,"
@@ -74,10 +72,40 @@
 (defn set-t! [sql t]
   (set-meta! sql :t t))
 
-(defn next-t! [sql]
-  (let [t (inc (get-t sql))]
-    (set-t! sql t)
-    t))
+(def ^:dynamic *in-sql-transaction?* false)
+
+(defn with-sql-transaction!
+  [sql f]
+  (if *in-sql-transaction?*
+    (f)
+    (.transaction sql
+                  (fn []
+                    (binding [*in-sql-transaction?* true]
+                      (f))))))
+
+(defn set-initial-checksum! [sql checksum]
+  (with-sql-transaction!
+    sql
+    (fn []
+      (let [existing-checksum (get-checksum sql)
+            current-t (get-t sql)]
+        (cond
+          (and (some? existing-checksum)
+               (not= existing-checksum checksum))
+          (throw (ex-info "Cannot overwrite existing checksum with snapshot checksum"
+                          {:type :db-sync/stale-snapshot-checksum
+                           :existing-checksum existing-checksum
+                           :snapshot-checksum checksum}))
+
+          (and (nil? existing-checksum)
+               (pos? current-t))
+          (throw (ex-info "Cannot initialize checksum after tx history advanced"
+                          {:type :db-sync/snapshot-checksum-after-tx-log
+                           :t current-t
+                           :snapshot-checksum checksum}))
+
+          (nil? existing-checksum)
+          (set-checksum! sql checksum))))))
 
 (defn- outliner-op->sql [outliner-op]
   (cond
@@ -89,24 +117,26 @@
   (when (string? value)
     (keyword value)))
 
-(defn append-tx! [sql t tx-str created-at outliner-op]
+(defn append-tx! [sql t tx-str created-at outliner-op tx-id]
   (common/sql-exec sql
-                   (str "insert into tx_log (t, tx, created_at, outliner_op) values (?, ?, ?, ?)"
-                        " on conflict(t) do update set tx = excluded.tx, created_at = excluded.created_at, outliner_op = excluded.outliner_op")
+                   (str "insert into tx_log (t, tx, created_at, outliner_op, tx_id) values (?, ?, ?, ?, ?)"
+                        " on conflict(t) do update set tx = excluded.tx, created_at = excluded.created_at, outliner_op = excluded.outliner_op, tx_id = excluded.tx_id")
                    t
                    tx-str
                    created-at
-                   (outliner-op->sql outliner-op)))
+                   (outliner-op->sql outliner-op)
+                   (when tx-id (str tx-id))))
 
 (defn fetch-tx-since [sql since-t]
   (let [rows (common/get-sql-rows
               (common/sql-exec sql
-                               "select t, tx, outliner_op from tx_log where t > ? order by t asc"
+                               "select t, tx, outliner_op, tx_id from tx_log where t > ? order by t asc"
                                since-t))]
     (mapv (fn [row]
-            {:t (aget row "t")
-             :tx (aget row "tx")
-             :outliner-op (sql->outliner-op (aget row "outliner_op"))})
+            (cond-> {:t (aget row "t")
+                     :tx (aget row "tx")
+                     :outliner-op (sql->outliner-op (aget row "outliner_op"))}
+              (some? (aget row "tx_id")) (assoc :tx-id (uuid (aget row "tx_id")))))
           rows)))
 
 (defn- upsert-addr-content! [sql data]
@@ -146,40 +176,25 @@
 
 (defn- append-tx-for-tx-report
   [sql {:keys [db-after db-before tx-data tx-meta] :as tx-report}]
-  (let [prev-checksum (get-checksum sql)
-        checksum (sync-checksum/update-checksum prev-checksum tx-report)]
-    ;; (let [full-checksum (sync-checksum/recompute-checksum db-after)
-    ;;       prev-full-checksum (sync-checksum/recompute-checksum db-before)]
-    ;;   (when (and prev-checksum
-    ;;              (not= checksum full-checksum))
-    ;;     (prn :debug :before-checksum-error {:prev-tx (get-t sql)
-    ;;                                         :prev-checksum prev-checksum
-    ;;                                         :prev-full-checksum prev-full-checksum
-    ;;                                         :new-checksum checksum
-    ;;                                         :recomputed-after-checksum full-checksum
-    ;;                                         :tx-meta tx-meta
-    ;;                                         :db-before (ldb/write-transit-str db-before)
-    ;;                                         :tx-data (ldb/write-transit-str tx-data)})
-    ;;     (when (not= prev-checksum prev-full-checksum)
-    ;;       (prn :debug :prev-checksum-not-match {:prev-checksum prev-checksum
-    ;;                                             :prev-full-checksum prev-full-checksum}))
-    ;;     (throw (ex-info "server checksum doesn't match"
-    ;;                     {:prev-checksum prev-checksum
-    ;;                      :recomputed-after-checksum full-checksum
-    ;;                      :tx-meta tx-meta
-    ;;                      :tx-data tx-data
-    ;;                      :prev-tx (get-t sql)}))))
-
-    (set-checksum! sql checksum)
-    (when-not (empty? tx-data)
-      (let [created-at (common/now-ms)
-            normalized-data (->> tx-data
-                                 (db-normalize/normalize-tx-data db-after db-before))
-            ;; _ (prn :debug :tx-data tx-data)
-            ;; _ (prn :debug :normalized-data normalized-data)
-            tx-str (common/write-transit normalized-data)
-            new-t (next-t! sql)]
-        (append-tx! sql new-t tx-str created-at (:outliner-op tx-meta))))))
+  (when-not (or (:db-sync/skip-tx-log? tx-meta)
+                (empty? tx-data))
+    (let [created-at (common/now-ms)
+          normalized-data (->> tx-data
+                               (db-normalize/normalize-tx-data db-after db-before)
+                               vec)
+          tx-str (common/write-transit normalized-data)]
+      (with-sql-transaction!
+        sql
+        (fn []
+          (let [new-t (inc (get-t sql))]
+            (append-tx! sql new-t tx-str created-at (:outliner-op tx-meta) (:tx-id tx-meta))
+            (set-t! sql new-t)
+            (when-not (:db-sync/skip-checksum-update? tx-meta)
+              (let [prev-checksum (get-checksum sql)
+                    checksum (sync-checksum/update-checksum
+                              prev-checksum
+                              (assoc tx-report :tx-data normalized-data))]
+                (set-checksum! sql checksum)))))))))
 
 (defn- listen-db-updates!
   [sql conn]

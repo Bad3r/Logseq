@@ -2,11 +2,9 @@
   "Block code needed by app but not graph-parser. This should be the only frontend
    namespace that has references to legacy file attributes like :block/pre-block?
    as they are being removed from graph-parser output"
-  (:require [cljs.cache :as cache]
-            [clojure.string :as string]
+  (:require [clojure.string :as string]
             [frontend.common.cache :as common.cache]
             [frontend.context.i18n :refer [t]]
-            [frontend.db :as db]
             [frontend.format :as format]
             [frontend.format.mldoc :as mldoc]
             [frontend.handler.notification :as notification]
@@ -16,33 +14,76 @@
             [logseq.graph-parser.block :as gp-block]
             [logseq.graph-parser.property :as gp-property]))
 
+(defn- standalone-display-block
+  [block]
+  (let [raw-title (:block/title block)
+        title (when (string? raw-title) (string/trim raw-title))
+        display-markup? (and title
+                             (or (re-find #"(?s)^```.*```$" title)
+                                 (re-find #"(?s)^\$\$.*\$\$$" title)))
+        ast-body (when display-markup?
+                   (or (:block.temp/ast-body block)
+                       (map first (mldoc/->edn title :markdown))))
+        [ast-node] ast-body
+        [node-type node-data] ast-node]
+    (if (= 1 (count ast-body))
+      (case node-type
+        "Src"
+        (let [{:keys [language lines]} node-data]
+          (cond-> (assoc block
+                         :block/title (string/replace (apply str lines) #"\r?\n$" "")
+                         :logseq.property.node/display-type :code)
+            (not-empty language)
+            (assoc :logseq.property.code/lang language)))
+
+        "Displayed_Math"
+        (assoc block
+               :block/title (string/trim node-data)
+               :logseq.property.node/display-type :math)
+
+        block)
+      block)))
+
+(defn math-block-formula
+  "The formula of a title written as 1 display math ($$E=mc^2$$), nil for any
+  other title. A math block's title is the formula alone; a save of the
+  editor's text from before the block became a math block brings the $$ back."
+  [title]
+  (let [block (standalone-display-block {:block/title title})]
+    (when (= :math (:logseq.property.node/display-type block))
+      (:block/title block))))
+
 (defn extract-blocks
   "Wrapper around logseq.graph-parser.block/extract-blocks that adds in system state
 and handles unexpected failure."
   [blocks content format {:keys [page-name]}]
-  (let [repo (state/get-current-repo)]
-    (try
-      (let [blocks (gp-block/extract-blocks blocks content format
-                                            {:user-config (state/get-config)
-                                             :block-pattern common-config/block-pattern
-                                             :db (db/get-db repo)
-                                             :date-formatter (state/get-date-formatter)
-                                             :page-name page-name
-                                             :db-graph-mode? true})]
-        (map (fn [block]
-               (cond-> (dissoc block :block/format :block/properties :block/macros :block/properties-order)
-                 (:block/properties block)
-                 (merge (update-keys (:block/properties block)
-                                     (fn [k]
-                                       (or ({:heading :logseq.property/heading} k)
-                                           (throw (ex-info (str "Don't know how to save graph-parser property " (pr-str k)) {}))))))))
-             blocks))
-      (catch :default e
-        (log/error :exception e)
-        (state/pub-event! [:capture-error {:error e
-                                           :payload {:type "Extract-blocks"}}])
-        (notification/show! (t :block/extraction-error) :error)
-        []))))
+  (try
+    (let [blocks (gp-block/extract-blocks blocks content format
+                                          {:user-config (state/get-config)
+                                           :block-pattern common-config/block-pattern
+                                           :date-formatter (state/get-date-formatter)
+                                           :page-name page-name
+                                           :db-graph-mode? true})]
+      (map (fn [block]
+             (let [block (standalone-display-block block)
+                   ;; Only a heading is saved from the parsed properties. Others (e.g. an
+                   ;; Org :PROPERTIES: drawer typed in a block) stay in the block's text.
+                   ;; Markdown headings go up to 6; mldoc reports `####### x` as size 7.
+                   heading (get-in block [:block/properties :heading])
+                   heading (when (or (true? heading) (and (integer? heading) (<= 1 heading 6)))
+                             heading)]
+               (cond-> (dissoc block :block/format :block/properties :block/macros :block/properties-order
+                               :block/scheduled :block/deadline :block/marker :block/priority
+                               :block/properties-text-values :block/invalid-properties)
+                 heading
+                 (assoc :logseq.property/heading heading))))
+           blocks))
+    (catch :default e
+      (log/error :exception e)
+      (state/pub-event! [:capture-error {:error e
+                                         :payload {:type "Extract-blocks"}}])
+      (notification/show! (t :block/extraction-error) :error)
+      [])))
 
 (defn parse-block
   [{:block/keys [uuid title format] :as block}]
@@ -63,7 +104,7 @@ and handles unexpected failure."
           block (dissoc block :block.temp/ast-body :block/level)]
       (if uuid (assoc block :block/uuid uuid) block))))
 
-(defonce *blocks-ast-cache (volatile! (cache/lru-cache-factory {} :threshold 5000)))
+(defonce *blocks-ast-cache (volatile! (common.cache/empty-lru 5000)))
 
 (defn- markdown-heading-level
   [content]

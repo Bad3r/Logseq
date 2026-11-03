@@ -3,16 +3,19 @@
             [clojure.string :as string]
             [frontend.commands :as commands]
             [frontend.context.i18n :refer [t]]
-            [frontend.db :as db]
+            [frontend.db.async :as db-async]
             [frontend.extensions.html-parser :as html-parser]
+            [frontend.extensions.video :as video]
             [frontend.format.block :as block]
             [frontend.format.mldoc :as mldoc]
             [frontend.handler.editor :as editor-handler]
+            [frontend.handler.editor.assets :as editor-assets]
+            [frontend.handler.editor.autopair :as editor-autopair]
+            [frontend.handler.editor.format :as editor-format]
             [frontend.handler.notification :as notification]
             [frontend.mobile.util :as mobile-util]
             [frontend.state :as state]
             [frontend.util :as util]
-            [frontend.util.text :as text-util]
             [frontend.util.thingatpt :as thingatpt]
             [goog.object :as gobj]
             [lambdaisland.glogi :as log]
@@ -22,25 +25,51 @@
             [logseq.graph-parser.block :as gp-block]
             [promesa.core :as p]))
 
+(defn- <ref-with-id
+  [repo date-formatter ref]
+  (if (and (map? ref)
+           (:block/title ref)
+           (nil? (:block/uuid ref)))
+    (p/let [page (state/<invoke-db-worker :thread-api/pull
+                                           repo
+                                           [:block/uuid :block/title :block/name]
+                                           [:block/name (common-util/page-name-sanity-lc (:block/title ref))])]
+      (or page
+          (gp-block/page-name->map (:block/title ref) nil true date-formatter)))
+    ref))
+
+(defn- <with-ref-ids
+  [repo date-formatter refs]
+  (p/all (mapv #(<ref-with-id repo date-formatter %) refs)))
+
 (defn- paste-text-parseable
   [format text]
   (when-let [editing-block (state/get-edit-block)]
-    (let [page-id (:db/id (:block/page editing-block))
-          blocks (block/extract-blocks
-                  (mldoc/->edn text format)
-                  text format
-                  {:page-name (:block/name (db/entity page-id))})
-          blocks' (cond->> (gp-block/with-parent-and-order page-id blocks)
-                    true
-                    (map (fn [block]
-                           (let [refs (:block/refs block)]
-                             (-> block
-                                 (dissoc :block/tags)
-                                 (update :block/title (fn [title]
-                                                        (let [title' (db-content/replace-tags-with-id-refs title refs)]
-                                                          (db-content/title-ref->id-ref title' refs)))))))))]
-      (editor-handler/paste-blocks blocks' {:keep-uuid? true
-                                            :outliner-real-op :paste-text}))))
+    (let [repo (state/get-current-repo)
+          date-formatter (state/get-date-formatter)]
+      (p/let [page-info (db-async/<get-block-page-info repo (or (:db/id editing-block)
+                                                                (:block/uuid editing-block)))
+              blocks (block/extract-blocks
+                      (mldoc/->edn text format)
+                      text format
+                      {:page-name (:block/name page-info)})
+              blocks (gp-block/with-parent-and-order (:db/id page-info) blocks)
+              blocks' (p/all
+                       (mapv (fn [block]
+                               (p/let [refs (some->> (:block/refs block)
+                                                     (<with-ref-ids repo date-formatter))]
+                                 (-> block
+                                     (dissoc :block/tags)
+                                     (cond-> refs
+                                       (assoc :block/refs refs))
+                                     (cond-> (:logseq.property/heading block)
+                                       (update :block/title commands/clear-markdown-heading))
+                                     (update :block/title (fn [title]
+                                                            (let [title' (db-content/replace-tags-with-id-refs title refs)]
+                                                              (db-content/title-ref->id-ref title' refs)))))))
+                             blocks))]
+        (editor-handler/paste-blocks blocks' {:keep-uuid? true
+                                              :outliner-real-op :paste-text})))))
 
 (defn- paste-segmented-text
   [format text]
@@ -58,7 +87,7 @@
 (defn- wrap-macro-url
   [url]
   (cond
-    (boolean (text-util/get-matched-video url))
+    (boolean (video/get-matched-video url))
     (util/format "{{video %s}}" url)
 
     (or (re-matches #"^https://twitter\.com.*?$" url)
@@ -105,12 +134,14 @@
 
 (defn- markdown-blocks?
   [text]
-  (boolean (util/safe-re-find #"(?m)^\s*(?:[-+*]|#+)\s+" text)))
+  (boolean (or (util/safe-re-find #"(?m)^\s*(?:[-+*]|#+)\s+" text)
+               (util/safe-re-find #"(?m)^\s*```[^\r\n]*\r?$" text)
+               (util/safe-re-find #"(?m)^\s*\$\$\s*\r?$" text))))
 
 (defn- get-revert-cut-txs
   "Get reverted previous cut tx when paste"
   [blocks]
-  (let [{:keys [retracted-block-ids revert-tx]} (get-in @state/state [:editor/last-replace-ref-content-tx (state/get-current-repo)])
+  (let [{:keys [retracted-block-ids revert-tx]} (get-in (state/get-state) [:editor/last-replace-ref-content-tx (state/get-current-repo)])
         recent-cut-block-ids (->> retracted-block-ids (map second) (set))]
     (state/set-state! [:editor/last-replace-ref-content-tx (state/get-current-repo)] nil)
     (when (= (set (map :block/uuid blocks)) recent-cut-block-ids)
@@ -124,7 +155,7 @@
                            (commands/simple-insert! input-id text nil)))
         text (string/replace *text "\r\n" "\n") ;; Fix for Windows platform
         input-id (state/get-edit-input-id)
-        {:keys [selection] :as selection-and-format} (editor-handler/get-selection-and-format)
+        {:keys [selection] :as selection-and-format} (editor-format/get-selection-and-format)
         text-url? (common-util/url? text)
         selection-url? (common-util/url? selection)]
     (cond
@@ -137,16 +168,16 @@
       ;; Paste a formatted link over selected text or paste text over a selected formatted link
       (and (or text-url? selection-url?)
            (not (string/blank? (util/get-selected-text))))
-      (editor-handler/html-link-format! text)
+      (editor-format/html-link-format! text)
 
       ;; Pastes only block id when inside of '(())'
       (and (block-ref/block-ref? text)
-           (editor-handler/wrapped-by? input block-ref/left-parens block-ref/right-parens))
+           (editor-autopair/wrapped-by? input block-ref/left-parens block-ref/right-parens))
       (commands/simple-insert! input-id (block-ref/get-block-ref-id text) nil)
 
       :else
       ;; from external
-      (let [format (or (db/get-page-format (state/get-current-page)) :markdown)
+      (let [format :markdown
             html-text (let [result (when-not (string/blank? html)
                                      (try
                                        (html-parser/convert html)
@@ -169,35 +200,43 @@
           :else
           (replace-text-f text'))))))
 
+(defn- <block-with-db-id
+  [repo block]
+  (if (:db/id block)
+    (p/resolved block)
+    (db-async/<get-block repo (:block/uuid block) {:children? false})))
+
 (defn- paste-copied-blocks-or-text
   [input text e html]
   (util/stop e)
   (let [repo (state/get-current-repo)
         copied-blocks-from-memory (get-copied-blocks-from-memory text)]
     (->
-     (p/let [{:keys [graph blocks embed-block?]} (or copied-blocks-from-memory
-                                                      (get-copied-blocks))]
-       (if (and (seq blocks) (= graph repo))
+     (p/let [{:keys [graph blocks embed-block? op]} (or copied-blocks-from-memory
+                                                        (get-copied-blocks))]
+      (if (and (seq blocks) (= graph repo))
        ;; Handle internal paste
          (let [revert-cut-txs (get-revert-cut-txs blocks)
-               keep-uuid? (= (state/get-block-op-type) :cut)
+               keep-uuid? (= :cut (or op (state/get-block-op-type)))
                blocks (map (fn [b] (dissoc b :block/properties)) blocks)]
            (if embed-block?
              (when-let [block-id (:block/uuid (first blocks))]
                (when-let [current-block (state/get-edit-block)]
-                 (cond
-                   (some #(= block-id (:block/uuid %)) (db/get-block-parents repo (:block/uuid current-block) {}))
-                   (notification/show! (t :asset/cannot-embed-parent-as-own-property) :error)
+                 (p/let [current-block' (<block-with-db-id repo current-block)
+                         parents (db-async/<get-block-parents repo (:db/id current-block') 100)]
+                   (cond
+                     (some #(= block-id (:block/uuid %)) parents)
+                     (notification/show! (t :asset/cannot-embed-parent-as-own-property) :error)
 
-                   :else
-                   (p/do!
-                    (editor-handler/api-insert-new-block! ""
-                                                          {:block-uuid (:block/uuid current-block)
-                                                           :sibling? true
-                                                           :outliner-op :paste
-                                                           :replace-empty-target? true
-                                                           :other-attrs {:block/link (:db/id (db/entity [:block/uuid block-id]))}})
-                    (state/clear-edit!)))))
+                     :else
+                     (p/let [linked-block (db-async/<get-block repo block-id {:children? false})
+                             _ (editor-handler/api-insert-new-block! ""
+                                                                    {:block-uuid (:block/uuid current-block)
+                                                                     :sibling? true
+                                                                     :outliner-op :paste
+                                                                     :replace-empty-target? true
+                                                                     :other-attrs {:block/link (:db/id linked-block)}})]
+                       (state/clear-edit!))))))
              (editor-handler/paste-blocks blocks {:revert-cut-txs revert-cut-txs
                                                   :keep-uuid? keep-uuid?})))
          (paste-copied-text input text html)))
@@ -214,7 +253,7 @@
        (if (common-util/url? clipboard-data)
          (if (string/blank? (util/get-selected-text))
            (editor-handler/insert (or (wrap-macro-url clipboard-data) clipboard-data) true)
-           (editor-handler/html-link-format! clipboard-data))
+           (editor-format/html-link-format! clipboard-data))
          (editor-handler/insert clipboard-data true))))
    (fn [error]
      (js/console.error error))))
@@ -222,8 +261,7 @@
 (defn- editing-display-type-block?
   []
   (boolean
-   (when-let [editing-block (some-> (state/get-edit-block) :db/id db/entity)]
-     (:logseq.property.node/display-type editing-block))))
+   (:logseq.property.node/display-type (state/get-edit-block))))
 
 (defn- paste-text-or-blocks-aux
   [input e text html]
@@ -238,7 +276,7 @@
   (when id
     (let [clipboard-data (gobj/get e "clipboardData")
           files (.-files clipboard-data)]
-      (p/let [blocks (editor-handler/upload-asset! id files
+      (p/let [blocks (editor-assets/upload-asset! id files
                                                    (get (state/get-edit-block) :block/format :markdown)
                                                    editor-handler/*asset-uploading? true)]
         (when-let [asset (first blocks)]

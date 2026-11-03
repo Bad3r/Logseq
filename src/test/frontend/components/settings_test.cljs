@@ -1,29 +1,30 @@
 (ns frontend.components.settings-test
-  (:require ["react" :as react]
-            ["react-dom/server" :as react-dom-server]
-            [cljs.test :refer [deftest is]]
+  (:require ["fs" :as fs]
+            [cljs.test :refer [deftest is testing]]
             [clojure.string :as string]
-            [frontend.components.settings :as settings]
-            [frontend.handler.user :as user-handler]
-            [frontend.state :as state]
-            [goog.object :as gobj]
-            [logseq.shui.ui :as shui]))
+            [frontend.components.settings :as settings]))
 
-(deftest rtc-members-does-not-render-duplicate-members-heading-test
-  (let [prev-react (gobj/get js/globalThis "React")]
-    (gobj/set js/globalThis "React" react)
-    (try
-      (with-redefs [state/get-current-repo (constantly "repo-1")
-                    user-handler/manager? (constantly false)
-                    shui/button (fn [_props & children]
-                                  (.createElement react "button" nil (to-array children)))
-                    shui/input (fn [_props]
-                                 (.createElement react "input" nil))
-                    shui/skeleton (fn [_props]
-                                    (.createElement react "div" nil))]
-        (let [html (.renderToStaticMarkup react-dom-server (settings/settings-rtc-members))]
-          (is (not (string/includes? html "<h2")))))
-      (finally
-        (if (some? prev-react)
-          (gobj/set js/globalThis "React" prev-react)
-          (js-delete js/globalThis "React"))))))
+(defn- css-declares-no-drag?
+  [css selector]
+  (boolean
+   (re-find (re-pattern (str "(?s)" selector "[^{]*\\{[^}]*-webkit-app-region:\\s*no-drag"))
+            css)))
+
+(deftest language-select-content-opts-out-of-app-region-drag
+  (testing "language select popup props punch a no-drag hole in the custom title bar"
+    (let [props (settings/language-select-content-props)]
+      (is (string/includes? (:class props) "ls-app-no-drag"))
+      (is (= "no-drag" (get-in props [:style :app-region])))
+      (is (= "no-drag" (get-in props [:style :-webkit-app-region])))
+      (is (string/includes? (str (get-in props [:positioner-props :className]))
+                            "ls-app-no-drag"))
+      (is (= "no-drag" (get-in props [:positioner-props :style :app-region])))
+      (is (= "no-drag" (get-in props [:positioner-props :style :-webkit-app-region]))))))
+
+(deftest language-select-no-drag-css-opts-out-of-app-region
+  (testing "CSS selectors used by the language popup opt out of Electron app-region drag"
+    (let [settings-css (.readFileSync fs "src/main/frontend/components/settings.css" "utf8")
+          shui-css (.readFileSync fs "resources/css/shui.css" "utf8")]
+      (is (css-declares-no-drag? settings-css "\\.ls-app-no-drag"))
+      (is (css-declares-no-drag? shui-css "\\.ui__select-content"))
+      (is (css-declares-no-drag? shui-css "\\.ui__select-item")))))

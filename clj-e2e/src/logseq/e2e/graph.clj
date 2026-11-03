@@ -1,13 +1,18 @@
 (ns logseq.e2e.graph
   (:require [logseq.e2e.assert :as assert]
             [logseq.e2e.keyboard :as k]
-            [logseq.e2e.locator :as loc]
             [logseq.e2e.util :as util]
-            [wally.main :as w]))
+            [wally.main :as w])
+  (:import [com.microsoft.playwright Locator$ClickOptions]))
 
-(defn- refresh-all-remote-graphs
+(def ^:private enabled-refresh-button "button:not([disabled]):has-text(\"Refresh\")")
+
+(defn refresh-all-remote-graphs
   []
-  (w/click "span:text(\"Refresh\")"))
+  (w/wait-for enabled-refresh-button {:timeout 30000})
+  (w/click enabled-refresh-button
+           (-> (Locator$ClickOptions.)
+               (.setTimeout 30000))))
 
 (defn goto-all-graphs
   []
@@ -66,6 +71,29 @@
                  (+ cloud-ready-ms e2ee-password-poll-ms)
                  0))))))
 
+(defn ensure-remote-graphs-loaded
+  "Open the all-graphs page and finish the one-time \"Set password for remote
+  graphs\" prompt when the account has no RSA keys on the sync server yet.
+  `<get-remote-graphs` runs the key check before it stores the fetched list, so
+  the prompt must be answered or the remote section (and its Refresh button)
+  never renders. Returns once remote graphs are loaded."
+  []
+  (goto-all-graphs)
+  (loop [remaining-ms 60000]
+    (cond
+      (w/visible? e2ee-password-modal)
+      (input-e2ee-password)
+
+      (w/visible? enabled-refresh-button)
+      nil
+
+      (<= remaining-ms 0)
+      (throw (ex-info "Remote graphs did not load" {}))
+
+      :else
+      (do (util/wait-timeout e2ee-password-poll-ms)
+          (recur (- remaining-ms e2ee-password-poll-ms))))))
+
 (defn- new-graph-helper
   [graph-name enable-sync? graph-e2ee?]
   (util/search-and-click "Add a DB graph")
@@ -85,9 +113,8 @@
     (maybe-input-e2ee-password)
     (w/wait-for cloud-ready-indicator {:timeout 20000}))
 
-  ;; new graph can blocks the ui because the db need to be created and restored,
-  ;; I have no idea why `search-and-click` failed to auto-wait sometimes.
-  (util/wait-timeout 1000))
+  (w/wait-for-not-visible new-graph-dialog {:timeout 30000})
+  (assert/assert-graph-loaded?))
 
 (defn new-graph
   ([graph-name enable-sync?]
@@ -131,12 +158,12 @@
 
 (defn validate-graph
   []
-  (k/esc)
-  (k/esc)
-  (util/search-and-click "(Dev) Validate current graph")
-  (assert/assert-is-visible
-   (loc/and ".notifications div.notification-success div"
-            (w/get-by-text "Your graph is valid")))
-  (when (w/visible? ".notifications div.notification-success .ls-icon-x")
-    (w/click ".notifications div.notification-success .ls-icon-x"))
-  {:valid? true})
+  (let [success-toast ".ui__toast:has-text('Your graph is valid')"]
+    (k/esc)
+    (k/esc)
+    (util/search-and-click "(Dev) Validate current graph")
+    (w/wait-for success-toast {:timeout 30000})
+    (w/eval-js
+     "() => document.querySelectorAll('.ui__toast.success button')
+       .forEach((button) => button.click())")
+    {:valid? true}))

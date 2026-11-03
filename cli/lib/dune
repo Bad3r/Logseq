@@ -8,7 +8,8 @@
   logseq_cli_platform_spec
   humanize
   melange-fetch
-  melange-transit
-  melange-edn
+  melange-transit-melange
+  melange-edn-melange
+  rrbvec
   melange.js
   melange.node))
